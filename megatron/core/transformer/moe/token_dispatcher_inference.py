@@ -437,6 +437,15 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = local_tokens * self.ep_size
         if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
             cls._symm_agv_routing["tensor"].fill_(-1)
+        elif (
+            self.config.inference_grouped_gemm_backend
+            == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED
+        ):
+            # The TRT-LLM routed kernel consumes every row in the fixed-size CUDA graph
+            # buffer and expects valid expert ids. Padding rows are ignored downstream,
+            # so route them to expert 0 with zero weight.
+            cls._symm_agv_routing["tensor"].fill_(0)
+            cls._symm_agv_probs["tensor"].zero_()
 
     def __init__(
         self,

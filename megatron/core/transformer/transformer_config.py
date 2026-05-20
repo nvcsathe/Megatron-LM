@@ -1026,7 +1026,9 @@ class TransformerConfig(ModelParallelConfig):
     inference_disable_triton_nvls_kernels: bool = False
     """ If true, disables the use of Triton NVLS kernels during inference. """
 
-    inference_grouped_gemm_backend: Literal['flashinfer', 'torch', 'vllm'] = "vllm"
+    inference_grouped_gemm_backend: Literal['flashinfer', 'torch', 'vllm', 'trtllm_bf16_routed'] = (
+        "vllm"
+    )
     """Specifies the backend to use for grouped GEMM operations during inference.
     Options:
     - 'flashinfer': Uses FlashInfer cutlass_fused_moe. Not compatible with MXFP8.
@@ -1034,6 +1036,8 @@ class TransformerConfig(ModelParallelConfig):
       Supports both BF16 and MXFP8.
     - 'vllm': Uses vLLM's Triton fused MoE kernel (BF16). Avoids physical token
       permutation via indirect addressing.
+    - 'trtllm_bf16_routed': Uses FlashInfer's TensorRT-LLM BF16 routed MoE kernel.
+      Supports BF16 only.
     """
 
     inference_moe_disable_fused_quant_kernels: bool = False
@@ -1296,10 +1300,26 @@ class TransformerConfig(ModelParallelConfig):
                     "to avoid costly dtype conversions during decode."
                 )
 
-            if self.gated_linear_unit:
+            try:
+                self.inference_grouped_gemm_backend = InferenceGroupedGemmBackend(
+                    self.inference_grouped_gemm_backend
+                )
+            except ValueError:
                 raise ValueError(
-                    "--transformer-impl='inference_optimized' does not yet support "
-                    "gated linear units (SwiGLU/GeGLU)."
+                    "inference_grouped_gemm_backend must be 'flashinfer', 'torch', 'vllm', "
+                    f"or 'trtllm_bf16_routed', "
+                    f"got '{self.inference_grouped_gemm_backend}'"
+                )
+
+            if (
+                self.gated_linear_unit
+                and self.inference_grouped_gemm_backend
+                != InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED
+            ):
+                raise ValueError(
+                    "--transformer-impl='inference_optimized' only supports gated linear "
+                    "units (SwiGLU/GeGLU) with "
+                    "inference_grouped_gemm_backend='trtllm_bf16_routed'."
                 )
 
             if self.fp8 == "mxfp8":
@@ -1310,22 +1330,17 @@ class TransformerConfig(ModelParallelConfig):
                         "Please set --fp8-param-gather."
                     )
 
-            try:
-                self.inference_grouped_gemm_backend = InferenceGroupedGemmBackend(
-                    self.inference_grouped_gemm_backend
-                )
-            except ValueError:
-                raise ValueError(
-                    f"inference_grouped_gemm_backend must be 'flashinfer', 'torch', or 'vllm', "
-                    f"got '{self.inference_grouped_gemm_backend}'"
-                )
-
             if (
-                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+                self.inference_grouped_gemm_backend
+                in (
+                    InferenceGroupedGemmBackend.FLASHINFER,
+                    InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED,
+                )
                 and self.fp8 == "mxfp8"
             ):
                 raise ValueError(
-                    "FlashInfer is not compatible with MXFP8 quantization. "
+                    "FlashInfer BF16 grouped GEMM backends are not compatible with "
+                    "MXFP8 quantization. "
                     "Set inference_grouped_gemm_backend to 'torch'."
                 )
 
