@@ -346,12 +346,7 @@ class MoELayer(BaseMoELayer):
 
         # Inference-optimized mode setup
         if config.transformer_impl == "inference_optimized":
-            inference_grouped_gemm_backend = getattr(
-                config.inference_grouped_gemm_backend,
-                "value",
-                config.inference_grouped_gemm_backend,
-            )
-            if inference_grouped_gemm_backend == 'auto':
+            if config.inference_grouped_gemm_backend == 'auto':
                 assert HAVE_FLASHINFER, (
                     "inference_grouped_gemm_backend='auto'"
                     "requires flashinfer-python. "
@@ -366,19 +361,26 @@ class MoELayer(BaseMoELayer):
                 from megatron.core.inference.utils import check_flashinfer_jit_cache_installed
 
                 check_flashinfer_jit_cache_installed()
-            elif inference_grouped_gemm_backend == 'torch':
+            elif config.inference_grouped_gemm_backend == 'torch':
                 assert hasattr(torch.nn.functional, 'grouped_mm') or hasattr(
                     torch, '_grouped_mm'
                 ), (
                     "inference_grouped_gemm_backend='torch' requires "
                     "torch.nn.functional.grouped_mm (> torch 2.10) or torch._grouped_mm (<= 2.10)."
                 )
-            elif inference_grouped_gemm_backend == 'vllm':
+            elif config.inference_grouped_gemm_backend == 'vllm':
                 assert HAVE_TRITON, (
                     "inference_grouped_gemm_backend='vllm' requires Triton. "
                     "Install triton (pip install triton)."
                 )
-            elif inference_grouped_gemm_backend == 'trtllm_bf16_routed':
+            elif (
+                getattr(
+                    config.inference_grouped_gemm_backend,
+                    "value",
+                    config.inference_grouped_gemm_backend,
+                )
+                == 'trtllm_bf16_routed'
+            ):
                 assert HAVE_FLASHINFER and hasattr(flashinfer, "trtllm_bf16_routed_moe"), (
                     "inference_grouped_gemm_backend='trtllm_bf16_routed' requires "
                     "flashinfer.trtllm_bf16_routed_moe."

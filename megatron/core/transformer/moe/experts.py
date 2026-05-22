@@ -76,12 +76,7 @@ else:
 
 try:
     import flashinfer.fused_moe as fused_moe
-    from flashinfer.fused_moe.core import ActivationType
-
-    try:
-        from flashinfer.fused_moe.core import WeightLayout
-    except ImportError:
-        WeightLayout = None
+    from flashinfer.fused_moe.core import ActivationType, WeightLayout
 
     HAVE_FLASHINFER = True
 except ImportError:
@@ -1045,6 +1040,16 @@ class InferenceGroupedMLP(TEGroupedMLP):
             HAVE_FLASHINFER
         ), "flashinfer-python is required to resolve FlashInfer activation type."
         func = self.config.activation_func
+        if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED:
+            if self.config.gated_linear_unit and func == F.silu:
+                return ActivationType.Swiglu
+            if not self.config.gated_linear_unit and func == squared_relu:
+                return ActivationType.Relu2
+            raise ValueError(
+                "trtllm_bf16_routed supports SwiGLU or non-gated squared_relu, "
+                f"got activation_func={func}, gated_linear_unit={self.config.gated_linear_unit}"
+            )
+
         if func == F.silu:
             return ActivationType.Silu
         elif func == F.gelu:
@@ -1064,19 +1069,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
             # gated SiLU -> SwiGLU (padded_swiglu / vllm silu_and_mul path)
             return McoreActivationType.SWIGLU
         raise ValueError(f"No mcore_fused_moe ActivationType mapping for activation_func={func}")
-
-    def _resolve_flashinfer_trtllm_activation_type(self):
-        """Map megatron activation config to FlashInfer TensorRT-LLM activation type."""
-        assert HAVE_FLASHINFER, "flashinfer-python is required for TensorRT-LLM MoE."
-        if self.config.gated_linear_unit and self.config.activation_func == F.silu:
-            return ActivationType.Swiglu
-        if not self.config.gated_linear_unit and self.config.activation_func == squared_relu:
-            return ActivationType.Relu2
-        raise ValueError(
-            "trtllm_bf16_routed supports SwiGLU or non-gated squared_relu, "
-            f"got activation_func={self.config.activation_func}, "
-            f"gated_linear_unit={self.config.gated_linear_unit}"
-        )
 
     def _build_concatenated_mxfp8_weights(self):
         """Build stacked MXFP8 weight tensors from per-expert MXFP8Tensor attributes.
@@ -1229,21 +1221,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
     def _trtllm_bf16_routed_forward(self, hidden_states, probs, routing_map):
         """FlashInfer TensorRT-LLM BF16 routed MoE forward."""
-        assert HAVE_FLASHINFER, "flashinfer-python is required for TensorRT-LLM MoE."
-        assert hasattr(
-            fused_moe, "trtllm_bf16_routed_moe"
-        ), "flashinfer.trtllm_bf16_routed_moe is required."
-        assert WeightLayout is not None, "flashinfer WeightLayout enum is required."
         assert (
             hidden_states.dtype == torch.bfloat16
         ), f"trtllm_bf16_routed requires bf16 input, got {hidden_states.dtype}"
         assert probs.dtype == torch.float32, "trtllm_bf16_routed requires fp32 probabilities."
         assert routing_map is not None, "routing_map is required for trtllm_bf16_routed."
-        assert not isinstance(
-            self._fc1_weight, MXFP8Tensor
-        ), "trtllm_bf16_routed does not support MXFP8 weights."
 
-        activation_type = self._resolve_flashinfer_trtllm_activation_type()
         packed_topk_ids = (routing_map.to(torch.int32) << 16) | (
             probs.to(torch.bfloat16).contiguous().view(torch.int16).to(torch.int32)
         )
@@ -1266,15 +1249,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
             weight_layout=WeightLayout.MajorK,
             do_finalize=True,
             tune_max_num_tokens=hidden_states.shape[0],
-            activation_type=activation_type,
+            activation_type=self._flashinfer_activation_type,
         )
-        if isinstance(output, (list, tuple)):
-            output = output[0]
-
-        out = NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None
-        if out is not None:
-            out.copy_(output)
-            output = out
+        rsv = NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None
+        if rsv is not None:
+            output = rsv.copy_(output)
         return output, None
 
     def forward(
