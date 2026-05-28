@@ -316,6 +316,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
         self.failed_request_ids = []
+        # For streaming: tracks how many generated_tokens have already been
+        # forwarded as ENGINE_REPLY_PARTIAL frames per request_id.
+        self._partial_emit_lengths: Dict[int, int] = {}
         self._generation_epoch: Optional[int] = None
         # Track requests that should stop due to stop words (detected in post_process_requests)
         self.stop_word_finished_request_ids: set[int] = set()
@@ -2073,6 +2076,34 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
                 self.socket_for_receiving_requests.send(payload)
                 nvtx_range_pop("coordinator_communication")
+
+            # Emit ENGINE_REPLY_PARTIAL frames for any still-active streaming
+            # requests that produced new tokens this step. Finished records are
+            # already covered above; their entries are also pruned from
+            # _partial_emit_lengths here.
+            finished_ids_this_step = {r.requests[-1].request_id for r in finished_request_records}
+            partials: list = []
+            for rid, entry in self.requests.items():
+                if rid in finished_ids_this_step:
+                    self._partial_emit_lengths.pop(rid, None)
+                    continue
+                request = entry.record[-1]
+                if not getattr(request.sampling_params, "streaming", False):
+                    continue
+                already = self._partial_emit_lengths.get(rid, 0)
+                total = len(request.generated_tokens)
+                if total > already:
+                    new_tokens = list(request.generated_tokens[already:])
+                    partials.append({"request_id": rid, "new_tokens": new_tokens})
+                    self._partial_emit_lengths[rid] = total
+            if partials:
+                nvtx_range_push("coordinator_streaming")
+                self.socket_for_receiving_requests.send(
+                    msgpack.packb(
+                        [Headers.ENGINE_REPLY_PARTIAL.value, partials], use_bin_type=True
+                    )
+                )
+                nvtx_range_pop("coordinator_streaming")
 
         # Drain prefix cache hit counters from context into engine accumulators.
         if self.context.enable_prefix_caching:
