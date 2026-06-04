@@ -384,6 +384,12 @@ class DynamicInferenceRequest(InferenceRequest):
     # Computed field - not passed by caller
     precomputed_block_hashes: List[int] = field(default_factory=list)
 
+    # Phase-3 disagg: when sampling_params.do_kv_handoff is True and the
+    # request finishes, the engine pins this request's blocks and populates
+    # `disaggregated_params` with the metadata a decode peer needs to pull
+    # them over NIXL. Shape: {"block_ids", "kv_meta", "first_token"}.
+    disaggregated_params: Optional[dict] = None
+
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
         if self.prompt_tokens is not None:

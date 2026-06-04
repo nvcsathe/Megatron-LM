@@ -41,6 +41,12 @@ class KVBlockAllocator:
         self.prefix_caching_eviction_policy = prefix_caching_eviction_policy
         self.on_blocks_deregistered: Optional[Callable] = None
 
+        # Phase-3 disagg: block ids in this set are excluded from
+        # `release_memory_blocks` (they stay out of the free pool until an
+        # explicit RELEASE_KV unpins them). Engine owns the lifetime — see
+        # DynamicInferenceEngine.pin_handoff_blocks / release_handoff_blocks.
+        self.pinned_blocks: set = set()
+
         self.total_count = total_count
         self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
         self.paused_count = paused_count
@@ -203,6 +209,19 @@ class KVBlockAllocator:
         """
         if blocks.numel() == 0:
             return
+
+        # Filter out pinned (disagg handoff) blocks before any release logic.
+        # They'll be returned to the pool by release_handoff_blocks() once the
+        # decode peer has finished pulling them.
+        if self.pinned_blocks:
+            pinned = self.pinned_blocks
+            keep_mask = torch.tensor(
+                [int(b) not in pinned for b in blocks.tolist()], dtype=torch.bool
+            )
+            if not keep_mask.all():
+                blocks = blocks[keep_mask]
+                if blocks.numel() == 0:
+                    return
 
         if self.enable_prefix_caching:
             self.block_ref_counts[blocks] -= 1

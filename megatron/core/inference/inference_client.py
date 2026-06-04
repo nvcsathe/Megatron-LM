@@ -119,6 +119,57 @@ class InferenceClient:
         self.request_submission_times[request_id] = time.perf_counter()
         return self.completion_futures[request_id]
 
+    def add_request_with_kv_handoff(
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        kv_meta: dict,
+        src_block_ids: List[int],
+        first_token: Optional[int] = None,
+    ) -> AsyncIterator[dict]:
+        """Phase-3 disagg: submit a streaming request whose KV state was imported.
+
+        The decode engine allocates local blocks, NIXL-pulls KV from the
+        prefill peer described by ``kv_meta``, then begins generation.
+
+        Returns the same per-step partial/final iterator as
+        :meth:`add_request_streaming`.
+        """
+        sampling_params.streaming = True
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        payload = [
+            Headers.SUBMIT_REQUEST_WITH_KV.value,
+            request_id,
+            prompt,
+            sampling_params.serialize(),
+            kv_meta,
+            list(src_block_ids),
+            first_token,
+        ]
+        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        queue: asyncio.Queue = asyncio.Queue()
+        self.stream_queues[request_id] = queue
+        self.request_submission_times[request_id] = time.perf_counter()
+
+        async def _iter():
+            while True:
+                item = await queue.get()
+                if item is None:
+                    return
+                yield item
+
+        return _iter()
+
+    def release_handoff(self, request_id: int) -> None:
+        """Tell the coordinator to release the KV blocks pinned for `request_id`.
+
+        Fire-and-forget. The coordinator broadcasts RELEASE_KV to every engine;
+        engines without that request_id ignore the message.
+        """
+        payload = [Headers.RELEASE_KV.value, int(request_id)]
+        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+
     def add_request_streaming(
         self, prompt: Union[str, List[int]], sampling_params: SamplingParams
     ) -> AsyncIterator[dict]:

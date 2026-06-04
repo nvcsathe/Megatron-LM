@@ -585,6 +585,85 @@ class DataParallelInferenceCoordinator:
                         ]
                     )
 
+            elif header == Headers.SUBMIT_REQUEST_WITH_KV:
+                # Decode-side handoff import. Payload:
+                #   [header, client_request_id, prompt, sampling_params,
+                #    kv_meta, src_block_ids, first_token]
+                # Routed exactly like SUBMIT_REQUEST — round-robin to a DP rank.
+                if sender_identity not in known_clients:
+                    logging.info(
+                        f"Received SUBMIT_REQUEST_WITH_KV from unknown client {sender_identity}; ignoring."
+                    )
+                    continue
+                client_request_id, prompt, sampling_params, kv_meta, src_block_ids, first_token = (
+                    deserialized_payload[1:]
+                )
+                request_id = self.next_request_id
+                self.next_request_id += 1
+                self.request_id_to_client_id[request_id] = sender_identity
+                self.request_id_to_client_request_id[request_id] = client_request_id
+
+                if isinstance(prompt, torch.Tensor):
+                    prompt = prompt.tolist()
+                payload = msgpack.packb(
+                    [
+                        Headers.SUBMIT_REQUEST_WITH_KV.value,
+                        request_id,
+                        prompt,
+                        sampling_params,
+                        kv_meta,
+                        src_block_ids,
+                        first_token,
+                    ],
+                    use_bin_type=True,
+                )
+
+                # Disagg requests bypass prefix-aware routing: KV handoff
+                # already determined which decode worker the request belongs
+                # to via the bootstrap rendezvous. Round-robin is fine here.
+                for _ in range(len(self.identities_of_data_parallel_ranks)):
+                    next_identity = self.get_next_data_parallel_rank()
+                    if self._send_to_engine(next_identity, payload):
+                        break
+                else:
+                    logging.error(
+                        "Coordinator: no reachable engines for handoff request %d",
+                        request_id,
+                    )
+                    del self.request_id_to_client_id[request_id]
+                    del self.request_id_to_client_request_id[request_id]
+                    return
+                self.request_id_to_rank[request_id] = next_identity
+                self._pending_counts[self.identity_to_rank_index[next_identity]] += 1
+
+            elif header == Headers.RELEASE_KV:
+                # Coordinator → all engines: release pinned blocks for a request_id.
+                # The originating client identifies its own request_id (server-side
+                # mapped via request_id_to_rank). We forward only to the engine
+                # that ran prefill, since only it holds the pinned blocks.
+                if sender_identity not in known_clients:
+                    logging.warning("Coordinator: ignoring RELEASE_KV from unknown client.")
+                    continue
+                client_request_id = deserialized_payload[1]
+                # The client passes its OWN request id (the one set in SUBMIT_REQUEST).
+                # Map it back to the server-side request id used to track rank.
+                server_request_id = None
+                for srv_rid, cli_rid in self.request_id_to_client_request_id.items():
+                    if cli_rid == client_request_id:
+                        server_request_id = srv_rid
+                        break
+                # The prefill request already finished and was cleaned from
+                # request_id_to_client_id; assigned rank may still be in
+                # request_id_to_rank if we left it there for handoff. For
+                # simplicity, broadcast to all engines — they'll ignore
+                # unknown request ids.
+                broadcast_payload = msgpack.packb(
+                    [Headers.RELEASE_KV.value, server_request_id if server_request_id is not None else client_request_id],
+                    use_bin_type=True,
+                )
+                for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
+                    self._send_to_engine(data_parallel_rank_id, broadcast_payload)
+
             elif header == Headers.SHUTDOWN:
                 if sender_identity not in known_clients:
                     logging.warning("Coordinator: ignoring signal from unknown client.")

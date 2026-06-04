@@ -300,8 +300,189 @@ class DynamicInferenceEngine(AbstractEngine):
         # Mark the inference engine as active. Cleared in `suspend()` and re-set in `resume()`.
         InferenceMode.set_active()
 
+        # Phase-3 disagg: per-request pinned block ids for KV handoff. Populated
+        # when a do_kv_handoff=True request finishes; consumed by
+        # release_handoff_blocks() when the decode peer is done pulling.
+        self._pinned_handoff_blocks: Dict[int, list] = {}
+        # NIXL bridge. None until setup_kv_transfer() is called by the
+        # launcher.
+        self._kv_transfer_agent = None
+
         # Create cuda graphs.
         self.create_cuda_graphs()
+
+    def setup_kv_transfer(self, role: str, listen_addr: Optional[str]) -> None:
+        """Bring up the NIXL transfer agent for this engine, if configured.
+
+        Args:
+            role: "prefill" or "decode" — used to name the local NIXL agent.
+            listen_addr: ``host:port`` for the NIXL agent. ``None`` disables
+                the bridge (Phase-0 / aggregated path stays usable).
+        """
+        if not listen_addr:
+            return
+        from megatron.core.inference.kv_transfer import make_agent
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        self._kv_transfer_agent = make_agent(
+            role=role,
+            rank=rank,
+            listen_addr=listen_addr,
+            memory_buffer=self.context.memory_buffer,
+        )
+
+    def _capture_handoff_meta(self, request: "DynamicInferenceRequest") -> None:
+        """Pin the request's KV blocks and stamp ``disaggregated_params``.
+
+        Called when a ``do_kv_handoff=True`` request transitions to finished.
+        After this returns, the request's blocks are guaranteed to stay out of
+        the free pool until :meth:`release_handoff_blocks` is invoked with the
+        request id.
+        """
+        # Locate the request's slot in the context tensors.
+        ctx = self.context
+        rid = request.request_id
+        idxs = (ctx.request_ids == rid).nonzero(as_tuple=True)[0]
+        if idxs.numel() == 0:
+            # Request already evicted from the context (rare race); nothing
+            # to pin.
+            return
+        slot = int(idxs[0].item())
+        # Snapshot block ids before update_requests releases them.
+        block_row = ctx.request_to_kv_block_ids[slot]
+        block_ids = [int(b) for b in block_row.tolist() if b != -1]
+        if not block_ids:
+            return
+
+        ctx.kv_block_allocator.pinned_blocks.update(block_ids)
+        self._pinned_handoff_blocks[rid] = block_ids
+        logging.info(
+            "DISAGG_PREFILL_HANDOFF request_id=%d pinned_blocks=%d", rid, len(block_ids)
+        )
+
+        # Build the dict that ships back to the prefill client.
+        kv_meta: Dict = {}
+        if self._kv_transfer_agent is not None:
+            kv_meta = self._kv_transfer_agent.export_meta()
+        first_token = (
+            int(request.generated_tokens[0])
+            if request.generated_tokens
+            else None
+        )
+        request.disaggregated_params = {
+            "block_ids": block_ids,
+            "kv_meta": kv_meta,
+            "first_token": first_token,
+        }
+
+    def release_handoff_blocks(self, request_id: int) -> None:
+        """Release blocks pinned by a previous do_kv_handoff completion."""
+        block_ids = self._pinned_handoff_blocks.pop(request_id, None)
+        if not block_ids:
+            return
+        allocator = self.context.kv_block_allocator
+        for b in block_ids:
+            allocator.pinned_blocks.discard(int(b))
+        # Now return them to the free pool. They've been kept out of
+        # release_memory_blocks until this moment.
+        block_tensor = torch.tensor(block_ids, dtype=torch.int32, device='cpu')
+        allocator.release_memory_blocks(block_tensor)
+
+    def add_request_with_kv_handoff(
+        self,
+        request_id: int,
+        prompt: list,
+        sampling_params: "SamplingParams",
+        kv_meta: dict,
+        src_block_ids: list,
+        first_token: Optional[int] = None,
+    ) -> "asyncio.Future[DynamicInferenceRequest]":
+        """Decode-side: import KV state via NIXL, then add the request so the
+        existing prefix-cache match path skips prefill on the imported blocks.
+
+        Mechanism:
+            1. Pre-allocate local blocks (sets ref_count=1 under prefix caching).
+            2. NIXL-pull KV data from the prefill peer into those blocks.
+            3. Register the prompt's chain hashes against the local blocks so
+               the upcoming match path will see them as cached.
+            4. Pre-decrement ref_count back to 0. ``context.add_request``'s
+               prefix-match code increments it to 1 for each matched block, so
+               the final ref_count matches the regular add_request path — and
+               the blocks return to the free pool when the request finishes,
+               no leak.
+            5. Call the regular :meth:`add_request`. The prefix matcher finds
+               every complete prompt block already cached and sets
+               ``prefix_skip_tokens = prompt_len - 1`` — the engine prefills
+               only the last token (needed for sampling logits) instead of the
+               full prompt. That's the actual prefill skip; decode continues
+               normally from there.
+
+        Requires ``enable_prefix_caching=True`` on this engine — without it
+        the match path is short-circuited and no skipping happens.
+        """
+        from megatron.core.inference.inference_request import (
+            compute_block_hashes_batched,
+        )
+
+        allocator = self.context.kv_block_allocator
+        if not allocator.enable_prefix_caching:
+            raise RuntimeError(
+                "add_request_with_kv_handoff requires --enable-prefix-caching on the "
+                "decode engine; the prefill-skip path uses the prefix-cache match logic."
+            )
+
+        # 1. Allocate local blocks to hold the imported KV state.
+        num_blocks = len(src_block_ids)
+        local_blocks_tensor = allocator.allocate_memory_blocks(num_blocks)
+        if local_blocks_tensor is None:
+            raise RuntimeError(
+                f"add_request_with_kv_handoff: OOM allocating {num_blocks} blocks"
+            )
+        local_blocks = [int(b) for b in local_blocks_tensor.tolist()]
+
+        # 2. NIXL-pull from the prefill peer. Synchronous — by the time
+        #    add_request runs the data is live in `local_blocks`.
+        if self._kv_transfer_agent is not None and kv_meta:
+            self._kv_transfer_agent.pull_blocks(kv_meta, src_block_ids, local_blocks)
+
+        # 3. Register the pulled blocks under the prompt's chain hashes. The
+        #    hashes are deterministic from prompt+block_size, so they match
+        #    whatever the prefill engine would produce — that's exactly what
+        #    `compute_block_hashes_batched` computes inside the request's
+        #    __post_init__ when the request is added in step 5.
+        prompt_tensor = torch.tensor(prompt, dtype=torch.int64)
+        hashes = compute_block_hashes_batched(
+            prompt_tensor, self.context.block_size_tokens
+        )
+        n = min(num_blocks, len(hashes))
+        if n > 0:
+            allocator.register_kv_block_hashes(local_blocks[:n], hashes[:n])
+
+        # 4. Pre-decrement ref_count so the match-path increment lands at 1.
+        #    `allocate_memory_blocks` set ref_count=1; if we leave it there,
+        #    `_compute_prefix_match` would push it to 2 and the blocks would
+        #    never return to the pool when the request finishes (leak).
+        local_blocks_idx = torch.tensor(local_blocks, dtype=torch.int64)
+        allocator.block_ref_counts[local_blocks_idx] -= 1
+
+        logging.info(
+            "DISAGG_DECODE_IMPORT request_id=%d prompt_tokens=%d imported_blocks=%d hashes_registered=%d",
+            request_id,
+            len(prompt),
+            num_blocks,
+            n,
+        )
+
+        # 5. Add the request via the standard path. Inside `context.add_request`:
+        #    - `_compute_prefix_match` looks up `req.precomputed_block_hashes` in
+        #      `kv_hash_to_block_id`, finds `n` matched blocks (the ones we just
+        #      registered), bumps their ref_counts to 1.
+        #    - Sets `prefix_skip_tokens = n * block_size_tokens` (clamped to
+        #      `prompt_len - 1` so sampling has at least 1 token to produce
+        #      logits on). The engine prefills only that single token.
+        #    - Allocates one extra block iff the prompt has a partial last
+        #      block (hashes only cover whole blocks).
+        return self.add_request(request_id, prompt, sampling_params)
 
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
@@ -1402,6 +1583,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
                     request.add_event_finish()
+                    # Phase-3 disagg: pin KV blocks + stamp disaggregated_params
+                    # BEFORE we pop the request, so the context release path can
+                    # check allocator.pinned_blocks and leave them alone.
+                    if getattr(request.sampling_params, "do_kv_handoff", False):
+                        self._capture_handoff_meta(request)
                     finished_entry = self.requests.pop(request_id)
                     finished_request = finished_entry.record[-1]
                     finished_request.generated_length = len(finished_request.generated_tokens)
@@ -2393,6 +2579,25 @@ class DynamicInferenceEngine(AbstractEngine):
                 nvtx_range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
                 nvtx_range_pop("add_request")
+            elif header == Headers.SUBMIT_REQUEST_WITH_KV:
+                # Decode-side handoff import (Phase-3 disagg).
+                (
+                    request_id,
+                    prompt,
+                    sampling_params,
+                    kv_meta,
+                    src_block_ids,
+                    first_token,
+                ) = data[1:]
+                sampling_params = SamplingParams.deserialize(sampling_params)
+                nvtx_range_push("add_request_with_kv_handoff")
+                self.add_request_with_kv_handoff(
+                    request_id, prompt, sampling_params, kv_meta, src_block_ids, first_token
+                )
+                nvtx_range_pop("add_request_with_kv_handoff")
+            elif header == Headers.RELEASE_KV:
+                # Coordinator-broadcast release. Unknown request ids are no-ops.
+                self.release_handoff_blocks(int(data[1]))
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
             else:

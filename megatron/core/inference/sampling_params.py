@@ -35,6 +35,7 @@ class SamplingParams:
     )
     detokenize_stop_sequence: bool = False  # Keep stop words and EOD in generated text
     streaming: bool = False  # If True, engine emits ENGINE_REPLY_PARTIAL per step
+    do_kv_handoff: bool = False  # Phase-3 disagg: pin KV blocks after generation, expose meta for peer pull
 
     def __post_init__(self):
         """Ensure backward compatibility for return_prompt_top_n_logprobs.
