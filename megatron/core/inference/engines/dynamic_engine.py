@@ -332,34 +332,29 @@ class DynamicInferenceEngine(AbstractEngine):
             expected_num_blocks=self.context.kv_block_allocator.total_count,
         )
 
-    def _capture_handoff_meta(self, request: "DynamicInferenceRequest") -> None:
-        """Pin the request's KV blocks and stamp ``disaggregated_params``.
+    def _capture_handoff_meta(
+        self, request: "DynamicInferenceRequest", block_ids: list
+    ) -> None:
+        """Stamp ``disaggregated_params`` and record pinned blocks.
 
         Called when a ``do_kv_handoff=True`` request transitions to finished.
-        After this returns, the request's blocks are guaranteed to stay out of
-        the free pool until :meth:`release_handoff_blocks` is invoked with the
-        request id.
+        ``block_ids`` comes from the controller's pre-``update_requests``
+        snapshot (`finished_handoff_block_ids`) — by the time we get here the
+        context tensors have already been cleared, so reading
+        ``request_to_kv_block_ids`` directly would return all -1. The
+        controller also pinned these blocks before releasing slots, so they
+        are safely out of the free pool until :meth:`release_handoff_blocks`.
         """
-        # Locate the request's slot in the context tensors.
-        ctx = self.context
         rid = request.request_id
-        idxs = (ctx.request_ids == rid).nonzero(as_tuple=True)[0]
-        if idxs.numel() == 0:
-            # Request already evicted from the context (rare race); nothing
-            # to pin.
-            return
-        slot = int(idxs[0].item())
-        # Snapshot block ids before update_requests releases them.
-        block_row = ctx.request_to_kv_block_ids[slot]
-        block_ids = [int(b) for b in block_row.tolist() if b != -1]
         if not block_ids:
+            logging.warning(
+                "DISAGG_PREFILL_HANDOFF request_id=%d had no snapshot blocks "
+                "(controller missed the slot?); decode peer will receive empty handoff",
+                rid,
+            )
             return
 
-        ctx.kv_block_allocator.pinned_blocks.update(block_ids)
-        self._pinned_handoff_blocks[rid] = block_ids
-        logging.info(
-            "DISAGG_PREFILL_HANDOFF request_id=%d pinned_blocks=%d", rid, len(block_ids)
-        )
+        self._pinned_handoff_blocks[rid] = list(block_ids)
 
         # Build the dict that ships back to the prefill client.
         kv_meta: Dict = {}
@@ -375,6 +370,12 @@ class DynamicInferenceEngine(AbstractEngine):
             "kv_meta": kv_meta,
             "first_token": first_token,
         }
+        logging.info(
+            "DISAGG_PREFILL_HANDOFF request_id=%d pinned_blocks=%d first_token=%s",
+            rid,
+            len(block_ids),
+            first_token,
+        )
 
     def release_handoff_blocks(self, request_id: int) -> None:
         """Release blocks pinned by a previous do_kv_handoff completion."""
@@ -1400,6 +1401,7 @@ class DynamicInferenceEngine(AbstractEngine):
         pre_fwd_active_token_count: Optional[int] = None,
         pre_fwd_step_count: Optional[int] = None,
         finished_routing_block_ids: Optional[Dict[int, list[int]]] = None,
+        finished_handoff_block_ids: Optional[Dict[int, list[int]]] = None,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
@@ -1584,11 +1586,28 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
                     request.add_event_finish()
-                    # Phase-3 disagg: pin KV blocks + stamp disaggregated_params
-                    # BEFORE we pop the request, so the context release path can
-                    # check allocator.pinned_blocks and leave them alone.
+                    # Phase-3 disagg routing of the finished request's KV blocks.
+                    # The controller already pinned them BEFORE update_requests
+                    # could release them, and snapshotted the ids in
+                    # finished_handoff_block_ids. Two paths:
+                    #   - do_kv_handoff=True: stamp disaggregated_params; leave
+                    #     the blocks pinned for the decode peer to pull.
+                    #     release_handoff_blocks() unpins + frees later.
+                    #   - do_kv_handoff=False: unpin and free immediately. The
+                    #     controller pinned universally because it doesn't have
+                    #     SamplingParams visibility.
+                    handoff_blocks = (finished_handoff_block_ids or {}).get(
+                        request_id, []
+                    )
                     if getattr(request.sampling_params, "do_kv_handoff", False):
-                        self._capture_handoff_meta(request)
+                        self._capture_handoff_meta(request, handoff_blocks)
+                    elif handoff_blocks:
+                        allocator = self.context.kv_block_allocator
+                        for b in handoff_blocks:
+                            allocator.pinned_blocks.discard(int(b))
+                        allocator.release_memory_blocks(
+                            torch.tensor(handoff_blocks, dtype=torch.int32, device='cpu')
+                        )
                     finished_entry = self.requests.pop(request_id)
                     finished_request = finished_entry.record[-1]
                     finished_request.generated_length = len(finished_request.generated_tokens)
@@ -2190,6 +2209,7 @@ class DynamicInferenceEngine(AbstractEngine):
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
             finished_routing_block_ids = step_result.get("finished_routing_block_ids", None)
+            finished_handoff_block_ids = step_result.get("finished_handoff_block_ids", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
             # Add paused events.
@@ -2210,6 +2230,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 pre_fwd_active_token_count=context_state.get("active_token_count"),
                 pre_fwd_step_count=context_state.get("step_count"),
                 finished_routing_block_ids=finished_routing_block_ids,
+                finished_handoff_block_ids=finished_handoff_block_ids,
             )
 
         else:

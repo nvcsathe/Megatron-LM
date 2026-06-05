@@ -1798,6 +1798,25 @@ class TextGenerationController:
                 if valid:
                     finished_routing_block_ids[req_id] = valid
 
+        # Phase-3 disagg: snapshot KV block ids for ALL finished requests
+        # before update_requests resets the slot to -1, AND pin them so
+        # release_memory_blocks treats them as off-limits. The engine then
+        # decides per-request in post_process_requests whether to keep them
+        # pinned (do_kv_handoff path) or unpin+release (regular path).
+        # Controller can't see SamplingParams, so it can't filter here —
+        # we pin universally and let the engine sort it out. Cost is
+        # negligible: one dict update + one set insert per finished request.
+        finished_handoff_block_ids = {}
+        if finished_idxs.numel() > 0:
+            pin_set = context.kv_block_allocator.pinned_blocks
+            for fidx in finished_idxs.tolist():
+                req_id = int(context.request_ids[fidx].item())
+                blocks = context.request_to_kv_block_ids[fidx]
+                valid = [int(b) for b in blocks.tolist() if b != -1]
+                if valid:
+                    finished_handoff_block_ids[req_id] = valid
+                    pin_set.update(valid)
+
         # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
         # which would corrupt the reused buffer.
         new_sample_copy = sampled_tokens_cpu.clone()
@@ -1818,6 +1837,7 @@ class TextGenerationController:
             # D2H sync when the engine later calls sample.tolist().
             "sample": sampled_tokens_cpu,
             "finished_routing_block_ids": finished_routing_block_ids,
+            "finished_handoff_block_ids": finished_handoff_block_ids,
             **(update_result or {}),
         }
 
