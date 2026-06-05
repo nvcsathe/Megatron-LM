@@ -329,6 +329,7 @@ class DynamicInferenceEngine(AbstractEngine):
             rank=rank,
             listen_addr=listen_addr,
             memory_buffer=self.context.memory_buffer,
+            expected_num_blocks=self.context.kv_block_allocator.total_count,
         )
 
     def _capture_handoff_meta(self, request: "DynamicInferenceRequest") -> None:

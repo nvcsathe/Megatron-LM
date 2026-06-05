@@ -76,7 +76,12 @@ class KvTransferAgent:
     ``add_remote_agent`` on first use.
     """
 
-    def __init__(self, agent_name: str, memory_buffer: torch.Tensor):
+    def __init__(
+        self,
+        agent_name: str,
+        memory_buffer: torch.Tensor,
+        expected_num_blocks: int,
+    ):
         if not _HAVE_NIXL:
             raise RuntimeError(
                 "KvTransferAgent requires the nixl Python package. Install the "
@@ -86,20 +91,57 @@ class KvTransferAgent:
         self.agent_name = agent_name
         self._memory_buffer = memory_buffer
 
-        # Derive per-block byte size: blocks axis is dim 1 in the paged layout
-        # ``[layers, blocks, ...]`` (or ``[2, layers, blocks, ...]`` for K/V
-        # split). Either way, dim 1 = blocks. TP/PP-match constraint guarantees
-        # peer + local use the same layout, so per_block_bytes matches.
+        # Locate the blocks axis. Megatron has two layouts:
+        #   - MLA:        [layers, blocks, block_size, kv_dim]            → axis 1
+        #   - K/V split:  [2, layers, blocks, block_size, n_kv_heads, d]  → axis 2
+        # We find it by matching the expected block count rather than
+        # hardcoding a position, so future layouts (e.g. EP/PP variations)
+        # don't silently mis-identify the layer dim as blocks. Caller passes
+        # `kv_block_allocator.total_count` as the source of truth.
         shape = list(memory_buffer.shape)
-        self._blocks_axis = 1
-        self._num_blocks = shape[self._blocks_axis]
+        candidates = [i for i, dim in enumerate(shape) if dim == expected_num_blocks]
+        if not candidates:
+            raise RuntimeError(
+                f"KvTransferAgent: no axis in memory_buffer shape {shape} "
+                f"matches expected_num_blocks={expected_num_blocks}. Layout "
+                "is unrecognized — bug in caller or new Megatron tensor shape."
+            )
+        if len(candidates) > 1:
+            raise RuntimeError(
+                f"KvTransferAgent: ambiguous blocks axis in shape {shape} "
+                f"(expected_num_blocks={expected_num_blocks} matches multiple "
+                f"axes {candidates}). Caller must pass a more distinctive value."
+            )
+        self._blocks_axis = candidates[0]
+        self._num_blocks = expected_num_blocks
         self._buf_ptr = memory_buffer.data_ptr()
         self._buf_numel = memory_buffer.numel()
-        per_block_elems = self._buf_numel // self._num_blocks
-        self._per_block_bytes = memory_buffer.element_size() * per_block_elems
+        self._element_size = memory_buffer.element_size()
         self._device_id = (
             memory_buffer.device.index if memory_buffer.is_cuda else 0
         )
+
+        # The KV buffer is contiguous in C-order. For each (outer-index combo,
+        # block i), there is ONE contiguous slice of `bytes_per_slice` bytes
+        # containing every position×head×dim element for that (outer, block).
+        # Walking the blocks-axis advances one slice; walking the next outer
+        # axis advances `num_blocks` slices (one full B-stride). For Megatron's
+        # K/V split layout [2, L, B, T, H, d] this gives 2*L slices per block.
+        # For MLA [L, B, T, D] it's L slices per block.
+        shape = list(memory_buffer.shape)
+        elements_per_slice = 1
+        for dim in shape[self._blocks_axis + 1 :]:
+            elements_per_slice *= dim
+        self._bytes_per_slice = self._element_size * elements_per_slice
+        num_outer = 1
+        for dim in shape[: self._blocks_axis]:
+            num_outer *= dim
+        self._num_outer = num_outer
+        # Bytes to skip to advance one outer-index combination (jumps over a
+        # whole B-stride of slices).
+        self._outer_stride_bytes = self._num_blocks * self._bytes_per_slice
+        # Total bytes per logical block (informational).
+        self._per_block_bytes = self._num_outer * self._bytes_per_slice
 
         self._agent = nixl_agent(agent_name)
         # Pass the torch tensor directly; NIXL detects VRAM + computes the
@@ -118,19 +160,28 @@ class KvTransferAgent:
 
         logger.info(
             "KvTransferAgent[%s] registered %d-block buffer "
-            "(%d bytes/block, device=%d)",
+            "(blocks_axis=%d, %d outer-slices/block × %d bytes/slice = "
+            "%d bytes/block, device=%d, shape=%s)",
             agent_name,
             self._num_blocks,
+            self._blocks_axis,
+            self._num_outer,
+            self._bytes_per_slice,
             self._per_block_bytes,
             self._device_id,
+            shape,
         )
 
     def export_meta(self) -> Dict[str, Any]:
         """Return JSON/msgpack-safe metadata for shipping to a decode peer.
 
-        The receiver passes ``agent_metadata_b64`` to
-        :meth:`pull_blocks` (via ``kv_meta``); we decode and register it
-        lazily on first transfer.
+        The receiver passes ``agent_metadata_b64`` to :meth:`pull_blocks` (via
+        ``kv_meta``); we decode and register it lazily on first transfer.
+
+        ``bytes_per_slice``, ``num_outer``, ``outer_stride_bytes`` capture the
+        scatter-gather layout: each block is ``num_outer`` non-contiguous
+        slices of ``bytes_per_slice`` bytes, separated by ``outer_stride_bytes``.
+        Peer + local must agree on all of these (enforced in pull_blocks).
         """
         return {
             "agent_name": self.agent_name,
@@ -138,7 +189,9 @@ class KvTransferAgent:
                 "ascii"
             ),
             "base_addr": self._buf_ptr,
-            "per_block_bytes": self._per_block_bytes,
+            "bytes_per_slice": self._bytes_per_slice,
+            "num_outer": self._num_outer,
+            "outer_stride_bytes": self._outer_stride_bytes,
             "num_blocks": self._num_blocks,
             "device_id": self._device_id,
             "blocks_axis": self._blocks_axis,
@@ -187,28 +240,43 @@ class KvTransferAgent:
         if not src_block_ids:
             return
 
-        peer_per_block = peer_meta["per_block_bytes"]
-        if peer_per_block != self._per_block_bytes:
-            raise ValueError(
-                f"Peer per_block_bytes {peer_per_block} != local "
-                f"{self._per_block_bytes}. TP/PP/dtype mismatch between "
-                "prefill and decode engines?"
-            )
+        # Layout compatibility: bytes_per_slice, num_outer, and outer_stride
+        # must all agree. Per-block bytes alone isn't enough — same total can
+        # come from different scatter-gather layouts.
+        for key, local in (
+            ("bytes_per_slice", self._bytes_per_slice),
+            ("num_outer", self._num_outer),
+            ("outer_stride_bytes", self._outer_stride_bytes),
+        ):
+            peer_val = peer_meta.get(key)
+            if peer_val != local:
+                raise ValueError(
+                    f"Peer/local layout mismatch on {key}: "
+                    f"peer={peer_val} local={local}. TP/PP/dtype mismatch?"
+                )
         peer_base = peer_meta["base_addr"]
         peer_device_id = peer_meta.get("device_id", 0)
         peer_id = self._ensure_peer_registered(peer_meta)
 
-        per = self._per_block_bytes
-        # Remote (source) descriptors: peer addresses + sizes + peer's device.
-        src_descs = self._agent.get_xfer_descs(
-            [(peer_base + sb * per, per, peer_device_id) for sb in src_block_ids],
-            mem_type="VRAM",
-        )
-        # Local (destination) descriptors: our addresses + sizes + our device.
-        dst_descs = self._agent.get_xfer_descs(
-            [(self._buf_ptr + db * per, per, self._device_id) for db in dst_block_ids],
-            mem_type="VRAM",
-        )
+        # Each logical block contributes `num_outer` non-contiguous slices.
+        # Generate one descriptor per (block, outer-index) pair on each side.
+        bps = self._bytes_per_slice
+        os_stride = self._outer_stride_bytes
+        src_tuples = []
+        dst_tuples = []
+        for src_b, dst_b in zip(src_block_ids, dst_block_ids):
+            src_block_offset = src_b * bps
+            dst_block_offset = dst_b * bps
+            for o in range(self._num_outer):
+                src_tuples.append(
+                    (peer_base + o * os_stride + src_block_offset, bps, peer_device_id)
+                )
+                dst_tuples.append(
+                    (self._buf_ptr + o * os_stride + dst_block_offset, bps, self._device_id)
+                )
+
+        src_descs = self._agent.get_xfer_descs(src_tuples, mem_type="VRAM")
+        dst_descs = self._agent.get_xfer_descs(dst_tuples, mem_type="VRAM")
 
         # READ pulls remote → local: src_descs = where on the peer, dst_descs
         # = where to put it locally. The third positional after the operation
@@ -250,15 +318,16 @@ def make_agent(
     rank: int,
     listen_addr: Optional[str],  # accepted but unused — NIXL does its own discovery
     memory_buffer: torch.Tensor,
+    expected_num_blocks: int,
 ) -> Optional[KvTransferAgent]:
     """Construct an agent, or return None when KV transfer is disabled.
 
     ``listen_addr`` is kept in the signature for launcher compatibility but is
     ignored by NIXL — peer discovery is metadata-based (see module docstring).
-    Callers may pass it as a flag to indicate "transfer enabled" by setting
-    any non-empty string.
+    Callers pass it as a flag to indicate "transfer enabled" by setting any
+    non-empty string.
     """
     if not listen_addr:
         return None
     agent_name = f"{role}-rank{rank}"
-    return KvTransferAgent(agent_name, memory_buffer)
+    return KvTransferAgent(agent_name, memory_buffer, expected_num_blocks)
