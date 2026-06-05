@@ -721,6 +721,11 @@ class DynamicInferenceRequestRecord:
 
         policy_epoch = self.requests[-1].policy_epoch
         kv_cache_epoch = self.requests[-1].kv_cache_epoch
+        # Phase-3 disagg: the prefill engine's `_capture_handoff_meta` stamps
+        # `disaggregated_params` on the in-flight request just before it
+        # finishes. The merged record is what gets serialized and sent to the
+        # client, so this field must be carried forward from the last segment.
+        disaggregated_params = self.requests[-1].disaggregated_params
 
         # Merged request.
         request = DynamicInferenceRequest(
@@ -746,6 +751,7 @@ class DynamicInferenceRequestRecord:
             block_size_tokens=self.requests[0].block_size_tokens,
             enable_prefix_caching=self.requests[0].enable_prefix_caching,
             precomputed_block_hashes=self.requests[0].precomputed_block_hashes,
+            disaggregated_params=disaggregated_params,
         )
 
         return request
