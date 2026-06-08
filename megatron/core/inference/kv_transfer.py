@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional
 
@@ -142,6 +143,29 @@ class KvTransferAgent:
         self._outer_stride_bytes = self._num_blocks * self._bytes_per_slice
         # Total bytes per logical block (informational).
         self._per_block_bytes = self._num_outer * self._bytes_per_slice
+
+        # UCX transport selection — must happen before the nixl_agent() constructor
+        # creates the UCX worker context.
+        #
+        # Without this, UCX may wire VRAM-to-VRAM transfers over its TCP transport.
+        # The TCP handler (uct_tcp_ep_am_bcopy) does a CPU memcpy from the source
+        # address; on aarch64 that crashes with SIGSEGV when the source is VRAM.
+        #
+        #   cuda_ipc  — direct GPU P2P via NVLink / PCIe P2P (zero-copy preferred path)
+        #   cuda_copy — CUDA-mediated staging through host memory (safe fallback)
+        #   cma       — cross-memory attach for host-memory control messages
+        #   shm       — POSIX shm for intra-node host memory
+        #   self      — loopback, needed for NIXL's internal operations
+        #
+        # setdefault: the operator can override by setting UCX_TLS before launch.
+        # TCP is not listed; if cuda_ipc/cuda_copy are unavailable (e.g. missing
+        # UCX CUDA backends), NIXL will raise a transport error at connection time
+        # rather than silently falling back to TCP and crashing later.
+        os.environ.setdefault("UCX_TLS", "cuda_ipc,cuda_copy,cma,shm,self")
+        # Disable the UCX memory-type cache: the cache is populated during early
+        # UCX init before CUDA is fully ready, and can misclassify VRAM addresses
+        # as host memory.  With explicit register_memory() we pay no lookup cost.
+        os.environ.setdefault("UCX_MEMTYPE_CACHE", "n")
 
         self._agent = nixl_agent(agent_name)
         # Pass the torch tensor directly; NIXL detects VRAM + computes the
