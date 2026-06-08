@@ -447,14 +447,19 @@ class DynamicInferenceEngine(AbstractEngine):
         if self._kv_transfer_agent is not None and kv_meta:
             self._kv_transfer_agent.pull_blocks(kv_meta, src_block_ids, local_blocks)
 
-        # 3. Register the pulled blocks under the prompt's chain hashes. The
-        #    hashes are deterministic from prompt+block_size, so they match
-        #    whatever the prefill engine would produce — that's exactly what
-        #    `compute_block_hashes_batched` computes inside the request's
-        #    __post_init__ when the request is added in step 5.
+        # 3. Register the pulled blocks under the prompt's chain hashes.
+        #    include_partial=True so that prompts shorter than block_size still
+        #    produce a hash for the partial last block. Without this, a 240-token
+        #    prompt with block_size=256 yields 0 complete-block hashes → nothing
+        #    registered → prefix cache finds nothing → decode re-prefills the
+        #    whole prompt and the imported KV is wasted.
+        #    The partial hash is deterministic from the actual token IDs, so it
+        #    matches the hash the request will look up in step 5 (we pass hashes[:n]
+        #    as precomputed_block_hashes to add_request, bypassing __post_init__'s
+        #    recompute which uses include_partial=False).
         prompt_tensor = torch.tensor(prompt, dtype=torch.int64)
         hashes = compute_block_hashes_batched(
-            prompt_tensor, self.context.block_size_tokens
+            prompt_tensor, self.context.block_size_tokens, include_partial=True
         )
         n = min(num_blocks, len(hashes))
         if n > 0:
@@ -475,16 +480,22 @@ class DynamicInferenceEngine(AbstractEngine):
             n,
         )
 
-        # 5. Add the request via the standard path. Inside `context.add_request`:
+        # 5. Add the request via the standard path, injecting the hashes we just
+        #    registered (including the partial block's hash when n covers it).
+        #    DynamicInferenceRequest.__post_init__ skips its own hash recompute
+        #    when precomputed_block_hashes is non-empty, so the partial hash is
+        #    preserved and _compute_prefix_match finds all n imported blocks.
+        #    Inside `context.add_request`:
         #    - `_compute_prefix_match` looks up `req.precomputed_block_hashes` in
         #      `kv_hash_to_block_id`, finds `n` matched blocks (the ones we just
         #      registered), bumps their ref_counts to 1.
         #    - Sets `prefix_skip_tokens = n * block_size_tokens` (clamped to
         #      `prompt_len - 1` so sampling has at least 1 token to produce
         #      logits on). The engine prefills only that single token.
-        #    - Allocates one extra block iff the prompt has a partial last
-        #      block (hashes only cover whole blocks).
-        return self.add_request(request_id, prompt, sampling_params)
+        return self.add_request(
+            request_id, prompt, sampling_params,
+            precomputed_block_hashes=hashes[:n] if n > 0 else None,
+        )
 
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
@@ -1334,6 +1345,7 @@ class DynamicInferenceEngine(AbstractEngine):
         request_id: int,
         prompt: Union[str, List[int], Tensor],
         sampling_params: Optional[SamplingParams] = None,
+        precomputed_block_hashes: Optional[List[int]] = None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
 
@@ -1383,6 +1395,7 @@ class DynamicInferenceEngine(AbstractEngine):
             sampling_params=sampling_params,
             block_size_tokens=self.context.block_size_tokens,
             enable_prefix_caching=self.context.enable_prefix_caching,
+            precomputed_block_hashes=precomputed_block_hashes or [],
         )
 
         # Add request.
