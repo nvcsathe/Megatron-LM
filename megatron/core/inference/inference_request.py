@@ -404,7 +404,7 @@ class DynamicInferenceRequest(InferenceRequest):
     # Phase-3 disagg: when sampling_params.do_kv_handoff is True and the
     # request finishes, the engine pins this request's blocks and populates
     # `disaggregated_params` with the metadata a decode peer needs to pull
-    # them over NIXL. Shape: {"block_ids", "kv_meta", "first_token"}.
+    # them over NIXL. Shape: {"request_id", "block_ids", "kv_meta"}.
     disaggregated_params: Optional[dict] = None
 
     def __post_init__(self):

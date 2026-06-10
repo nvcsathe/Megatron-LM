@@ -125,7 +125,6 @@ class InferenceClient:
         sampling_params: SamplingParams,
         kv_meta: dict,
         src_block_ids: List[int],
-        first_token: Optional[int] = None,
     ) -> AsyncIterator[dict]:
         """Phase-3 disagg: submit a streaming request whose KV state was imported.
 
@@ -145,7 +144,6 @@ class InferenceClient:
             sampling_params.serialize(),
             kv_meta,
             list(src_block_ids),
-            first_token,
         ]
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
         queue: asyncio.Queue = asyncio.Queue()

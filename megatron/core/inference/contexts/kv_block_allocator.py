@@ -211,8 +211,8 @@ class KVBlockAllocator:
             return
 
         # Filter out pinned (disagg handoff) blocks before any release logic.
-        # They'll be returned to the pool by release_handoff_blocks() once the
-        # decode peer has finished pulling them.
+        # They'll be released by release_handoff_blocks() once the decode peer
+        # has finished pulling them.
         if self.pinned_blocks:
             pinned = self.pinned_blocks
             keep_mask = torch.tensor(

@@ -302,7 +302,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Phase-3 disagg: per-request pinned block ids for KV handoff. Populated
         # when a do_kv_handoff=True request finishes; consumed by
-        # release_handoff_blocks() when the decode peer is done pulling.
+        # release_handoff_blocks() unpins them when the decode peer is done pulling.
         self._pinned_handoff_blocks: Dict[int, list] = {}
         # NIXL bridge. None until setup_kv_transfer() is called by the
         # launcher.
@@ -360,21 +360,15 @@ class DynamicInferenceEngine(AbstractEngine):
         kv_meta: Dict = {}
         if self._kv_transfer_agent is not None:
             kv_meta = self._kv_transfer_agent.export_meta()
-        first_token = (
-            int(request.generated_tokens[0])
-            if request.generated_tokens
-            else None
-        )
         request.disaggregated_params = {
+            "request_id": rid,
             "block_ids": block_ids,
             "kv_meta": kv_meta,
-            "first_token": first_token,
         }
         logging.info(
-            "DISAGG_PREFILL_HANDOFF request_id=%d pinned_blocks=%d first_token=%s",
+            "DISAGG_PREFILL_HANDOFF request_id=%d pinned_blocks=%d",
             rid,
             len(block_ids),
-            first_token,
         )
 
     def release_handoff_blocks(self, request_id: int) -> None:
@@ -385,10 +379,13 @@ class DynamicInferenceEngine(AbstractEngine):
         allocator = self.context.kv_block_allocator
         for b in block_ids:
             allocator.pinned_blocks.discard(int(b))
-        # Now return them to the free pool. They've been kept out of
-        # release_memory_blocks until this moment.
         block_tensor = torch.tensor(block_ids, dtype=torch.int32, device='cpu')
         allocator.release_memory_blocks(block_tensor)
+        logging.info(
+            "DISAGG_PREFILL_RELEASE request_id=%d released_blocks=%d",
+            request_id,
+            len(block_ids),
+        )
 
     def add_request_with_kv_handoff(
         self,
@@ -397,7 +394,6 @@ class DynamicInferenceEngine(AbstractEngine):
         sampling_params: "SamplingParams",
         kv_meta: dict,
         src_block_ids: list,
-        first_token: Optional[int] = None,
     ) -> "asyncio.Future[DynamicInferenceRequest]":
         """Decode-side: import KV state via NIXL, then add the request so the
         existing prefix-cache match path skips prefill on the imported blocks.
@@ -1605,7 +1601,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # finished_handoff_block_ids. Two paths:
                     #   - do_kv_handoff=True: stamp disaggregated_params; leave
                     #     the blocks pinned for the decode peer to pull.
-                    #     release_handoff_blocks() unpins + frees later.
+                    #     release_handoff_blocks() unpins + releases later.
                     #   - do_kv_handoff=False: unpin and free immediately. The
                     #     controller pinned universally because it doesn't have
                     #     SamplingParams visibility.
@@ -2622,12 +2618,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     sampling_params,
                     kv_meta,
                     src_block_ids,
-                    first_token,
                 ) = data[1:]
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 nvtx_range_push("add_request_with_kv_handoff")
                 self.add_request_with_kv_handoff(
-                    request_id, prompt, sampling_params, kv_meta, src_block_ids, first_token
+                    request_id, prompt, sampling_params, kv_meta, src_block_ids
                 )
                 nvtx_range_pop("add_request_with_kv_handoff")
             elif header == Headers.RELEASE_KV:
