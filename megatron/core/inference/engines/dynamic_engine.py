@@ -2612,13 +2612,15 @@ class DynamicInferenceEngine(AbstractEngine):
                 nvtx_range_pop("add_request")
             elif header == Headers.SUBMIT_REQUEST_WITH_KV:
                 # Decode-side handoff import (Phase-3 disagg).
-                (
-                    request_id,
-                    prompt,
-                    sampling_params,
-                    kv_meta,
-                    src_block_ids,
-                ) = data[1:]
+                handoff_payload = data[1:]
+                if len(handoff_payload) not in (5, 6):
+                    raise ValueError(
+                        "SUBMIT_REQUEST_WITH_KV payload must have 5 fields "
+                        f"(or 6 with deprecated first_token), got {len(handoff_payload)}"
+                    )
+                request_id, prompt, sampling_params, kv_meta, src_block_ids = (
+                    handoff_payload[:5]
+                )
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 nvtx_range_push("add_request_with_kv_handoff")
                 self.add_request_with_kv_handoff(

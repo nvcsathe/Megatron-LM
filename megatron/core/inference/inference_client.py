@@ -125,15 +125,20 @@ class InferenceClient:
         sampling_params: SamplingParams,
         kv_meta: dict,
         src_block_ids: List[int],
+        first_token: Optional[int] = None,
     ) -> AsyncIterator[dict]:
         """Phase-3 disagg: submit a streaming request whose KV state was imported.
 
         The decode engine allocates local blocks, NIXL-pulls KV from the
         prefill peer described by ``kv_meta``, then begins generation.
+        ``first_token`` is accepted for compatibility with older callers and
+        ignored; decode now generates the first output token itself.
 
         Returns the same per-step partial/final iterator as
         :meth:`add_request_streaming`.
         """
+        if first_token is not None:
+            logging.debug("Client: ignoring deprecated handoff first_token field")
         sampling_params.streaming = True
         request_id = self.next_request_id
         self.next_request_id += 1

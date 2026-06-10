@@ -595,8 +595,16 @@ class DataParallelInferenceCoordinator:
                         f"Received SUBMIT_REQUEST_WITH_KV from unknown client {sender_identity}; ignoring."
                     )
                     continue
+                handoff_payload = deserialized_payload[1:]
+                if len(handoff_payload) not in (5, 6):
+                    logging.error(
+                        "Coordinator: malformed SUBMIT_REQUEST_WITH_KV payload "
+                        "with %d fields",
+                        len(handoff_payload),
+                    )
+                    continue
                 client_request_id, prompt, sampling_params, kv_meta, src_block_ids = (
-                    deserialized_payload[1:]
+                    handoff_payload[:5]
                 )
                 request_id = self.next_request_id
                 self.next_request_id += 1
