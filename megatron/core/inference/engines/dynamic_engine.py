@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
 from itertools import repeat
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -307,6 +307,10 @@ class DynamicInferenceEngine(AbstractEngine):
         # NIXL bridge. None until setup_kv_transfer() is called by the
         # launcher.
         self._kv_transfer_agent = None
+        # All prefill TP ranks' KV metadata (set in setup_kv_transfer when
+        # TP>1); shipped in the handoff so a different-TP decode peer can
+        # re-shard. None → matched-TP / single-rank, ship only local meta.
+        self._kv_peer_metas = None
 
         # Create cuda graphs.
         self.create_cuda_graphs()
@@ -324,13 +328,44 @@ class DynamicInferenceEngine(AbstractEngine):
         from megatron.core.inference.kv_transfer import make_agent
 
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+
+        # TP topology, so a peer at a different TP can re-shard our KV heads.
+        # KV heads under GQA == num_query_groups (falls back to attention heads).
+        model_config = self.controller.inference_wrapped_model.model.config
+        num_kv_heads_global = (
+            model_config.num_query_groups or model_config.num_attention_heads
+        )
+        tp_size = get_pg_size(self.pg_collection.tp)
+        tp_rank = get_pg_rank(self.pg_collection.tp)
+
         self._kv_transfer_agent = make_agent(
             role=role,
             rank=rank,
             listen_addr=listen_addr,
             memory_buffer=self.context.memory_buffer,
             expected_num_blocks=self.context.kv_block_allocator.total_count,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            num_kv_heads_global=num_kv_heads_global,
+            heads_per_partition=self.context.num_attention_heads_per_partition,
+            head_dim=self.context.hidden_size_per_attention_head,
+            tokens_per_block=self.context.block_size_tokens,
         )
+
+        # Gather every prefill TP rank's NIXL metadata ONCE (it is static after
+        # registration). A decode peer running at a different TP needs all of
+        # them to reconstruct its local KV-head shard; for matched TP the
+        # decode side just picks its corresponding entry (fast path). The
+        # gather is a collective over the TP group — safe here because all TP
+        # ranks call setup_kv_transfer() together at startup.
+        self._kv_peer_metas = None
+        if self._kv_transfer_agent is not None and torch.distributed.is_initialized() and tp_size > 1:
+            local_meta = self._kv_transfer_agent.export_meta()
+            gathered: list = [None] * tp_size
+            torch.distributed.all_gather_object(
+                gathered, local_meta, group=self.pg_collection.tp
+            )
+            self._kv_peer_metas = gathered
 
     def _capture_handoff_meta(
         self, request: "DynamicInferenceRequest", block_ids: list
@@ -356,9 +391,14 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self._pinned_handoff_blocks[rid] = list(block_ids)
 
-        # Build the dict that ships back to the prefill client.
-        kv_meta: Dict = {}
-        if self._kv_transfer_agent is not None:
+        # Build the dict that ships back to the prefill client. When we gathered
+        # every TP rank's metadata (TP>1), ship the whole list so a decode peer
+        # at a different TP can re-shard; pull_blocks accepts a list or a single
+        # dict. Otherwise ship just this rank's meta (matched-TP fast path).
+        kv_meta: Any = {}
+        if self._kv_peer_metas is not None:
+            kv_meta = self._kv_peer_metas
+        elif self._kv_transfer_agent is not None:
             kv_meta = self._kv_transfer_agent.export_meta()
         request.disaggregated_params = {
             "request_id": rid,
