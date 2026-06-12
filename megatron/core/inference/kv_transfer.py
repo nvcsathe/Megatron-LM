@@ -40,6 +40,12 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
+from megatron.core.inference.kv_reshard_plan import (
+    KvTopology,
+    TransferSegment,
+    build_reshard_plan,
+)
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -88,6 +94,9 @@ class KvTransferAgent:
         heads_per_partition: Optional[int] = None,
         head_dim: Optional[int] = None,
         tokens_per_block: Optional[int] = None,
+        pp_rank: Optional[int] = None,
+        layer_start: Optional[int] = None,
+        layer_end: Optional[int] = None,
     ):
         if not _HAVE_NIXL:
             raise RuntimeError(
@@ -116,6 +125,12 @@ class KvTransferAgent:
             head_dim,
             tokens_per_block,
         )
+        # PP topology — used for heterogeneous-PP KV layer re-sharding.
+        # layer_start/layer_end are global attention-layer indices (exclusive end)
+        # owned by this PP rank. None → PP=1 or unknown, no layer subsetting.
+        self._pp_rank = pp_rank
+        self._layer_start = layer_start
+        self._layer_end = layer_end
 
         # Locate the blocks axis. Megatron has two layouts:
         #   - MLA:        [layers, blocks, block_size, kv_dim]            → axis 1
@@ -168,6 +183,20 @@ class KvTransferAgent:
         self._outer_stride_bytes = self._num_blocks * self._bytes_per_slice
         # Total bytes per logical block (informational).
         self._per_block_bytes = self._num_outer * self._bytes_per_slice
+
+        # Topology snapshot — passed to kv_reshard_plan functions at transfer time.
+        self._topology = KvTopology(
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            num_kv_heads_global=num_kv_heads_global,
+            heads_per_partition=heads_per_partition,
+            head_dim=head_dim,
+            tokens_per_block=tokens_per_block,
+            pp_rank=pp_rank,
+            layer_start=layer_start,
+            layer_end=layer_end,
+            num_outer=self._num_outer,
+        )
 
         # UCX transport selection — must happen before the nixl_agent() constructor
         # creates the UCX worker context.
@@ -259,6 +288,17 @@ class KvTransferAgent:
                     "tokens_per_block": self._tokens_per_block,
                 }
             )
+        # PP topology — present when built with layer_start/layer_end. Allows a
+        # decode peer at a different PP size to select only the outer (layer)
+        # slices it owns from each prefill PP rank's buffer.
+        if self._layer_start is not None and self._layer_end is not None:
+            meta.update(
+                {
+                    "pp_rank": self._pp_rank,
+                    "layer_start": self._layer_start,
+                    "layer_end": self._layer_end,
+                }
+            )
         return meta
 
     def _ensure_peer_registered(self, peer_meta: Dict[str, Any]) -> str:
@@ -294,43 +334,24 @@ class KvTransferAgent:
         Args:
             peer_meta: an ``export_meta()`` dict from a single prefill peer, OR a
                 list of such dicts (one per prefill TP rank) when prefill and
-                decode run at different TP. Block ids are identical across all
-                prefill TP ranks (lockstep allocator), so ``src_block_ids`` /
-                ``dst_block_ids`` apply to every peer.
-            src_block_ids: Block ids on the peer(s) (paired 1:1 with dst_block_ids).
+                decode run at different TP. For heterogeneous-PP handoffs this is
+                ``{"pp_metas": [{"tp_metas": ..., "block_ids": [...]}, ...]}``.
+            src_block_ids: Block ids on the peer(s). Unused for the PP path (each
+                PP entry carries its own block_ids); required for TP-only paths.
             dst_block_ids: Local block ids to write into.
         """
-        if len(src_block_ids) != len(dst_block_ids):
-            raise ValueError(
-                f"src/dst block_id length mismatch: "
-                f"{len(src_block_ids)} vs {len(dst_block_ids)}"
-            )
-        if not src_block_ids:
-            return
+        if not isinstance(peer_meta, dict) or "pp_metas" not in peer_meta:
+            if len(src_block_ids) != len(dst_block_ids):
+                raise ValueError(
+                    f"src/dst block_id length mismatch: "
+                    f"{len(src_block_ids)} vs {len(dst_block_ids)}"
+                )
+            if not src_block_ids:
+                return
 
-        peer_metas = peer_meta if isinstance(peer_meta, list) else [peer_meta]
-
-        # Fast path: a single peer whose scatter-gather layout matches ours
-        # exactly (equal TP/PP/dtype). This is the original, head-agnostic
-        # whole-slice copy — cheapest possible, one descriptor per (block,
-        # outer-index).
-        if len(peer_metas) == 1 and self._layout_matches(peer_metas[0]):
-            self._pull_matched(peer_metas[0], src_block_ids, dst_block_ids)
-            return
-
-        # Heterogeneous-TP path: re-shard KV heads on the way in.
-        self._pull_resharded(peer_metas, src_block_ids, dst_block_ids)
-
-    def _layout_matches(self, peer_meta: Dict[str, Any]) -> bool:
-        """True iff peer's scatter-gather layout is byte-identical to ours."""
-        return all(
-            peer_meta.get(key) == local
-            for key, local in (
-                ("bytes_per_slice", self._bytes_per_slice),
-                ("num_outer", self._num_outer),
-                ("outer_stride_bytes", self._outer_stride_bytes),
-            )
-        )
+        segments = build_reshard_plan(peer_meta, src_block_ids, self._topology)
+        for seg in segments:
+            self._execute_segment(seg, dst_block_ids)
 
     def _await_xfer(self, xfer: Any, ctx: str) -> None:
         """Submit + spin-poll a NIXL transfer to completion."""
@@ -349,179 +370,71 @@ class KvTransferAgent:
                 )
             time.sleep(_POLL_INTERVAL_S)
 
-    def _pull_matched(
-        self,
-        peer_meta: Dict[str, Any],
-        src_block_ids: List[int],
-        dst_block_ids: List[int],
-    ) -> None:
-        peer_base = peer_meta["base_addr"]
-        peer_device_id = peer_meta.get("device_id", 0)
-        peer_id = self._ensure_peer_registered(peer_meta)
+    def _execute_segment(self, seg: TransferSegment, dst_block_ids: List[int]) -> None:
+        """Execute one :class:`TransferSegment` via NIXL.
 
-        # Each logical block contributes `num_outer` non-contiguous slices.
-        # Generate one descriptor per (block, outer-index) pair on each side.
-        bps = self._bytes_per_slice
-        os_stride = self._outer_stride_bytes
-        src_tuples = []
-        dst_tuples = []
-        for src_b, dst_b in zip(src_block_ids, dst_block_ids):
-            src_block_offset = src_b * bps
-            dst_block_offset = dst_b * bps
-            for o in range(self._num_outer):
-                src_tuples.append(
-                    (peer_base + o * os_stride + src_block_offset, bps, peer_device_id)
-                )
-                dst_tuples.append(
-                    (self._buf_ptr + o * os_stride + dst_block_offset, bps, self._device_id)
-                )
+        Two execution paths driven by ``seg.n_heads``:
 
-        src_descs = self._agent.get_xfer_descs(src_tuples, mem_type="VRAM")
-        dst_descs = self._agent.get_xfer_descs(dst_tuples, mem_type="VRAM")
-        # READ pulls remote → local: src_descs = where on the peer, dst_descs
-        # = where to put it locally. NIXL's signature is (op, LOCAL, REMOTE,
-        # peer); for "READ" the local side is the destination.
-        xfer = self._agent.initialize_xfer("READ", dst_descs, src_descs, peer_id)
-        self._await_xfer(xfer, f"peer={peer_id}, blocks={len(src_block_ids)}")
+        - ``n_heads == 0``: full-slice matched copy. One descriptor per
+          ``(dst_block, outer)`` pair. Uses the peer's own stride/size values for
+          src so the method is correct even when prefill and decode have different
+          block pool sizes (different ``outer_stride_bytes``).
 
-    def reshard_plan(self, peer_metas: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Compute which (peer, head-range) fragments this rank must pull.
-
-        KV heads live in a global index space ``[0, num_kv_heads_global)`` (==
-        ``num_query_groups`` under GQA). A rank at TP ``t``/``rank r`` owns the
-        contiguous range ``[r*Hpp, (r+1)*Hpp)`` where ``Hpp =
-        num_kv_heads_global / t``. For each prefill peer we intersect its owned
-        range with ours; the overlap is the slice of heads to copy, expressed as
-        offsets into the peer's slice (``src_h0``) and our slice (``dst_h0``).
-
-        Returns a list of ``{peer, src_h0, dst_h0, n_heads}``. Raises if the
-        union of fragments does not exactly cover our local head range — that
-        means an incompatible (non-divisible) TP combination.
+        - ``n_heads > 0``: head sub-range copy. One descriptor per
+          ``(dst_block, outer, token)`` triple. Used when TP differs between
+          prefill and decode so each token's ``[H, d]`` slice must be partially
+          copied.
         """
-        if not self._reshard_capable:
-            raise RuntimeError(
-                "KvTransferAgent is not reshard-capable (no TP topology). "
-                "Heterogeneous-TP handoff requires the decode agent to be built "
-                "with tp_size/num_kv_heads_global/etc."
-            )
-        g = self._num_kv_heads_global
-        local_hpp = self._heads_per_partition
-        # Replication regime (TP > num_kv_heads_global) repeats whole heads
-        # across ranks rather than partitioning them; the simple range-overlap
-        # model below doesn't describe it. Only matched TP (fast path) is
-        # supported there for now.
-        if local_hpp * self._tp_size != g:
-            raise NotImplementedError(
-                f"KV-head replication regime not supported for re-shard "
-                f"(local heads_per_partition={local_hpp} * tp={self._tp_size} "
-                f"!= num_kv_heads_global={g}). Use matched TP, or keep TP "
-                f"<= num_query_groups on both sides."
-            )
-        local_lo = self._tp_rank * local_hpp
-        local_hi = local_lo + local_hpp
+        pm = seg.peer_meta
+        peer_base = pm["base_addr"]
+        peer_device_id = pm.get("device_id", 0)
+        peer_bps = pm["bytes_per_slice"]
+        peer_os = pm["outer_stride_bytes"]
+        peer_id = self._ensure_peer_registered(pm)
 
-        plan: List[Dict[str, Any]] = []
-        for pm in peer_metas:
-            for key in ("tp_size", "tp_rank", "heads_per_partition", "head_dim",
-                        "tokens_per_block", "num_kv_heads_global"):
-                if pm.get(key) is None:
-                    raise ValueError(
-                        f"peer_meta missing topology field {key!r}; prefill "
-                        "engine must be reshard-capable for heterogeneous TP."
-                    )
-            if pm["num_kv_heads_global"] != g:
-                raise ValueError(
-                    f"num_kv_heads_global mismatch peer={pm['num_kv_heads_global']} "
-                    f"local={g} (different model?)."
-                )
-            if pm["head_dim"] != self._head_dim or pm["tokens_per_block"] != self._tokens_per_block:
-                raise ValueError(
-                    "head_dim/tokens_per_block mismatch — only TP may differ "
-                    "between prefill and decode, not head dim or block size."
-                )
-            if pm["num_outer"] != self._num_outer:
-                raise ValueError(
-                    f"num_outer mismatch peer={pm['num_outer']} local={self._num_outer} "
-                    "— PP/layer-count must match (PP-heterogeneous unsupported)."
-                )
-            p_hpp = pm["heads_per_partition"]
-            p_lo = pm["tp_rank"] * p_hpp
-            p_hi = p_lo + p_hpp
-            lo = max(local_lo, p_lo)
-            hi = min(local_hi, p_hi)
-            if hi <= lo:
-                continue
-            plan.append(
-                {
-                    "peer": pm,
-                    "src_h0": lo - p_lo,
-                    "dst_h0": lo - local_lo,
-                    "n_heads": hi - lo,
-                }
-            )
+        src_block_ids = seg.src_block_ids
+        src_o_start = seg.src_o_start
+        dst_o_start = seg.dst_o_start
+        n_outer = seg.n_outer
+        bps = self._bytes_per_slice
+        local_os = self._outer_stride_bytes
 
-        covered = sum(item["n_heads"] for item in plan)
-        if covered != local_hpp:
-            raise ValueError(
-                f"re-shard plan covers {covered} of {local_hpp} local KV heads; "
-                f"prefill TP set {[pm.get('tp_size') for pm in peer_metas]} is not "
-                f"compatible with decode TP {self._tp_size} (one must divide the "
-                "other and both must divide num_kv_heads_global)."
-            )
-        return plan
+        src_tuples: List[Any] = []
+        dst_tuples: List[Any] = []
 
-    def _pull_resharded(
-        self,
-        peer_metas: List[Dict[str, Any]],
-        src_block_ids: List[int],
-        dst_block_ids: List[int],
-    ) -> None:
-        plan = self.reshard_plan(peer_metas)
-
-        # Equal-TP shortcut: the gathered list is shipped even when TP matches,
-        # but the plan then resolves to a single peer covering our full head
-        # range with identical layout. Take the cheap whole-slice copy instead
-        # of per-token fragments.
-        if (
-            len(plan) == 1
-            and plan[0]["n_heads"] == self._heads_per_partition
-            and plan[0]["src_h0"] == 0
-            and plan[0]["dst_h0"] == 0
-            and self._layout_matches(plan[0]["peer"])
-        ):
-            self._pull_matched(plan[0]["peer"], src_block_ids, dst_block_ids)
-            return
-
-        d_bytes = self._head_dim * self._element_size
-        local_token_stride = self._heads_per_partition * d_bytes
-        T = self._tokens_per_block
-        num_outer = self._num_outer
-
-        # One NIXL transfer per contributing peer (each is a distinct remote
-        # agent). Within a peer, a head sub-range is strided across the T tokens
-        # of every (outer, block) slice — layout is [T, H, d] — so we emit one
-        # descriptor per (block, outer, token).
-        for item in plan:
-            pm = item["peer"]
-            peer_base = pm["base_addr"]
-            peer_device_id = pm.get("device_id", 0)
-            peer_bps = pm["bytes_per_slice"]
-            peer_os = pm["outer_stride_bytes"]
-            peer_token_stride = pm["heads_per_partition"] * d_bytes
-            peer_id = self._ensure_peer_registered(pm)
-
-            frag_bytes = item["n_heads"] * d_bytes
-            src_h_off = item["src_h0"] * d_bytes
-            dst_h_off = item["dst_h0"] * d_bytes
-
-            src_tuples = []
-            dst_tuples = []
+        if seg.n_heads == 0:
+            # Matched layout: copy one full bytes_per_slice per (block, outer).
             for src_b, dst_b in zip(src_block_ids, dst_block_ids):
-                src_block_off = src_b * peer_bps
-                dst_block_off = dst_b * self._bytes_per_slice
-                for o in range(num_outer):
-                    src_slice = peer_base + o * peer_os + src_block_off + src_h_off
-                    dst_slice = self._buf_ptr + o * self._outer_stride_bytes + dst_block_off + dst_h_off
+                for i in range(n_outer):
+                    src_o = src_o_start + i
+                    dst_o = dst_o_start + i
+                    src_tuples.append(
+                        (peer_base + src_o * peer_os + src_b * peer_bps, peer_bps, peer_device_id)
+                    )
+                    dst_tuples.append(
+                        (self._buf_ptr + dst_o * local_os + dst_b * bps, bps, self._device_id)
+                    )
+            ctx = (
+                f"matched peer={peer_id} outer[{src_o_start}:+{n_outer}] "
+                f"blocks={len(src_block_ids)}"
+            )
+        else:
+            # Head sub-range: copy n_heads×head_dim bytes per token.
+            topo = self._topology
+            d_bytes = topo.head_dim * self._element_size  # type: ignore[operator]
+            local_token_stride = topo.heads_per_partition * d_bytes  # type: ignore[operator]
+            peer_token_stride = pm["heads_per_partition"] * d_bytes
+            T = topo.tokens_per_block
+            frag_bytes = seg.n_heads * d_bytes
+            src_h_off = seg.src_h0 * d_bytes
+            dst_h_off = seg.dst_h0 * d_bytes
+
+            for src_b, dst_b in zip(src_block_ids, dst_block_ids):
+                for i in range(n_outer):
+                    src_o = src_o_start + i
+                    dst_o = dst_o_start + i
+                    src_slice = peer_base + src_o * peer_os + src_b * peer_bps + src_h_off
+                    dst_slice = self._buf_ptr + dst_o * local_os + dst_b * bps + dst_h_off
                     for t in range(T):
                         src_tuples.append(
                             (src_slice + t * peer_token_stride, frag_bytes, peer_device_id)
@@ -529,15 +442,16 @@ class KvTransferAgent:
                         dst_tuples.append(
                             (dst_slice + t * local_token_stride, frag_bytes, self._device_id)
                         )
-
-            src_descs = self._agent.get_xfer_descs(src_tuples, mem_type="VRAM")
-            dst_descs = self._agent.get_xfer_descs(dst_tuples, mem_type="VRAM")
-            xfer = self._agent.initialize_xfer("READ", dst_descs, src_descs, peer_id)
-            self._await_xfer(
-                xfer,
-                f"reshard peer={peer_id} heads[{item['src_h0']}:+{item['n_heads']}] "
-                f"blocks={len(src_block_ids)}",
+            ctx = (
+                f"reshard peer={peer_id} outer[{src_o_start}:+{n_outer}] "
+                f"heads[{seg.src_h0}:+{seg.n_heads}] blocks={len(src_block_ids)}"
             )
+
+        src_descs = self._agent.get_xfer_descs(src_tuples, mem_type="VRAM")
+        dst_descs = self._agent.get_xfer_descs(dst_tuples, mem_type="VRAM")
+        # READ pulls remote → local. NIXL's signature is (op, LOCAL, REMOTE, peer).
+        xfer = self._agent.initialize_xfer("READ", dst_descs, src_descs, peer_id)
+        self._await_xfer(xfer, ctx)
 
     def close(self) -> None:
         if self._agent is None:
@@ -561,6 +475,9 @@ def make_agent(
     heads_per_partition: Optional[int] = None,
     head_dim: Optional[int] = None,
     tokens_per_block: Optional[int] = None,
+    pp_rank: Optional[int] = None,
+    layer_start: Optional[int] = None,
+    layer_end: Optional[int] = None,
 ) -> Optional[KvTransferAgent]:
     """Construct an agent, or return None when KV transfer is disabled.
 
@@ -572,6 +489,11 @@ def make_agent(
     The ``tp_*`` / head / block args enable heterogeneous-TP re-sharding; pass
     them from the engine's parallel state + KV context. When omitted the agent
     only supports matched layouts.
+
+    The ``pp_*`` / layer args enable heterogeneous-PP layer re-sharding. Pass
+    ``pp_rank``, ``layer_start``, and ``layer_end`` (global attention-layer
+    indices, inclusive start / exclusive end) so the agent can expose its layer
+    partition to decode peers and select the right outer-slice range when pulling.
     """
     if not listen_addr:
         return None
@@ -586,4 +508,7 @@ def make_agent(
         heads_per_partition=heads_per_partition,
         head_dim=head_dim,
         tokens_per_block=tokens_per_block,
+        pp_rank=pp_rank,
+        layer_start=layer_start,
+        layer_end=layer_end,
     )

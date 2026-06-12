@@ -338,6 +338,22 @@ class DynamicInferenceEngine(AbstractEngine):
         tp_size = get_pg_size(self.pg_collection.tp)
         tp_rank = get_pg_rank(self.pg_collection.tp)
 
+        # PP: compute layer_start/layer_end for this rank. All PP ranks all_gather
+        # their local layer counts; prefix-sum gives the global layer offset.
+        pp_size = get_pg_size(self.pg_collection.pp)
+        pp_rank = get_pg_rank(self.pg_collection.pp)
+        local_num_layers = self.context.num_attention_layers
+
+        if pp_size > 1 and torch.distributed.is_initialized():
+            layer_counts: list = [None] * pp_size
+            torch.distributed.all_gather_object(
+                layer_counts, local_num_layers, group=self.pg_collection.pp
+            )
+            layer_start = sum(layer_counts[:pp_rank])
+        else:
+            layer_start = 0
+        layer_end = layer_start + local_num_layers
+
         self._kv_transfer_agent = make_agent(
             role=role,
             rank=rank,
@@ -350,6 +366,9 @@ class DynamicInferenceEngine(AbstractEngine):
             heads_per_partition=self.context.num_attention_heads_per_partition,
             head_dim=self.context.hidden_size_per_attention_head,
             tokens_per_block=self.context.block_size_tokens,
+            pp_rank=pp_rank,
+            layer_start=layer_start,
+            layer_end=layer_end,
         )
 
         # Gather every prefill TP rank's NIXL metadata ONCE (it is static after
@@ -389,20 +408,44 @@ class DynamicInferenceEngine(AbstractEngine):
             )
             return
 
+        # Each PP rank pins its OWN local blocks; release is per-rank.
         self._pinned_handoff_blocks[rid] = list(block_ids)
 
-        # Build the dict that ships back to the prefill client. When we gathered
-        # every TP rank's metadata (TP>1), ship the whole list so a decode peer
-        # at a different TP can re-shard; pull_blocks accepts a list or a single
-        # dict. Otherwise ship just this rank's meta (matched-TP fast path).
-        kv_meta: Any = {}
+        # Build the per-rank kv meta (TP-gathered list or single dict).
+        local_kv: Any = {}
         if self._kv_peer_metas is not None:
-            kv_meta = self._kv_peer_metas
+            local_kv = self._kv_peer_metas
         elif self._kv_transfer_agent is not None:
-            kv_meta = self._kv_transfer_agent.export_meta()
+            local_kv = self._kv_transfer_agent.export_meta()
+
+        pp_size = get_pg_size(self.pg_collection.pp)
+        if pp_size > 1 and torch.distributed.is_initialized():
+            # All PP ranks participate in this collective simultaneously — they
+            # are synchronised by the engine step that detected request completion
+            # (sampled tokens are broadcast from the last PP stage, so all ranks
+            # agree on which requests finished and call _capture_handoff_meta in
+            # the same engine-step iteration and in the same request order).
+            local_entry = {"kv_meta": local_kv, "block_ids": list(block_ids)}
+            gathered: list = [None] * pp_size
+            torch.distributed.all_gather_object(
+                gathered, local_entry, group=self.pg_collection.pp
+            )
+            kv_meta: Any = {
+                "pp_metas": [
+                    {"tp_metas": e["kv_meta"], "block_ids": e["block_ids"]}
+                    for e in gathered
+                ]
+            }
+            # Top-level block_ids = pp_rank=0's blocks for Dynamo-handler compat.
+            # The decode path reads per-rank block_ids from kv_meta["pp_metas"].
+            top_block_ids: Any = gathered[0]["block_ids"]
+        else:
+            kv_meta = local_kv
+            top_block_ids = block_ids
+
         request.disaggregated_params = {
             "request_id": rid,
-            "block_ids": block_ids,
+            "block_ids": top_block_ids,
             "kv_meta": kv_meta,
         }
         logging.info(
@@ -470,7 +513,16 @@ class DynamicInferenceEngine(AbstractEngine):
             )
 
         # 1. Allocate local blocks to hold the imported KV state.
-        num_blocks = len(src_block_ids)
+        # For heterogeneous-PP handoffs, kv_meta carries per-PP-rank block_ids
+        # inside "pp_metas"; the top-level src_block_ids contains only pp_rank=0's
+        # blocks. Use the count from the first PP-rank entry as the canonical
+        # sequence-block count (all PP ranks hold the same number of blocks for a
+        # given sequence length).
+        if isinstance(kv_meta, dict) and "pp_metas" in kv_meta:
+            pp_metas = kv_meta["pp_metas"]
+            num_blocks = len(pp_metas[0]["block_ids"]) if pp_metas else 0
+        else:
+            num_blocks = len(src_block_ids)
         local_blocks_tensor = allocator.allocate_memory_blocks(num_blocks)
         if local_blocks_tensor is None:
             raise RuntimeError(
