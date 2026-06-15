@@ -311,6 +311,15 @@ class DynamicInferenceEngine(AbstractEngine):
         # TP>1); shipped in the handoff so a different-TP decode peer can
         # re-shard. None → matched-TP / single-rank, ship only local meta.
         self._kv_peer_metas = None
+        # Mamba (SSM) state transfer agents for hybrid models (Nemotron Nano
+        # etc.). These mirror ``_kv_transfer_agent`` but register the Mamba
+        # cache's conv/ssm slot pools so the recurrent state can ride the same
+        # NIXL path as attention KV during a prefill→decode handoff. None until
+        # setup_kv_transfer() runs and only populated for hybrid models. See
+        # _capture_handoff_meta (export) and add_request_with_kv_handoff
+        # (import).
+        self._mamba_conv_agent = None
+        self._mamba_ssm_agent = None
 
         # Create cuda graphs.
         self.create_cuda_graphs()
@@ -386,6 +395,55 @@ class DynamicInferenceEngine(AbstractEngine):
             )
             self._kv_peer_metas = gathered
 
+        # Hybrid (Mamba) models: bring up two more NIXL agents over the Mamba
+        # conv/ssm slot pools so the recurrent state transfers alongside KV.
+        #
+        # The slot pools are laid out [num_mamba_layers, max_slots, *state]
+        # — exactly the [outer, blocks, ...] layout KvTransferAgent already
+        # understands, with the cache slot playing the role of the "block". We
+        # therefore reuse make_agent (matched-layout fast path) by passing
+        # ``expected_num_blocks=max_slots``.
+        #
+        # Scope: matched TP=1/PP=1 only. Mamba conv/ssm state is sharded across
+        # TP (by head group) and PP (by layer); unlike attention KV heads there
+        # is no reshard plan for it yet (kv_reshard_plan handles KV heads only).
+        # Fail loud at launch rather than silently zeroing state at the first
+        # handoff — a hybrid model with mismatched/parallel layouts would
+        # otherwise produce wrong decode output.
+        self._mamba_conv_agent = None
+        self._mamba_ssm_agent = None
+        if getattr(self.context, "is_hybrid_model", False):
+            if tp_size > 1 or pp_size > 1:
+                raise NotImplementedError(
+                    "Disaggregated KV handoff for hybrid (Mamba) models "
+                    f"currently supports only TP=1/PP=1 (got tp={tp_size}, "
+                    f"pp={pp_size}). Mamba conv/ssm state re-sharding across "
+                    "TP/PP is not implemented. Run prefill and decode at "
+                    "TP=1 PP=1, or disable KV transfer for this model."
+                )
+            msa = getattr(self.context, "mamba_slot_allocator", None)
+            if msa is None:
+                raise RuntimeError(
+                    "Hybrid model KV handoff requires the Mamba state cache. "
+                    "Pass --inference-dynamic-batching-prefix-caching and "
+                    "--inference-dynamic-batching-prefix-caching-mamba-gb <GB> "
+                    "so the decode engine can restore transferred Mamba state."
+                )
+            self._mamba_conv_agent = make_agent(
+                role=f"{role}-mamba-conv",
+                rank=rank,
+                listen_addr=listen_addr,
+                memory_buffer=msa.conv_states,
+                expected_num_blocks=msa.max_slots,
+            )
+            self._mamba_ssm_agent = make_agent(
+                role=f"{role}-mamba-ssm",
+                rank=rank,
+                listen_addr=listen_addr,
+                memory_buffer=msa.ssm_states,
+                expected_num_blocks=msa.max_slots,
+            )
+
     def _capture_handoff_meta(
         self, request: "DynamicInferenceRequest", block_ids: list
     ) -> None:
@@ -443,15 +501,39 @@ class DynamicInferenceEngine(AbstractEngine):
             kv_meta = local_kv
             top_block_ids = block_ids
 
+        # Hybrid models: nest the Mamba state meta inside kv_meta so it rides
+        # the existing handoff transport verbatim (the coordinator forwards
+        # kv_meta as one opaque object to the decode peer). We export, per
+        # handoff block that has a committed Mamba snapshot, its position in the
+        # block list and the source cache slot. The decode side maps position →
+        # its own local block + a freshly allocated local slot and pulls the
+        # conv/ssm state over NIXL.
+        #
+        # Matched TP=1/PP=1 only (enforced in setup_kv_transfer), so kv_meta is
+        # the flat single-rank export dict here — safe to attach a key to.
+        if self._mamba_conv_agent is not None and isinstance(kv_meta, dict):
+            msa = self.context.mamba_slot_allocator
+            mamba_blocks = []
+            for pos, b in enumerate(block_ids):
+                slot = msa.get_slot(int(b))
+                if slot >= 0:
+                    mamba_blocks.append([pos, int(slot)])
+            kv_meta["mamba"] = {
+                "conv": self._mamba_conv_agent.export_meta(),
+                "ssm": self._mamba_ssm_agent.export_meta(),
+                "blocks": mamba_blocks,
+            }
+
         request.disaggregated_params = {
             "request_id": rid,
             "block_ids": top_block_ids,
             "kv_meta": kv_meta,
         }
         logging.info(
-            "DISAGG_PREFILL_HANDOFF request_id=%d pinned_blocks=%d",
+            "DISAGG_PREFILL_HANDOFF request_id=%d pinned_blocks=%d mamba_blocks=%d",
             rid,
             len(block_ids),
+            len(kv_meta.get("mamba", {}).get("blocks", [])) if isinstance(kv_meta, dict) else 0,
         )
 
     def release_handoff_blocks(self, request_id: int) -> None:
@@ -568,6 +650,20 @@ class DynamicInferenceEngine(AbstractEngine):
             n,
         )
 
+        # 4b. Hybrid models: import the Mamba (conv/ssm) recurrent state that the
+        #     prefill peer cached at block boundaries. We populate this decode
+        #     engine's Mamba cache (block→slot + hash→block) so the *existing*
+        #     restore path takes over: schedule_*_prefill runs
+        #     _find_mamba_match_count against hash_to_block_id, _compute_prefix_match
+        #     sets prefix_skip_tokens to the matched Mamba block boundary, and
+        #     context.add_request appends a _pending_mamba_restore that copies the
+        #     transferred slot into the live per-request buffer. The short tail
+        #     after that boundary is re-prefilled, which advances the recurrence
+        #     to the exact handoff position (no off-by-one, no zeroed state).
+        mamba_meta = kv_meta.get("mamba") if isinstance(kv_meta, dict) else None
+        if mamba_meta:
+            self._import_mamba_handoff(request_id, mamba_meta, local_blocks, hashes)
+
         # 5. Add the request via the standard path, injecting the hashes we just
         #    registered (including the partial block's hash when n covers it).
         #    DynamicInferenceRequest.__post_init__ skips its own hash recompute
@@ -583,6 +679,68 @@ class DynamicInferenceEngine(AbstractEngine):
         return self.add_request(
             request_id, prompt, sampling_params,
             precomputed_block_hashes=hashes[:n] if n > 0 else None,
+        )
+
+    def _import_mamba_handoff(
+        self,
+        request_id: int,
+        mamba_meta: dict,
+        local_blocks: list,
+        hashes: list,
+    ) -> None:
+        """Pull the prefill peer's Mamba state into this decode engine's cache.
+
+        ``mamba_meta`` is the ``{"conv", "ssm", "blocks"}`` dict the prefill side
+        nested in ``kv_meta`` (see :meth:`_capture_handoff_meta`). ``blocks`` is a
+        list of ``[position, src_slot]`` pairs: ``position`` indexes into the
+        request's block list (so the local block is ``local_blocks[position]``)
+        and ``src_slot`` is the cache slot on the peer.
+
+        For each such block we allocate a local Mamba slot, NIXL-pull the conv and
+        ssm state from the peer slot into it, and register the block in both
+        ``block_to_slot`` (so ``restore_to_live`` can find it) and
+        ``hash_to_block_id`` (so ``_find_mamba_match_count`` matches it). The
+        standard scheduling/add_request path then restores it.
+        """
+        pairs = mamba_meta.get("blocks") or []
+        if not pairs:
+            return
+        if self._mamba_conv_agent is None or self._mamba_ssm_agent is None:
+            raise RuntimeError(
+                "Received Mamba handoff state but this decode engine has no "
+                "Mamba transfer agents. Ensure it runs a hybrid model with "
+                "--inference-dynamic-batching-prefix-caching-mamba-gb set and "
+                "KV transfer enabled (matched TP=1/PP=1)."
+            )
+        msa = self.context.mamba_slot_allocator
+        if msa is None:
+            raise RuntimeError(
+                "Mamba handoff requires the decode engine's Mamba state cache; "
+                "pass --inference-dynamic-batching-prefix-caching-mamba-gb."
+            )
+
+        positions = [int(p) for p, _ in pairs]
+        src_slots = [int(s) for _, s in pairs]
+        # Map peer block positions onto our freshly imported local blocks. These
+        # are complete blocks (Mamba snapshots are only committed at block/chunk
+        # boundaries), so every position is a valid index into local_blocks and
+        # has a corresponding prompt block hash.
+        target_blocks = [int(local_blocks[p]) for p in positions]
+
+        # Allocate local cache slots (also writes block_to_slot / slot_to_block).
+        local_slots = msa.allocate_slots_batch(target_blocks)
+
+        # Pull conv + ssm state peer_slot -> local_slot over NIXL (matched path).
+        self._mamba_conv_agent.pull_blocks(mamba_meta["conv"], src_slots, local_slots)
+        self._mamba_ssm_agent.pull_blocks(mamba_meta["ssm"], src_slots, local_slots)
+
+        # Register block hashes so _find_mamba_match_count sees the cached state.
+        msa.register_block_hashes_batch(target_blocks, [hashes[p] for p in positions])
+
+        logging.info(
+            "DISAGG_DECODE_MAMBA_IMPORT request_id=%d mamba_blocks=%d",
+            request_id,
+            len(target_blocks),
         )
 
     def reset(self) -> None:

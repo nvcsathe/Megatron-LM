@@ -405,6 +405,10 @@ class DynamicInferenceRequest(InferenceRequest):
     # request finishes, the engine pins this request's blocks and populates
     # `disaggregated_params` with the metadata a decode peer needs to pull
     # them over NIXL. Shape: {"request_id", "block_ids", "kv_meta"}.
+    # For hybrid (Mamba) models, kv_meta additionally carries a nested
+    # "mamba" entry ({"conv", "ssm", "blocks"}) so the recurrent conv/ssm
+    # state transfers over NIXL alongside attention KV; the decode engine
+    # restores it via the existing Mamba prefix-cache path.
     disaggregated_params: Optional[dict] = None
 
     def __post_init__(self):
