@@ -324,12 +324,16 @@ def _tp_to_segments(
     fragments = tp_reshard_plan(peer_metas, local, check_outer=check_outer)
 
     # Equal-TP shortcut: plan resolves to a single peer covering our full head
-    # range from offset 0 → treat as matched (no per-token iteration needed).
+    # range from offset 0, AND the peer's heads_per_partition equals ours so
+    # their bytes_per_slice equals ours. Only then is the full-slice matched
+    # copy correct — if the peer has more heads per slice (e.g. prefill TP=1
+    # vs decode TP=2), peer_bps > local_bps and NIXL rejects the size mismatch.
     if (
         len(fragments) == 1
         and fragments[0]["src_h0"] == 0
         and fragments[0]["dst_h0"] == 0
         and fragments[0]["n_heads"] == local.heads_per_partition
+        and fragments[0]["peer"]["heads_per_partition"] == local.heads_per_partition
     ):
         return [
             TransferSegment(

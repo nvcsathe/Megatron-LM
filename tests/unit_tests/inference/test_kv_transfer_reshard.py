@@ -14,7 +14,13 @@ import base64
 
 import pytest
 
-from megatron.core.inference.kv_reshard_plan import KvTopology, pp_reshard_plan, tp_reshard_plan
+from megatron.core.inference.kv_reshard_plan import (
+    KvTopology,
+    TransferSegment,
+    build_reshard_plan,
+    pp_reshard_plan,
+    tp_reshard_plan,
+)
 
 G = 8          # num_kv_heads_global (e.g. Llama-3.1-8B num_query_groups)
 HEAD_DIM = 128
@@ -207,6 +213,53 @@ def test_mismatched_model_raises():
     bad["num_kv_heads_global"] = 16  # different model
     with pytest.raises(ValueError, match="num_kv_heads_global mismatch"):
         tp_reshard_plan([bad], _make_topology(2, 0))
+
+
+# ===========================================================================
+# build_reshard_plan segment-type tests
+# Regression coverage for the equal-TP shortcut bug:
+# prefill TP=1 → decode TP=2 must NOT use the full-slice matched path because
+# peer_bps (T×8×d×elem) ≠ local_bps (T×4×d×elem); NIXL rejects the size
+# mismatch with NIXL_ERR_INVALID_PARAM / "createXferReq: length mismatch".
+# ===========================================================================
+
+SRC_BLOCK_IDS = list(range(8))  # 8 arbitrary src block ids
+
+
+def test_prefill_tp1_to_decode_tp2_rank0_is_head_subrange():
+    # Decode rank 0 (heads [0,4)): src_h0=0, dst_h0=0, n_heads=4 — looks like
+    # equal-TP but peer has 8 heads/slice, local has 4 → must NOT be matched.
+    peer = _peer_meta(1, 0)   # prefill TP=1: 8 heads/slice
+    topo = _make_topology(2, 0)
+    segs = build_reshard_plan(peer, SRC_BLOCK_IDS, topo)
+    assert len(segs) == 1
+    seg = segs[0]
+    assert isinstance(seg, TransferSegment)
+    assert seg.n_heads == 4, "must use head-subrange path (n_heads>0), not matched path"
+    assert seg.src_h0 == 0
+    assert seg.dst_h0 == 0
+
+
+def test_prefill_tp1_to_decode_tp2_rank1_is_head_subrange():
+    # Decode rank 1 (heads [4,8)): src_h0=4, dst_h0=0, n_heads=4 — always head-subrange.
+    peer = _peer_meta(1, 0)
+    topo = _make_topology(2, 1)
+    segs = build_reshard_plan(peer, SRC_BLOCK_IDS, topo)
+    assert len(segs) == 1
+    seg = segs[0]
+    assert seg.n_heads == 4
+    assert seg.src_h0 == 4
+    assert seg.dst_h0 == 0
+
+
+def test_equal_tp_same_hpp_uses_matched_path():
+    # Decode TP=2 rank 0, prefill TP=2 rank 0: heads_per_partition matches (4==4)
+    # → shortcut to matched path (n_heads=0) is valid.
+    peer = _peer_meta(2, 0)   # prefill TP=2: 4 heads/slice
+    topo = _make_topology(2, 0)
+    segs = build_reshard_plan(peer, SRC_BLOCK_IDS, topo)
+    assert len(segs) == 1
+    assert segs[0].n_heads == 0, "equal hpp → matched (full-slice) path"
 
 
 # ===========================================================================
