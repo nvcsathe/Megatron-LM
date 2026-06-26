@@ -334,7 +334,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         if not listen_addr:
             return
-        from megatron.core.inference.kv_transfer import make_agent
+        from megatron.core.inference.disaggregation.transfer_backends.nixl import make_agent
 
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
