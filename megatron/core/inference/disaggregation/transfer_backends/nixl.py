@@ -17,6 +17,7 @@ import base64
 import logging
 import os
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -46,6 +47,48 @@ _POLL_TIMEOUT_S = 30.0
 
 def have_nixl() -> bool:
     return _HAVE_NIXL
+
+
+@dataclass
+class NixlPullHandle:
+    """Pollable handle for one logical pull made of one or more NIXL transfers."""
+
+    agent: Any
+    xfers: List[Any]
+    contexts: List[str]
+    submitted_at: float
+    timeout_s: float = _POLL_TIMEOUT_S
+    done: bool = False
+
+    def poll(self) -> bool:
+        if self.done:
+            return True
+        if not self.xfers:
+            self.done = True
+            return True
+
+        pending: List[str] = []
+        for xfer, ctx in zip(self.xfers, self.contexts):
+            state = self.agent.check_xfer_state(xfer)
+            if state == "DONE":
+                continue
+            if state == "ERR":
+                raise RuntimeError(f"NIXL transfer failed ({ctx})")
+            pending.append(f"{ctx}: {state}")
+
+        if not pending:
+            self.done = True
+            return True
+        if time.perf_counter() - self.submitted_at > self.timeout_s:
+            raise TimeoutError(
+                f"NIXL transfer timed out after {self.timeout_s}s; "
+                f"pending={pending}"
+            )
+        return False
+
+    def wait(self) -> None:
+        while not self.poll():
+            time.sleep(_POLL_INTERVAL_S)
 
 
 class NixlTransferBackend:
@@ -263,6 +306,15 @@ class NixlTransferBackend:
             src_block_ids: Source block ids unless carried by ``pp_metas``.
             dst_block_ids: Local block ids to write into.
         """
+        self.begin_pull_blocks(peer_meta, src_block_ids, dst_block_ids).wait()
+
+    def begin_pull_blocks(
+        self,
+        peer_meta: Any,
+        src_block_ids: List[int],
+        dst_block_ids: List[int],
+    ) -> NixlPullHandle:
+        """Submit a pull and return a handle that can be polled later."""
         if not isinstance(peer_meta, dict) or "pp_metas" not in peer_meta:
             if len(src_block_ids) != len(dst_block_ids):
                 raise ValueError(
@@ -270,31 +322,30 @@ class NixlTransferBackend:
                     f"{len(src_block_ids)} vs {len(dst_block_ids)}"
                 )
             if not src_block_ids:
-                return
+                return NixlPullHandle(
+                    agent=self._agent,
+                    xfers=[],
+                    contexts=[],
+                    submitted_at=time.perf_counter(),
+                    done=True,
+                )
 
         segments = build_reshard_plan(peer_meta, src_block_ids, self._topology)
+        xfers: List[Any] = []
+        contexts: List[str] = []
         for seg in segments:
-            self._execute_segment(seg, dst_block_ids)
+            xfer, ctx = self._begin_segment(seg, dst_block_ids)
+            xfers.append(xfer)
+            contexts.append(ctx)
+        return NixlPullHandle(
+            agent=self._agent,
+            xfers=xfers,
+            contexts=contexts,
+            submitted_at=time.perf_counter(),
+        )
 
-    def _await_xfer(self, xfer: Any, ctx: str) -> None:
-        """Submit + spin-poll a NIXL transfer to completion."""
-        self._agent.transfer(xfer)
-        deadline = time.perf_counter() + _POLL_TIMEOUT_S
-        while True:
-            state = self._agent.check_xfer_state(xfer)
-            if state == "DONE":
-                return
-            if state == "ERR":
-                raise RuntimeError(f"NIXL transfer failed ({ctx})")
-            if time.perf_counter() > deadline:
-                raise TimeoutError(
-                    f"NIXL transfer timed out after {_POLL_TIMEOUT_S}s "
-                    f"({ctx}, last_state={state})"
-                )
-            time.sleep(_POLL_INTERVAL_S)
-
-    def _execute_segment(self, seg: TransferSegment, dst_block_ids: List[int]) -> None:
-        """Execute one :class:`TransferSegment` via NIXL.
+    def _begin_segment(self, seg: TransferSegment, dst_block_ids: List[int]) -> tuple[Any, str]:
+        """Submit one :class:`TransferSegment` via NIXL.
 
         ``n_heads == 0`` copies full slices. Otherwise, copy per-token head
         fragments for heterogeneous TP.
@@ -365,7 +416,8 @@ class NixlTransferBackend:
         dst_descs = self._agent.get_xfer_descs(dst_tuples, mem_type="VRAM")
         # READ pulls remote -> local. Signature is (op, local, remote, peer).
         xfer = self._agent.initialize_xfer("READ", dst_descs, src_descs, peer_id)
-        self._await_xfer(xfer, ctx)
+        self._agent.transfer(xfer)
+        return xfer, ctx
 
     def close(self) -> None:
         if self._agent is None:

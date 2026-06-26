@@ -1142,7 +1142,7 @@ class TextGenerationController:
         Example:
           input_tokens_required:  [ a5  a6s  a7s |  b3   b4s  b5s  |  c6  c7s  c8s  |  d2  |  e4  ]
           Accepted tokens mask    [  1   1    0  |  1     1    1   |   1   0    0   |   1  |   1  ]
-          Accepted tokens         [ [a6s  -1] | [b4s  b5s] | [-1  -1] ]  (decode only; prefill → -1)
+          Accepted tokens         [ [a6s  -1] | [b4s  b5s] | [-1  -1] ]  (decode only; prefill uses -1)
           Accepted token counts   [     1     |      2     |     0    ]  (prefill defaults to 0)
         """
         active_request_count = last_one_indices.shape[0]
@@ -1468,7 +1468,7 @@ class TextGenerationController:
 
             if max_top_n_prefill > 0:
                 if only_last:
-                    # One logit row per prefill request — single batched topk.
+                    # One logit row per prefill request, batched once.
                     topk_results_prefill = torch.topk(
                         prefill_log_probs, k=max_top_n_prefill, dim=-1
                     )
@@ -1798,14 +1798,8 @@ class TextGenerationController:
                 if valid:
                     finished_routing_block_ids[req_id] = valid
 
-        # Phase-3 disagg: snapshot KV block ids for ALL finished requests
-        # before update_requests resets the slot to -1, AND pin them so
-        # release_memory_blocks treats them as off-limits. The engine then
-        # decides per-request in post_process_requests whether to keep them
-        # pinned (do_kv_handoff path) or unpin+release (regular path).
-        # Controller can't see SamplingParams, so it can't filter here —
-        # we pin universally and let the engine sort it out. Cost is
-        # negligible: one dict update + one set insert per finished request.
+        # Snapshot finished blocks before update_requests clears slots. The
+        # engine later keeps or releases each pin based on request parameters.
         finished_handoff_block_ids = {}
         if finished_idxs.numel() > 0:
             pin_set = context.kv_block_allocator.pinned_blocks
@@ -1910,11 +1904,11 @@ class TextGenerationController:
             return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
 
             if self.num_speculative_tokens > 0:
-                # Phase 1: Verify speculative tokens using base logits only.
+                # Verify speculative tokens using base logits.
                 nvtx_range_push("mtp-spec-decoding/verify")
                 self._dynamic_step_sample_logits_and_verify_tokens(input_ids)
                 nvtx_range_pop("mtp-spec-decoding/verify")
-                # Phase 2: Rewind KV cache for rejected tokens.
+                # Rewind KV cache for rejected tokens.
                 nvtx_range_push("mtp-spec-decoding/rewind-kv-cache")
                 blocks_to_release, remove_mask = self._rewind_kv_cache()
                 nvtx_range_pop("mtp-spec-decoding/rewind-kv-cache")
@@ -1925,13 +1919,12 @@ class TextGenerationController:
                     if not context.using_cuda_graph_this_step():
                         set_decode_expert_padding(self._unwrapped_model, False)
 
-                # Phase 3: Compute MTP serially with correct (verified) inputs.
+                # Compute MTP serially with verified inputs.
                 nvtx_range_push("mtp-spec-decoding/serial-mtp")
                 self._compute_serial_mtp_and_sample()
                 nvtx_range_pop("mtp-spec-decoding/serial-mtp")
 
-                # Phase 4: Release freed blocks. Deferred from Phase 2 so the
-                # data-dependent boolean-mask sync overlaps with MTP GPU work.
+                # Release freed blocks after overlapping the mask sync with MTP.
                 context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
             else:
                 self._dynamic_step_sample_logits()
@@ -2319,8 +2312,8 @@ class TextGenerationController:
             else:
                 context_end_position = min_prompt_length_in_batch
 
-            # The initial iteration of this loop runs the prefill phase up to the shortest
-            # prompt length in the batch. Then every subsequent iterations runs a decode step.
+            # First iteration advances to the shortest prompt length. Later
+            # iterations run one decode step.
             # At least one new token will be generated in each iteration. The generated token
             # will be ignored for requests which have prompt length > the current generated
             # sequence length. Similarly, the generated token is ignored for requests which

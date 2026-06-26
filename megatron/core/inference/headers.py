@@ -22,9 +22,8 @@ class Headers(Enum):
     DISCONNECT = auto()
     SHUTDOWN = auto()
     TP_BROADCAST = auto()
-    # Phase-3 disagg headers.
-    SUBMIT_REQUEST_WITH_KV = auto()  # client → coordinator → engine: decode-side import.
-    RELEASE_KV = auto()  # client → coordinator → engine: free pinned handoff blocks.
+    SUBMIT_REQUEST_WITH_KV = auto()  # Decode-side KV import.
+    RELEASE_KV = auto()  # Free pinned handoff blocks.
 
 
 class UnknownHeaderError(Exception):

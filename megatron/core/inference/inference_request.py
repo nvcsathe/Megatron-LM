@@ -401,14 +401,9 @@ class DynamicInferenceRequest(InferenceRequest):
     # Computed field - not passed by caller
     precomputed_block_hashes: List[int] = field(default_factory=list)
 
-    # Phase-3 disagg: when sampling_params.do_kv_handoff is True and the
-    # request finishes, the engine pins this request's blocks and populates
-    # `disaggregated_params` with the metadata a decode peer needs to pull
-    # them over NIXL. Shape: {"request_id", "block_ids", "kv_meta"}.
-    # For hybrid (Mamba) models, kv_meta additionally carries a nested
-    # "mamba" entry ({"conv", "ssm", "blocks"}) so the recurrent conv/ssm
-    # state transfers over NIXL alongside attention KV; the decode engine
-    # restores it via the existing Mamba prefix-cache path.
+    # KV handoff metadata for decode-side NIXL pulls.
+    # Shape: {"request_id", "block_ids", "kv_meta"}.
+    # Hybrid models may add kv_meta["mamba"] for conv/ssm state.
     disaggregated_params: Optional[dict] = None
 
     def __post_init__(self):
@@ -742,10 +737,7 @@ class DynamicInferenceRequestRecord:
 
         policy_epoch = self.requests[-1].policy_epoch
         kv_cache_epoch = self.requests[-1].kv_cache_epoch
-        # Phase-3 disagg: the prefill engine's `_capture_handoff_meta` stamps
-        # `disaggregated_params` on the in-flight request just before it
-        # finishes. The merged record is what gets serialized and sent to the
-        # client, so this field must be carried forward from the last segment.
+        # Preserve KV handoff metadata when merging request segments.
         disaggregated_params = self.requests[-1].disaggregated_params
 
         # Merged request.

@@ -143,10 +143,9 @@ class MambaSlotAllocator:
         device = self.block_to_slot.device
         bid_tensor = torch.tensor(block_ids, dtype=torch.int64, device=device)
 
-        # Phase 1: Batch lookup existing slots (1 GPU sync)
+        # Batch lookup existing slots.
         existing_slots = self.block_to_slot[bid_tensor].tolist()
 
-        # Phase 2: Identify new blocks needing allocation (deduplicated)
         # seen_new maps block_id -> index in new_bids list
         seen_new = {}
         new_bids = []
@@ -159,7 +158,7 @@ class MambaSlotAllocator:
         if num_new == 0:
             return existing_slots
 
-        # Phase 3: Get slots from free pool, evicting if necessary
+        # Get slots from the free pool, evicting if needed.
         from_free = min(num_new, self.free_count)
         new_slots = []
         if from_free > 0:
@@ -171,14 +170,13 @@ class MambaSlotAllocator:
         if need_evict > 0:
             new_slots.extend(self._evict_lru_slots_batch(need_evict))
 
-        # Phase 4: Batch GPU writes for new mappings
+        # Batch GPU writes for new mappings.
         new_bid_tensor = torch.tensor(new_bids, dtype=torch.int64, device=device)
         new_slot_tensor = torch.tensor(new_slots, dtype=torch.int64, device=device)
         self.block_to_slot[new_bid_tensor] = new_slot_tensor.to(torch.int32)
         self.slot_to_block[new_slot_tensor] = new_bid_tensor.to(torch.int32)
 
-        # Phase 5: Build result mapping
-        # Map new block_ids to their allocated slots
+        # Map each requested block to its slot.
         alloc_bid_to_slot = {bid: slot for bid, slot in zip(new_bids, new_slots)}
         result = []
         for bid, existing in zip(block_ids, existing_slots):
@@ -191,7 +189,7 @@ class MambaSlotAllocator:
     def _evict_lru_slots_batch(self, num_needed: int) -> list:
         """Evict the least recently used Mamba cache slots.
 
-        Does NOT return slots to the free pool — caller takes ownership.
+        Does NOT return slots to the free pool; caller takes ownership.
 
         Args:
             num_needed: Number of slots to evict.

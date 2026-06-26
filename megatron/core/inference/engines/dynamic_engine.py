@@ -181,6 +181,31 @@ class RequestEntry:
     future: asyncio.Future
 
 
+@dataclass(kw_only=True)
+class PendingMambaImport:
+    """Mamba state transfers attached to a pending KV handoff import."""
+
+    conv_handle: Any
+    ssm_handle: Any
+    target_blocks: List[int]
+    positions: List[int]
+
+
+@dataclass(kw_only=True)
+class PendingKvImport:
+    """Decode request waiting for async NIXL KV import completion."""
+
+    request_id: int
+    prompt: list
+    sampling_params: SamplingParams
+    local_blocks: List[int]
+    hashes: list
+    hashes_to_register: int
+    handle: Any
+    future: asyncio.Future
+    mamba: Optional[PendingMambaImport] = None
+
+
 # pylint: disable=line-too-long
 @experimental_api
 class DynamicInferenceEngine(AbstractEngine):
@@ -300,26 +325,16 @@ class DynamicInferenceEngine(AbstractEngine):
         # Mark the inference engine as active. Cleared in `suspend()` and re-set in `resume()`.
         InferenceMode.set_active()
 
-        # Phase-3 disagg: per-request pinned block ids for KV handoff. Populated
-        # when a do_kv_handoff=True request finishes; consumed by
-        # release_handoff_blocks() unpins them when the decode peer is done pulling.
+        # Blocks pinned until the decode peer finishes pulling KV.
         self._pinned_handoff_blocks: Dict[int, list] = {}
-        # NIXL bridge. None until setup_kv_transfer() is called by the
-        # launcher.
+        # NIXL bridge. None until setup_kv_transfer() runs.
         self._kv_transfer_agent = None
-        # All prefill TP ranks' KV metadata (set in setup_kv_transfer when
-        # TP>1); shipped in the handoff so a different-TP decode peer can
-        # re-shard. None → matched-TP / single-rank, ship only local meta.
+        # All prefill TP-rank metadata when TP re-sharding is possible.
         self._kv_peer_metas = None
-        # Mamba (SSM) state transfer agents for hybrid models (Nemotron Nano
-        # etc.). These mirror ``_kv_transfer_agent`` but register the Mamba
-        # cache's conv/ssm slot pools so the recurrent state can ride the same
-        # NIXL path as attention KV during a prefill→decode handoff. None until
-        # setup_kv_transfer() runs and only populated for hybrid models. See
-        # _capture_handoff_meta (export) and add_request_with_kv_handoff
-        # (import).
+        # Hybrid-model Mamba state agents for conv/ssm slot pools.
         self._mamba_conv_agent = None
         self._mamba_ssm_agent = None
+        self._pending_kv_imports = deque()
 
         # Create cuda graphs.
         self.create_cuda_graphs()
@@ -328,9 +343,9 @@ class DynamicInferenceEngine(AbstractEngine):
         """Bring up the NIXL transfer agent for this engine, if configured.
 
         Args:
-            role: "prefill" or "decode" — used to name the local NIXL agent.
+            role: "prefill" or "decode"; used to name the local NIXL agent.
             listen_addr: ``host:port`` for the NIXL agent. ``None`` disables
-                the bridge (Phase-0 / aggregated path stays usable).
+                KV transfer.
         """
         if not listen_addr:
             return
@@ -347,8 +362,7 @@ class DynamicInferenceEngine(AbstractEngine):
         tp_size = get_pg_size(self.pg_collection.tp)
         tp_rank = get_pg_rank(self.pg_collection.tp)
 
-        # PP: compute layer_start/layer_end for this rank. All PP ranks all_gather
-        # their local layer counts; prefix-sum gives the global layer offset.
+        # Compute this PP rank's global attention-layer range.
         pp_size = get_pg_size(self.pg_collection.pp)
         pp_rank = get_pg_rank(self.pg_collection.pp)
         local_num_layers = self.context.num_attention_layers
@@ -380,12 +394,7 @@ class DynamicInferenceEngine(AbstractEngine):
             layer_end=layer_end,
         )
 
-        # Gather every prefill TP rank's NIXL metadata ONCE (it is static after
-        # registration). A decode peer running at a different TP needs all of
-        # them to reconstruct its local KV-head shard; for matched TP the
-        # decode side just picks its corresponding entry (fast path). The
-        # gather is a collective over the TP group — safe here because all TP
-        # ranks call setup_kv_transfer() together at startup.
+        # Gather TP-rank metadata once for heterogeneous-TP pulls.
         self._kv_peer_metas = None
         if self._kv_transfer_agent is not None and torch.distributed.is_initialized() and tp_size > 1:
             local_meta = self._kv_transfer_agent.export_meta()
@@ -395,21 +404,8 @@ class DynamicInferenceEngine(AbstractEngine):
             )
             self._kv_peer_metas = gathered
 
-        # Hybrid (Mamba) models: bring up two more NIXL agents over the Mamba
-        # conv/ssm slot pools so the recurrent state transfers alongside KV.
-        #
-        # The slot pools are laid out [num_mamba_layers, max_slots, *state]
-        # — exactly the [outer, blocks, ...] layout KvTransferAgent already
-        # understands, with the cache slot playing the role of the "block". We
-        # therefore reuse make_agent (matched-layout fast path) by passing
-        # ``expected_num_blocks=max_slots``.
-        #
-        # Scope: matched TP=1/PP=1 only. Mamba conv/ssm state is sharded across
-        # TP (by head group) and PP (by layer); unlike attention KV heads there
-        # is no reshard plan for it yet (kv_reshard_plan handles KV heads only).
-        # Fail loud at launch rather than silently zeroing state at the first
-        # handoff — a hybrid model with mismatched/parallel layouts would
-        # otherwise produce wrong decode output.
+        # Mamba state transfer reuses the matched-layout block path.
+        # Mamba TP/PP re-sharding is not implemented.
         self._mamba_conv_agent = None
         self._mamba_ssm_agent = None
         if getattr(self.context, "is_hybrid_model", False):
@@ -451,7 +447,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         Called when a ``do_kv_handoff=True`` request transitions to finished.
         ``block_ids`` comes from the controller's pre-``update_requests``
-        snapshot (`finished_handoff_block_ids`) — by the time we get here the
+        snapshot (`finished_handoff_block_ids`). By the time we get here the
         context tensors have already been cleared, so reading
         ``request_to_kv_block_ids`` directly would return all -1. The
         controller also pinned these blocks before releasing slots, so they
@@ -466,10 +462,10 @@ class DynamicInferenceEngine(AbstractEngine):
             )
             return
 
-        # Each PP rank pins its OWN local blocks; release is per-rank.
+        # Each PP rank pins and releases its own local blocks.
         self._pinned_handoff_blocks[rid] = list(block_ids)
 
-        # Build the per-rank kv meta (TP-gathered list or single dict).
+        # Build per-rank KV metadata.
         local_kv: Any = {}
         if self._kv_peer_metas is not None:
             local_kv = self._kv_peer_metas
@@ -478,11 +474,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         pp_size = get_pg_size(self.pg_collection.pp)
         if pp_size > 1 and torch.distributed.is_initialized():
-            # All PP ranks participate in this collective simultaneously — they
-            # are synchronised by the engine step that detected request completion
-            # (sampled tokens are broadcast from the last PP stage, so all ranks
-            # agree on which requests finished and call _capture_handoff_meta in
-            # the same engine-step iteration and in the same request order).
+            # All PP ranks call this together after the same completion step.
             local_entry = {"kv_meta": local_kv, "block_ids": list(block_ids)}
             gathered: list = [None] * pp_size
             torch.distributed.all_gather_object(
@@ -494,23 +486,13 @@ class DynamicInferenceEngine(AbstractEngine):
                     for e in gathered
                 ]
             }
-            # Top-level block_ids = pp_rank=0's blocks for Dynamo-handler compat.
-            # The decode path reads per-rank block_ids from kv_meta["pp_metas"].
+            # Keep top-level block_ids for existing Dynamo handlers.
             top_block_ids: Any = gathered[0]["block_ids"]
         else:
             kv_meta = local_kv
             top_block_ids = block_ids
 
-        # Hybrid models: nest the Mamba state meta inside kv_meta so it rides
-        # the existing handoff transport verbatim (the coordinator forwards
-        # kv_meta as one opaque object to the decode peer). We export, per
-        # handoff block that has a committed Mamba snapshot, its position in the
-        # block list and the source cache slot. The decode side maps position →
-        # its own local block + a freshly allocated local slot and pulls the
-        # conv/ssm state over NIXL.
-        #
-        # Matched TP=1/PP=1 only (enforced in setup_kv_transfer), so kv_meta is
-        # the flat single-rank export dict here — safe to attach a key to.
+        # Hybrid models include Mamba slot metadata in the same handoff object.
         if self._mamba_conv_agent is not None and isinstance(kv_meta, dict):
             msa = self.context.mamba_slot_allocator
             mamba_blocks = []
@@ -560,29 +542,7 @@ class DynamicInferenceEngine(AbstractEngine):
         kv_meta: dict,
         src_block_ids: list,
     ) -> "asyncio.Future[DynamicInferenceRequest]":
-        """Decode-side: import KV state via NIXL, then add the request so the
-        existing prefix-cache match path skips prefill on the imported blocks.
-
-        Mechanism:
-            1. Pre-allocate local blocks (sets ref_count=1 under prefix caching).
-            2. NIXL-pull KV data from the prefill peer into those blocks.
-            3. Register the prompt's chain hashes against the local blocks so
-               the upcoming match path will see them as cached.
-            4. Pre-decrement ref_count back to 0. ``context.add_request``'s
-               prefix-match code increments it to 1 for each matched block, so
-               the final ref_count matches the regular add_request path — and
-               the blocks return to the free pool when the request finishes,
-               no leak.
-            5. Call the regular :meth:`add_request`. The prefix matcher finds
-               every complete prompt block already cached and sets
-               ``prefix_skip_tokens = prompt_len - 1`` — the engine prefills
-               only the last token (needed for sampling logits) instead of the
-               full prompt. That's the actual prefill skip; decode continues
-               normally from there.
-
-        Requires ``enable_prefix_caching=True`` on this engine — without it
-        the match path is short-circuited and no skipping happens.
-        """
+        """Submit an async NIXL pull, then admit the request when KV is local."""
         from megatron.core.inference.inference_request import (
             compute_block_hashes_batched,
         )
@@ -612,99 +572,155 @@ class DynamicInferenceEngine(AbstractEngine):
             )
         local_blocks = [int(b) for b in local_blocks_tensor.tolist()]
 
-        # 2. NIXL-pull from the prefill peer. Synchronous — by the time
-        #    add_request runs the data is live in `local_blocks`.
         if self._kv_transfer_agent is not None and kv_meta:
-            self._kv_transfer_agent.pull_blocks(kv_meta, src_block_ids, local_blocks)
+            handle = self._kv_transfer_agent.begin_pull_blocks(
+                kv_meta, src_block_ids, local_blocks
+            )
+        else:
+            handle = None
 
-        # 3. Register the pulled blocks under the prompt's chain hashes.
-        #    include_partial=True so that prompts shorter than block_size still
-        #    produce a hash for the partial last block. Without this, a 240-token
-        #    prompt with block_size=256 yields 0 complete-block hashes → nothing
-        #    registered → prefix cache finds nothing → decode re-prefills the
-        #    whole prompt and the imported KV is wasted.
-        #    The partial hash is deterministic from the actual token IDs, so it
-        #    matches the hash the request will look up in step 5 (we pass hashes[:n]
-        #    as precomputed_block_hashes to add_request, bypassing __post_init__'s
-        #    recompute which uses include_partial=False).
+        # Hashes are registered only after the async transfer completes.
+        # include_partial=True lets short prompts skip their imported partial
+        # block instead of falling back to a full decode-side prefill.
         prompt_tensor = torch.tensor(prompt, dtype=torch.int64)
         hashes = compute_block_hashes_batched(
             prompt_tensor, self.context.block_size_tokens, include_partial=True
         )
-        n = min(num_blocks, len(hashes))
-        if n > 0:
-            allocator.register_kv_block_hashes(local_blocks[:n], hashes[:n])
+        hashes_to_register = min(num_blocks, len(hashes))
 
-        # 4. Pre-decrement ref_count so the match-path increment lands at 1.
-        #    `allocate_memory_blocks` set ref_count=1; if we leave it there,
-        #    `_compute_prefix_match` would push it to 2 and the blocks would
-        #    never return to the pool when the request finishes (leak).
-        local_blocks_idx = torch.tensor(local_blocks, dtype=torch.int64)
-        allocator.block_ref_counts[local_blocks_idx] -= 1
+        mamba_import = None
+        mamba_meta = kv_meta.get("mamba") if isinstance(kv_meta, dict) else None
+        if mamba_meta:
+            mamba_import = self._begin_mamba_handoff_import(
+                request_id, mamba_meta, local_blocks, hashes
+            )
 
+        future = self._loop.create_future()
+        pending = PendingKvImport(
+            request_id=request_id,
+            prompt=prompt,
+            sampling_params=sampling_params,
+            local_blocks=local_blocks,
+            hashes=hashes,
+            hashes_to_register=hashes_to_register,
+            handle=handle,
+            future=future,
+            mamba=mamba_import,
+        )
+        self._pending_kv_imports.append(pending)
         logging.info(
-            "DISAGG_DECODE_IMPORT request_id=%d prompt_tokens=%d imported_blocks=%d hashes_registered=%d",
+            "DISAGG_DECODE_PULL_SUBMIT request_id=%d prompt_tokens=%d blocks=%d pending_imports=%d",
             request_id,
             len(prompt),
             num_blocks,
+            len(self._pending_kv_imports),
+        )
+        self._loop.call_soon_threadsafe(
+            self._loop.create_task, self._notify_cond_for_new_request()
+        )
+        return future
+
+    def _kv_import_done(self, pending: PendingKvImport) -> bool:
+        if pending.handle is not None and not pending.handle.poll():
+            return False
+        if pending.mamba is not None:
+            if not pending.mamba.conv_handle.poll():
+                return False
+            if not pending.mamba.ssm_handle.poll():
+                return False
+        return True
+
+    def _finalize_kv_handoff_import(self, pending: PendingKvImport) -> None:
+        allocator = self.context.kv_block_allocator
+        n = pending.hashes_to_register
+        local_blocks = pending.local_blocks
+
+        if n > 0:
+            allocator.register_kv_block_hashes(local_blocks[:n], pending.hashes[:n])
+
+        local_blocks_idx = torch.tensor(local_blocks, dtype=torch.int64)
+        allocator.block_ref_counts[local_blocks_idx] -= 1
+
+        if pending.mamba is not None:
+            self._complete_mamba_handoff_import(pending.request_id, pending.mamba, pending.hashes)
+
+        logging.info(
+            "DISAGG_DECODE_IMPORT request_id=%d prompt_tokens=%d imported_blocks=%d hashes_registered=%d pending_imports=%d",
+            pending.request_id,
+            len(pending.prompt),
+            len(local_blocks),
             n,
+            len(self._pending_kv_imports),
+        )
+        request_future = self.add_request(
+            pending.request_id,
+            pending.prompt,
+            pending.sampling_params,
+            precomputed_block_hashes=pending.hashes[:n] if n > 0 else None,
         )
 
-        # 4b. Hybrid models: import the Mamba (conv/ssm) recurrent state that the
-        #     prefill peer cached at block boundaries. We populate this decode
-        #     engine's Mamba cache (block→slot + hash→block) so the *existing*
-        #     restore path takes over: schedule_*_prefill runs
-        #     _find_mamba_match_count against hash_to_block_id, _compute_prefix_match
-        #     sets prefix_skip_tokens to the matched Mamba block boundary, and
-        #     context.add_request appends a _pending_mamba_restore that copies the
-        #     transferred slot into the live per-request buffer. The short tail
-        #     after that boundary is re-prefilled, which advances the recurrence
-        #     to the exact handoff position (no off-by-one, no zeroed state).
-        mamba_meta = kv_meta.get("mamba") if isinstance(kv_meta, dict) else None
-        if mamba_meta:
-            self._import_mamba_handoff(request_id, mamba_meta, local_blocks, hashes)
+        def _relay_result(src: asyncio.Future) -> None:
+            if pending.future.done():
+                return
+            if src.cancelled():
+                pending.future.cancel()
+                return
+            exc = src.exception()
+            if exc is not None:
+                pending.future.set_exception(exc)
+            else:
+                pending.future.set_result(src.result())
 
-        # 5. Add the request via the standard path, injecting the hashes we just
-        #    registered (including the partial block's hash when n covers it).
-        #    DynamicInferenceRequest.__post_init__ skips its own hash recompute
-        #    when precomputed_block_hashes is non-empty, so the partial hash is
-        #    preserved and _compute_prefix_match finds all n imported blocks.
-        #    Inside `context.add_request`:
-        #    - `_compute_prefix_match` looks up `req.precomputed_block_hashes` in
-        #      `kv_hash_to_block_id`, finds `n` matched blocks (the ones we just
-        #      registered), bumps their ref_counts to 1.
-        #    - Sets `prefix_skip_tokens = n * block_size_tokens` (clamped to
-        #      `prompt_len - 1` so sampling has at least 1 token to produce
-        #      logits on). The engine prefills only that single token.
-        return self.add_request(
-            request_id, prompt, sampling_params,
-            precomputed_block_hashes=hashes[:n] if n > 0 else None,
-        )
+        request_future.add_done_callback(_relay_result)
 
-    def _import_mamba_handoff(
+    def _release_pending_kv_import(self, pending: PendingKvImport) -> None:
+        if pending.local_blocks:
+            block_tensor = torch.tensor(pending.local_blocks, dtype=torch.int32, device='cpu')
+            self.context.kv_block_allocator.release_memory_blocks(block_tensor)
+        if pending.mamba is not None:
+            msa = self.context.mamba_slot_allocator
+            if msa is not None:
+                for block_id in pending.mamba.target_blocks:
+                    msa.invalidate_block(int(block_id))
+
+    def _poll_pending_kv_imports(self) -> int:
+        if not self._pending_kv_imports:
+            return 0
+        ready = 0
+        remaining = deque()
+        while self._pending_kv_imports:
+            pending = self._pending_kv_imports.popleft()
+            try:
+                if self._kv_import_done(pending):
+                    self._finalize_kv_handoff_import(pending)
+                    ready += 1
+                else:
+                    remaining.append(pending)
+            except Exception as exc:
+                self._release_pending_kv_import(pending)
+                if not pending.future.done():
+                    pending.future.set_exception(exc)
+                logging.exception(
+                    "DISAGG_DECODE_PULL_FAILED request_id=%d", pending.request_id
+                )
+                raise
+        self._pending_kv_imports = remaining
+        if ready:
+            self._loop.call_soon_threadsafe(
+                self._loop.create_task, self._notify_cond_for_new_request()
+            )
+        return ready
+
+    def _begin_mamba_handoff_import(
         self,
         request_id: int,
         mamba_meta: dict,
         local_blocks: list,
         hashes: list,
-    ) -> None:
-        """Pull the prefill peer's Mamba state into this decode engine's cache.
-
-        ``mamba_meta`` is the ``{"conv", "ssm", "blocks"}`` dict the prefill side
-        nested in ``kv_meta`` (see :meth:`_capture_handoff_meta`). ``blocks`` is a
-        list of ``[position, src_slot]`` pairs: ``position`` indexes into the
-        request's block list (so the local block is ``local_blocks[position]``)
-        and ``src_slot`` is the cache slot on the peer.
-
-        For each such block we allocate a local Mamba slot, NIXL-pull the conv and
-        ssm state from the peer slot into it, and register the block in both
-        ``block_to_slot`` (so ``restore_to_live`` can find it) and
-        ``hash_to_block_id`` (so ``_find_mamba_match_count`` matches it). The
-        standard scheduling/add_request path then restores it.
-        """
+    ) -> Optional[PendingMambaImport]:
         pairs = mamba_meta.get("blocks") or []
         if not pairs:
-            return
+            return None
         if self._mamba_conv_agent is None or self._mamba_ssm_agent is None:
             raise RuntimeError(
                 "Received Mamba handoff state but this decode engine has no "
@@ -721,27 +737,58 @@ class DynamicInferenceEngine(AbstractEngine):
 
         positions = [int(p) for p, _ in pairs]
         src_slots = [int(s) for _, s in pairs]
-        # Map peer block positions onto our freshly imported local blocks. These
-        # are complete blocks (Mamba snapshots are only committed at block/chunk
-        # boundaries), so every position is a valid index into local_blocks and
-        # has a corresponding prompt block hash.
         target_blocks = [int(local_blocks[p]) for p in positions]
-
-        # Allocate local cache slots (also writes block_to_slot / slot_to_block).
         local_slots = msa.allocate_slots_batch(target_blocks)
-
-        # Pull conv + ssm state peer_slot -> local_slot over NIXL (matched path).
-        self._mamba_conv_agent.pull_blocks(mamba_meta["conv"], src_slots, local_slots)
-        self._mamba_ssm_agent.pull_blocks(mamba_meta["ssm"], src_slots, local_slots)
-
-        # Register block hashes so _find_mamba_match_count sees the cached state.
-        msa.register_block_hashes_batch(target_blocks, [hashes[p] for p in positions])
-
+        conv_handle = self._mamba_conv_agent.begin_pull_blocks(
+            mamba_meta["conv"], src_slots, local_slots
+        )
+        ssm_handle = self._mamba_ssm_agent.begin_pull_blocks(
+            mamba_meta["ssm"], src_slots, local_slots
+        )
         logging.info(
-            "DISAGG_DECODE_MAMBA_IMPORT request_id=%d mamba_blocks=%d",
+            "DISAGG_DECODE_MAMBA_IMPORT_SUBMIT request_id=%d mamba_blocks=%d",
             request_id,
             len(target_blocks),
         )
+        return PendingMambaImport(
+            conv_handle=conv_handle,
+            ssm_handle=ssm_handle,
+            target_blocks=target_blocks,
+            positions=positions,
+        )
+
+    def _complete_mamba_handoff_import(
+        self,
+        request_id: int,
+        pending: PendingMambaImport,
+        hashes: list,
+    ) -> None:
+        msa = self.context.mamba_slot_allocator
+        if msa is None:
+            raise RuntimeError("Mamba handoff completed but the decode cache is unavailable.")
+        msa.register_block_hashes_batch(
+            pending.target_blocks, [hashes[p] for p in pending.positions]
+        )
+        logging.info(
+            "DISAGG_DECODE_MAMBA_IMPORT request_id=%d mamba_blocks=%d",
+            request_id,
+            len(pending.target_blocks),
+        )
+
+    def _import_mamba_handoff(
+        self,
+        request_id: int,
+        mamba_meta: dict,
+        local_blocks: list,
+        hashes: list,
+    ) -> None:
+        """Synchronously pull the prefill peer's Mamba state."""
+        pending = self._begin_mamba_handoff_import(request_id, mamba_meta, local_blocks, hashes)
+        if pending is None:
+            return
+        pending.conv_handle.wait()
+        pending.ssm_handle.wait()
+        self._complete_mamba_handoff_import(request_id, pending, hashes)
 
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
@@ -755,6 +802,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
+        self._pending_kv_imports = deque()
         self.failed_request_ids = []
         # For streaming: tracks how many generated_tokens have already been
         # forwarded as ENGINE_REPLY_PARTIAL frames per request_id.
@@ -920,7 +968,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         mtp_seen_batch_sizes.add(n)
                         device = torch.cuda.current_device()
                         batch_dim = n // tp_size if sp_enabled else n
-                        # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
+                        # Use zeros; empty tensors can replay garbage token IDs.
                         for depth in mtp_warmup_depths:
                             unwrapped.compute_mtp_single_step(
                                 hidden_states=torch.zeros(
@@ -1845,13 +1893,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
                     request.add_event_finish()
-                    # Phase-3 disagg routing of the finished request's KV blocks.
-                    # The controller already pinned them BEFORE update_requests
-                    # could release them, and snapshotted the ids in
-                    # finished_handoff_block_ids. Two paths:
-                    #   - do_kv_handoff=True: stamp disaggregated_params; leave
-                    #     the blocks pinned for the decode peer to pull.
-                    #     release_handoff_blocks() unpins + releases later.
+                    # Attach KV handoff metadata when requested. Otherwise,
+                    # release the blocks pinned by the controller snapshot.
                     #   - do_kv_handoff=False: unpin and free immediately. The
                     #     controller pinned universally because it doesn't have
                     #     SamplingParams visibility.
@@ -1894,7 +1937,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
 
             # Process log_probs if available (unified for both regular and chunked prefill)
-            # Skip for requests being finished due to stop words — tokens are not
+            # Skip requests finished by stop words; tokens are not
             # appended for these requests, so log probs must also be skipped to keep
             # the two lists in sync.
             if (
@@ -2861,7 +2904,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.add_request(request_id, prompt, sampling_params)
                 nvtx_range_pop("add_request")
             elif header == Headers.SUBMIT_REQUEST_WITH_KV:
-                # Decode-side handoff import (Phase-3 disagg).
+                # Decode-side KV import.
                 handoff_payload = data[1:]
                 if len(handoff_payload) not in (5, 6):
                     raise ValueError(
@@ -2885,6 +2928,8 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 # Control signal: queue for second pass.
                 self._pending_signals.append(message)
+
+        self._poll_pending_kv_imports()
 
         if new_generation_epoch is not None:
             self._generation_epoch = new_generation_epoch
@@ -2995,10 +3040,15 @@ class DynamicInferenceEngine(AbstractEngine):
                             and (
                                 self.context.get_active_request_count() > 0
                                 or self.waiting_request_ids
+                                or self._pending_kv_imports
                             )
                         )
                     )
-                await self.async_step()
+                self._poll_pending_kv_imports()
+                if self.context.get_active_request_count() > 0 or self.waiting_request_ids:
+                    await self.async_step()
+                else:
+                    await asyncio.sleep(0.02)
         except asyncio.CancelledError:
             pass
 
@@ -3055,8 +3105,8 @@ class DynamicInferenceEngine(AbstractEngine):
         """World-wide ZMQ all-reduce barrier for global rank consensus.
 
         Used for all state transitions that require global synchronization:
-        PAUSING → PAUSED, UNPAUSING → RUNNING, SUSPENDING → SUSPENDED,
-        RESUMING → PAUSED, and STOPPING → STOPPED.
+        PAUSING to PAUSED, UNPAUSING to RUNNING, SUSPENDING to SUSPENDED,
+        RESUMING to PAUSED, and STOPPING to STOPPED.
 
         No-op when world_size == 1 (communicator is not created).
         """
@@ -3088,9 +3138,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.schedule_requests()
 
                 if self.state in (EngineState.RUNNING, EngineState.PAUSING):
-                    local_pending = self.context.get_active_request_count() + len(
+                    local_schedulable = self.context.get_active_request_count() + len(
                         self.waiting_request_ids
                     )
+                    local_pending = local_schedulable + len(self._pending_kv_imports)
                     if self.disable_ep_consensus:
                         # Skip the EP consensus all-reduce; act on local state only.
                         # NOTE: even with no consensus we must still participate in EP
@@ -3102,7 +3153,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             await self._world_barrier()
                             self.state = EngineState.PAUSED
                             self._state_events[EngineState.PAUSED].set()
-                        elif local_pending > 0:
+                        elif local_schedulable > 0:
                             await self.async_step()
                         else:
                             self.step_start_event.record()
@@ -3143,7 +3194,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         self._state_events[EngineState.PAUSED].set()
                     elif global_work > 0:
                         # At least one EP peer has work: all must participate.
-                        if local_pending > 0:
+                        if local_schedulable > 0:
                             await self.async_step()
                         else:
                             # Dummy forward to participate in the EP collective.
@@ -3167,9 +3218,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.state = EngineState.RUNNING
                     self._state_events[EngineState.PAUSED].clear()
                     self._state_events[EngineState.RUNNING].set()
-                    # The cache from the PAUSING phase still has all_pausing=True;
-                    # without this reset the next RUNNING iteration would skip
-                    # consensus, read the stale flag, and immediately re-pause.
+                    # Clear stale pause consensus before returning to RUNNING.
                     self._last_ep_consensus = (0, False)
 
                 elif self.state == EngineState.SUSPENDING:

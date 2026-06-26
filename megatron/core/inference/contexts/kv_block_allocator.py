@@ -41,10 +41,7 @@ class KVBlockAllocator:
         self.prefix_caching_eviction_policy = prefix_caching_eviction_policy
         self.on_blocks_deregistered: Optional[Callable] = None
 
-        # Phase-3 disagg: block ids in this set are excluded from
-        # `release_memory_blocks` (they stay out of the free pool until an
-        # explicit RELEASE_KV unpins them). Engine owns the lifetime — see
-        # DynamicInferenceEngine.pin_handoff_blocks / release_handoff_blocks.
+        # Pinned blocks stay out of the free pool until RELEASE_KV unpins them.
         self.pinned_blocks: set = set()
 
         self.total_count = total_count

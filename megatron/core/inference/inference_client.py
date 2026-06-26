@@ -127,7 +127,7 @@ class InferenceClient:
         src_block_ids: List[int],
         first_token: Optional[int] = None,
     ) -> AsyncIterator[dict]:
-        """Phase-3 disagg: submit a streaming request whose KV state was imported.
+        """Submit a streaming request with remote KV metadata.
 
         The decode engine allocates local blocks, NIXL-pulls KV from the
         prefill peer described by ``kv_meta``, then begins generation.
