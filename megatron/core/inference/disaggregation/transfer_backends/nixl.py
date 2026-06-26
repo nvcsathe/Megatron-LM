@@ -3,31 +3,12 @@
 
 """Direct NIXL backend for disaggregated prefill/decode KV transfer.
 
-API reference (validated against ``nixl_cu12`` 1.2.0 and Dynamo's
-``components/src/dynamo/common/multimodal/embedding_transfer.py``):
+Each rank registers its paged KV buffer once, exports NIXL peer metadata, and
+the decode side pulls source block ranges directly into its local KV blocks.
 
-- ``agent = nixl_agent(name)`` — local NIXL agent.
-- ``agent.register_memory(tensor)`` — register a torch tensor; returns a
-  registration handle. NIXL infers ``VRAM`` from CUDA tensors automatically.
-- ``agent.get_agent_metadata() -> bytes`` — serialized connection blob to ship
-  to peers out-of-band. We carry it inside ``disaggregated_params["kv_meta"]``
-  base64-encoded.
-- ``agent.add_remote_agent(metadata_bytes) -> remote_agent_id`` — call once per
-  peer before any transfer to it.
-- ``agent.get_xfer_descs(list_of_(ptr, size, device_id), mem_type=...)`` —
-  build a descriptor list for sub-ranges of the registered buffer.
-- ``agent.initialize_xfer("READ"|"WRITE", local_descs, remote_descs, remote_agent_id)``
-  → xfer handle. For pulls, "READ" with local_descs as destination and
-  remote_descs as source.
-- ``agent.transfer(xfer_handle)`` — submit.
-- ``agent.check_xfer_state(xfer_handle) -> "DONE"|"ERR"|...`` — poll.
-- ``agent.deregister_memory(handle)`` — cleanup.
-
-Phase-3 wiring: each rank constructs a single agent, registers its paged
-``DynamicInferenceContext.memory_buffer``, and exposes the agent metadata via
-:meth:`KvTransferAgent.export_meta`. The prefill engine ships that dict in the
-reply; the decode engine receives it, calls :meth:`add_remote_agent` once,
-then :meth:`pull_blocks` for each handoff request.
+Backend selection belongs in ``transfer_backends.base``. A future NCCL backend
+can be registered there and selected by launcher config, e.g.
+``MEGATRON_KV_TRANSFER_BACKEND=nccl``, without changing this NIXL backend.
 """
 
 from __future__ import annotations
@@ -57,11 +38,8 @@ except ImportError:
     _HAVE_NIXL = False
 
 
-# Polling cadence + safety cap for `check_xfer_state`. NIXL doesn't expose a
-# blocking wait; we spin with a tight initial interval (transfer latency on
-# NVLink is sub-millisecond) and back off slightly. 30-second cap is well
-# beyond any plausible per-block transfer on healthy hardware — a longer
-# stall means something is wrong (peer crashed, fabric drop, etc.).
+# NIXL exposes polling, not a blocking wait. A long stall usually means peer or
+# fabric failure, so cap the wait.
 _POLL_INTERVAL_S = 0.0005  # 0.5 ms
 _POLL_TIMEOUT_S = 30.0
 
@@ -73,14 +51,9 @@ def have_nixl() -> bool:
 class NixlTransferBackend:
     """Per-rank NIXL agent owning a registration over the paged KV buffer.
 
-    The whole ``memory_buffer`` is registered once at startup. Per-block
-    transfers use ``get_xfer_descs`` to describe sub-ranges by ``(ptr, size,
-    device_id)`` triples; NIXL handles the actual RDMA/NVLink path.
-
-    Peer discovery is out-of-band: the prefill engine returns this rank's
-    agent metadata inside ``disaggregated_params``, the decode engine calls
-    :meth:`pull_blocks` which lazily registers the peer via
-    ``add_remote_agent`` on first use.
+    Per-block transfers are descriptor ranges over that registration. Peer
+    metadata is exchanged by the control plane and registered lazily on first
+    pull.
     """
 
     name = "nixl"
@@ -109,10 +82,8 @@ class NixlTransferBackend:
         self.agent_name = agent_name
         self._memory_buffer = memory_buffer
 
-        # TP topology — needed for heterogeneous-TP KV re-sharding (prefill_TP !=
-        # decode_TP). When any of these is None the agent only supports matched
-        # layouts (the original fast path); export_meta() omits the topology
-        # block and pull_blocks() falls back to the whole-slice copy.
+        # TP topology enables heterogeneous-TP KV re-sharding. If incomplete,
+        # only matched layouts are supported.
         self._tp_size = tp_size
         self._tp_rank = tp_rank
         self._num_kv_heads_global = num_kv_heads_global
@@ -127,27 +98,20 @@ class NixlTransferBackend:
             head_dim,
             tokens_per_block,
         )
-        # PP topology — used for heterogeneous-PP KV layer re-sharding.
-        # layer_start/layer_end are global attention-layer indices (exclusive end)
-        # owned by this PP rank. None → PP=1 or unknown, no layer subsetting.
+        # PP topology enables layer subsetting across heterogeneous PP layouts.
         self._pp_rank = pp_rank
         self._layer_start = layer_start
         self._layer_end = layer_end
 
-        # Locate the blocks axis. Megatron has two layouts:
-        #   - MLA:        [layers, blocks, block_size, kv_dim]            → axis 1
-        #   - K/V split:  [2, layers, blocks, block_size, n_kv_heads, d]  → axis 2
-        # We find it by matching the expected block count rather than
-        # hardcoding a position, so future layouts (e.g. EP/PP variations)
-        # don't silently mis-identify the layer dim as blocks. Caller passes
-        # `kv_block_allocator.total_count` as the source of truth.
+        # Locate the blocks axis by allocator size instead of layout position.
+        # Current layouts are MLA [L, B, T, D] and K/V split [2, L, B, T, H, d].
         shape = list(memory_buffer.shape)
         candidates = [i for i, dim in enumerate(shape) if dim == expected_num_blocks]
         if not candidates:
             raise RuntimeError(
                 f"NixlTransferBackend: no axis in memory_buffer shape {shape} "
                 f"matches expected_num_blocks={expected_num_blocks}. Layout "
-                "is unrecognized — bug in caller or new Megatron tensor shape."
+                "is unrecognized; bug in caller or new Megatron tensor shape."
             )
         if len(candidates) > 1:
             raise RuntimeError(
@@ -164,13 +128,8 @@ class NixlTransferBackend:
             memory_buffer.device.index if memory_buffer.is_cuda else 0
         )
 
-        # The KV buffer is contiguous in C-order. For each (outer-index combo,
-        # block i), there is ONE contiguous slice of `bytes_per_slice` bytes
-        # containing every position×head×dim element for that (outer, block).
-        # Walking the blocks-axis advances one slice; walking the next outer
-        # axis advances `num_blocks` slices (one full B-stride). For Megatron's
-        # K/V split layout [2, L, B, T, H, d] this gives 2*L slices per block.
-        # For MLA [L, B, T, D] it's L slices per block.
+        # Each (outer, block) pair is one contiguous slice. The outer stride
+        # skips over the full block pool for that outer index.
         shape = list(memory_buffer.shape)
         elements_per_slice = 1
         for dim in shape[self._blocks_axis + 1 :]:
@@ -180,13 +139,10 @@ class NixlTransferBackend:
         for dim in shape[: self._blocks_axis]:
             num_outer *= dim
         self._num_outer = num_outer
-        # Bytes to skip to advance one outer-index combination (jumps over a
-        # whole B-stride of slices).
         self._outer_stride_bytes = self._num_blocks * self._bytes_per_slice
-        # Total bytes per logical block (informational).
         self._per_block_bytes = self._num_outer * self._bytes_per_slice
 
-        # Topology snapshot — passed to kv_reshard_plan functions at transfer time.
+        # Snapshot used by kv_reshard_plan at transfer time.
         self._topology = KvTopology(
             tp_size=tp_size,
             tp_rank=tp_rank,
@@ -200,42 +156,20 @@ class NixlTransferBackend:
             num_outer=self._num_outer,
         )
 
-        # UCX transport selection — must happen before the nixl_agent() constructor
-        # creates the UCX worker context.
-        #
-        # Without this, UCX may wire VRAM-to-VRAM transfers over its TCP transport.
-        # The TCP handler (uct_tcp_ep_am_bcopy) does a CPU memcpy from the source
-        # address; on aarch64 that crashes with SIGSEGV when the source is VRAM.
-        #
-        #   cuda_ipc  — direct GPU P2P via NVLink / PCIe P2P (zero-copy preferred path)
-        #   cuda_copy — CUDA-mediated staging through host memory (safe fallback)
-        #   cma       — cross-memory attach for host-memory control messages
-        #   shm       — POSIX shm for intra-node host memory
-        #   self      — loopback, needed for NIXL's internal operations
-        #
-        # setdefault: the operator can override by setting UCX_TLS before launch.
-        # TCP is not listed; if cuda_ipc/cuda_copy are unavailable (e.g. missing
-        # UCX CUDA backends), NIXL will raise a transport error at connection time
-        # rather than silently falling back to TCP and crashing later.
+        # Configure UCX before agent construction. Avoid TCP for VRAM addresses;
+        # operators may override this by setting UCX_TLS before launch.
         os.environ.setdefault("UCX_TLS", "cuda_ipc,cuda_copy,cma,shm,self")
-        # Disable the UCX memory-type cache: the cache is populated during early
-        # UCX init before CUDA is fully ready, and can misclassify VRAM addresses
-        # as host memory.  With explicit register_memory() we pay no lookup cost.
+        # Explicit registration makes the UCX memtype cache unnecessary and
+        # avoids stale VRAM/host classifications.
         os.environ.setdefault("UCX_MEMTYPE_CACHE", "n")
 
         self._agent = nixl_agent(agent_name)
-        # Pass the torch tensor directly; NIXL detects VRAM + computes the
-        # descriptor list internally. Returns a registration handle we hold
-        # for the agent's lifetime.
         self._reg_handle = self._agent.register_memory(memory_buffer)
 
-        # Cache our own metadata bytes for export_meta(). NIXL's
-        # add_remote_agent() on the peer side requires raw bytes; we
-        # base64-encode for msgpack-safe transport in disaggregated_params.
+        # Base64 keeps NIXL metadata safe for msgpack/json control messages.
         self._agent_metadata = self._agent.get_agent_metadata()
 
-        # Peer agent_name -> the id returned by add_remote_agent (often the
-        # peer's name string). Used to short-circuit duplicate registration.
+        # Peer agent_name -> id returned by add_remote_agent.
         self._known_peers: Dict[str, Any] = {}
 
         logger.info(
@@ -255,13 +189,8 @@ class NixlTransferBackend:
     def export_meta(self) -> Dict[str, Any]:
         """Return JSON/msgpack-safe metadata for shipping to a decode peer.
 
-        The receiver passes ``agent_metadata_b64`` to :meth:`pull_blocks` (via
-        ``kv_meta``); we decode and register it lazily on first transfer.
-
-        ``bytes_per_slice``, ``num_outer``, ``outer_stride_bytes`` capture the
-        scatter-gather layout: each block is ``num_outer`` non-contiguous
-        slices of ``bytes_per_slice`` bytes, separated by ``outer_stride_bytes``.
-        Peer + local must agree on all of these (enforced in pull_blocks).
+        Layout fields describe the scatter-gather address ranges needed to pull
+        source blocks into decode-owned blocks.
         """
         meta = {
             "agent_name": self.agent_name,
@@ -276,9 +205,7 @@ class NixlTransferBackend:
             "device_id": self._device_id,
             "blocks_axis": self._blocks_axis,
         }
-        # Topology block — only present when the agent was built with TP info.
-        # Its presence is what lets a decode peer re-shard a differently-TP'd
-        # prefill buffer (see pull_blocks). Absent → matched-layout only.
+        # TP topology is included only when heterogeneous-TP transfer is possible.
         if self._reshard_capable:
             meta.update(
                 {
@@ -290,9 +217,7 @@ class NixlTransferBackend:
                     "tokens_per_block": self._tokens_per_block,
                 }
             )
-        # PP topology — present when built with layer_start/layer_end. Allows a
-        # decode peer at a different PP size to select only the outer (layer)
-        # slices it owns from each prefill PP rank's buffer.
+        # PP topology lets decode select the layer slices it owns.
         if self._layer_start is not None and self._layer_end is not None:
             meta.update(
                 {
@@ -315,9 +240,7 @@ class NixlTransferBackend:
                 f"peer_meta for {peer_name!r} is missing agent_metadata_b64"
             )
         peer_id = self._agent.add_remote_agent(base64.b64decode(metadata_b64))
-        # NIXL's add_remote_agent returns the peer agent name in some
-        # versions, an opaque id in others. Either way, store it for use in
-        # initialize_xfer().
+        # NIXL versions return either the peer name or an opaque id.
         resolved = peer_id if peer_id else peer_name
         self._known_peers[peer_name] = resolved
         logger.info(
@@ -335,11 +258,9 @@ class NixlTransferBackend:
 
         Args:
             peer_meta: an ``export_meta()`` dict from a single prefill peer, OR a
-                list of such dicts (one per prefill TP rank) when prefill and
-                decode run at different TP. For heterogeneous-PP handoffs this is
+                list of dicts for heterogeneous TP. Heterogeneous PP uses
                 ``{"pp_metas": [{"tp_metas": ..., "block_ids": [...]}, ...]}``.
-            src_block_ids: Block ids on the peer(s). Unused for the PP path (each
-                PP entry carries its own block_ids); required for TP-only paths.
+            src_block_ids: Source block ids unless carried by ``pp_metas``.
             dst_block_ids: Local block ids to write into.
         """
         if not isinstance(peer_meta, dict) or "pp_metas" not in peer_meta:
@@ -375,17 +296,8 @@ class NixlTransferBackend:
     def _execute_segment(self, seg: TransferSegment, dst_block_ids: List[int]) -> None:
         """Execute one :class:`TransferSegment` via NIXL.
 
-        Two execution paths driven by ``seg.n_heads``:
-
-        - ``n_heads == 0``: full-slice matched copy. One descriptor per
-          ``(dst_block, outer)`` pair. Uses the peer's own stride/size values for
-          src so the method is correct even when prefill and decode have different
-          block pool sizes (different ``outer_stride_bytes``).
-
-        - ``n_heads > 0``: head sub-range copy. One descriptor per
-          ``(dst_block, outer, token)`` triple. Used when TP differs between
-          prefill and decode so each token's ``[H, d]`` slice must be partially
-          copied.
+        ``n_heads == 0`` copies full slices. Otherwise, copy per-token head
+        fragments for heterogeneous TP.
         """
         pm = seg.peer_meta
         peer_base = pm["base_addr"]
@@ -405,7 +317,7 @@ class NixlTransferBackend:
         dst_tuples: List[Any] = []
 
         if seg.n_heads == 0:
-            # Matched layout: copy one full bytes_per_slice per (block, outer).
+            # Full-slice copy: one descriptor per (block, outer).
             for src_b, dst_b in zip(src_block_ids, dst_block_ids):
                 for i in range(n_outer):
                     src_o = src_o_start + i
@@ -421,7 +333,7 @@ class NixlTransferBackend:
                 f"blocks={len(src_block_ids)}"
             )
         else:
-            # Head sub-range: copy n_heads×head_dim bytes per token.
+            # Head sub-range copy: one descriptor per token.
             topo = self._topology
             d_bytes = topo.head_dim * self._element_size  # type: ignore[operator]
             local_token_stride = topo.heads_per_partition * d_bytes  # type: ignore[operator]
@@ -451,7 +363,7 @@ class NixlTransferBackend:
 
         src_descs = self._agent.get_xfer_descs(src_tuples, mem_type="VRAM")
         dst_descs = self._agent.get_xfer_descs(dst_tuples, mem_type="VRAM")
-        # READ pulls remote → local. NIXL's signature is (op, LOCAL, REMOTE, peer).
+        # READ pulls remote -> local. Signature is (op, local, remote, peer).
         xfer = self._agent.initialize_xfer("READ", dst_descs, src_descs, peer_id)
         self._await_xfer(xfer, ctx)
 
@@ -468,7 +380,7 @@ class NixlTransferBackend:
 def make_agent(
     role: str,
     rank: int,
-    listen_addr: Optional[str],  # accepted but unused — NIXL does its own discovery
+    listen_addr: Optional[str],  # accepted but unused; NIXL does its own discovery
     memory_buffer: torch.Tensor,
     expected_num_blocks: int,
     tp_size: Optional[int] = None,
@@ -483,19 +395,8 @@ def make_agent(
 ) -> Optional[NixlTransferBackend]:
     """Construct an agent, or return None when KV transfer is disabled.
 
-    ``listen_addr`` is kept in the signature for launcher compatibility but is
-    ignored by NIXL — peer discovery is metadata-based (see module docstring).
-    Callers pass it as a flag to indicate "transfer enabled" by setting any
-    non-empty string.
-
-    The ``tp_*`` / head / block args enable heterogeneous-TP re-sharding; pass
-    them from the engine's parallel state + KV context. When omitted the agent
-    only supports matched layouts.
-
-    The ``pp_*`` / layer args enable heterogeneous-PP layer re-sharding. Pass
-    ``pp_rank``, ``layer_start``, and ``layer_end`` (global attention-layer
-    indices, inclusive start / exclusive end) so the agent can expose its layer
-    partition to decode peers and select the right outer-slice range when pulling.
+    ``listen_addr`` is kept for launcher compatibility; NIXL uses metadata-based
+    peer discovery. TP/PP arguments enable heterogeneous parallelism transfer.
     """
     if not listen_addr:
         return None
