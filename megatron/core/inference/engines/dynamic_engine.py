@@ -523,16 +523,39 @@ class DynamicInferenceEngine(AbstractEngine):
         block_ids = self._pinned_handoff_blocks.pop(request_id, None)
         if not block_ids:
             return
-        allocator = self.context.kv_block_allocator
-        for b in block_ids:
-            allocator.pinned_blocks.discard(int(b))
-        block_tensor = torch.tensor(block_ids, dtype=torch.int32, device='cpu')
-        allocator.release_memory_blocks(block_tensor)
+        released = self._release_pinned_handoff_blocks(block_ids)
         logging.info(
             "DISAGG_PREFILL_RELEASE request_id=%d released_blocks=%d",
             request_id,
-            len(block_ids),
+            released,
         )
+
+    def _release_pinned_handoff_blocks(self, block_ids: list) -> int:
+        """Unpin and release handoff blocks that are still owned by the pin set."""
+        allocator = self.context.kv_block_allocator
+        pinned = allocator.pinned_blocks
+        candidate_ids = [int(b) for b in block_ids if int(b) in pinned]
+        if not candidate_ids:
+            return 0
+
+        for block_id in candidate_ids:
+            pinned.discard(block_id)
+
+        if allocator.enable_prefix_caching:
+            live_ids = [
+                block_id for block_id in candidate_ids
+                if int(allocator.block_ref_counts[block_id].item()) > 0
+            ]
+        else:
+            free_ids = set(int(b) for b in allocator.block_bag[: allocator.total_avail].tolist())
+            live_ids = [block_id for block_id in candidate_ids if block_id not in free_ids]
+
+        if not live_ids:
+            return 0
+
+        block_tensor = torch.tensor(live_ids, dtype=torch.int32, device='cpu')
+        allocator.release_memory_blocks(block_tensor)
+        return len(live_ids)
 
     def add_request_with_kv_handoff(
         self,
@@ -1904,12 +1927,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     if getattr(request.sampling_params, "do_kv_handoff", False):
                         self._capture_handoff_meta(request, handoff_blocks)
                     elif handoff_blocks:
-                        allocator = self.context.kv_block_allocator
-                        for b in handoff_blocks:
-                            allocator.pinned_blocks.discard(int(b))
-                        allocator.release_memory_blocks(
-                            torch.tensor(handoff_blocks, dtype=torch.int32, device='cpu')
-                        )
+                        self._release_pinned_handoff_blocks(handoff_blocks)
                     finished_entry = self.requests.pop(request_id)
                     finished_request = finished_entry.record[-1]
                     finished_request.generated_length = len(finished_request.generated_tokens)
