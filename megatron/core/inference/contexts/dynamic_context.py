@@ -277,6 +277,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Prefix caching hit tracking (accumulated, reset by engine after logging).
         self.prefix_cache_hits = 0  # requests that matched at least one cached block
+        self.prefix_cache_queries = 0
         self.prefix_cache_blocks_matched = 0  # total matched blocks across all requests
 
         # Engine step counter (used for logging, metrics, and event tracking)
@@ -549,6 +550,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             paused_count=paused_block_count,
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_eviction_policy=self.prefix_caching_eviction_policy,
+        )
+        self._kv_event_listeners: list = []
+        self.kv_block_allocator.add_blocks_deregistered_observer(
+            self._on_kv_blocks_deregistered
         )
 
         # Track request metadata.
@@ -2534,6 +2539,26 @@ class DynamicInferenceContext(BaseInferenceContext):
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
 
+    def add_kv_event_listener(self, listener) -> None:
+        """Register a lightweight listener for prefix-cache lifecycle events."""
+        self._kv_event_listeners.append(listener)
+
+    def _emit_kv_event(self, kind: str, payload: dict) -> None:
+        for listener in tuple(self._kv_event_listeners):
+            try:
+                listener(kind, payload)
+            except Exception:
+                logging.exception("KV event listener failed for %s", kind)
+
+    def _on_kv_blocks_deregistered(self, _block_ids, hashes) -> None:
+        if hashes:
+            self._emit_kv_event("removed", {"block_hashes": list(hashes)})
+
+    def notify_kv_cache_cleared(self) -> None:
+        """Notify observers that no previously advertised block is routable."""
+        if self._kv_event_listeners:
+            self._emit_kv_event("cleared", {})
+
     def reset(self) -> None:
         """Reset entire context.
 
@@ -2546,6 +2571,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         context's memory buffer is referenced by the cuda graph system and
         cannot be deallocated.
         """
+        self.notify_kv_cache_cleared()
         self.reset_tensors()
         self.reset_metadata()
 
@@ -2880,6 +2906,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         effective_kv_offset = req.finished_chunk_token_count + prefix_skip_tokens
 
         # Track prefix cache hits.
+        if self.enable_prefix_caching:
+            self.prefix_cache_queries += 1
         if num_matched_blocks > 0:
             self.prefix_cache_hits += 1
             self.prefix_cache_blocks_matched += num_matched_blocks
@@ -3003,6 +3031,22 @@ class DynamicInferenceContext(BaseInferenceContext):
                 block_hashes_slice = req.precomputed_block_hashes[start:end]
                 self.kv_block_allocator.register_kv_block_hashes(
                     block_ids_to_hash, block_hashes_slice
+                )
+                token_start = start * self.block_size_tokens
+                token_end = end * self.block_size_tokens
+                token_ids = req.prompt_tokens[token_start:token_end].tolist()
+                self._emit_kv_event(
+                    "stored",
+                    {
+                        "block_hashes": list(block_hashes_slice),
+                        "token_ids": token_ids,
+                        "num_block_tokens": [self.block_size_tokens] * (end - start),
+                        "parent_hash": (
+                            int(req.precomputed_block_hashes[start - 1])
+                            if start > 0
+                            else None
+                        ),
+                    },
                 )
 
             # Range 1: prior-chunk partial block that this chunk just completed

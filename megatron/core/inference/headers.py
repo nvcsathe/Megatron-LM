@@ -24,6 +24,7 @@ class Headers(Enum):
     TP_BROADCAST = auto()
     SUBMIT_REQUEST_WITH_KV = auto()  # Decode-side KV import.
     RELEASE_KV = auto()  # Free pinned handoff blocks.
+    ABORT_REQUEST = auto()  # Cancel one in-flight request.
 
 
 class UnknownHeaderError(Exception):

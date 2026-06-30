@@ -40,6 +40,8 @@ class KVBlockAllocator:
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_eviction_policy = prefix_caching_eviction_policy
         self.on_blocks_deregistered: Optional[Callable] = None
+        self._blocks_registered_observers: list[Callable] = []
+        self._blocks_deregistered_observers: list[Callable] = []
 
         # Pinned blocks stay out of the free pool until RELEASE_KV unpins them.
         self.pinned_blocks: set = set()
@@ -293,6 +295,14 @@ class KVBlockAllocator:
         hash_tensor = torch.tensor(block_hashes, dtype=torch.int64, device=self.block_hashes.device)
         self.block_hashes[id_tensor] = hash_tensor
         self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
+        for observer in tuple(self._blocks_registered_observers):
+            observer(list(block_ids), list(block_hashes))
+
+    def add_blocks_registered_observer(self, observer: Callable) -> None:
+        self._blocks_registered_observers.append(observer)
+
+    def add_blocks_deregistered_observer(self, observer: Callable) -> None:
+        self._blocks_deregistered_observers.append(observer)
 
     def _deregister_blocks(self, block_ids: Tensor) -> None:
         """Remove blocks from prefix caching state and return to free pool.
@@ -320,6 +330,8 @@ class KVBlockAllocator:
         # Notify Mamba slot allocator (if wired) to clean up its state
         if self.on_blocks_deregistered is not None:
             self.on_blocks_deregistered(block_ids.tolist(), keys_to_delete)
+        for observer in tuple(self._blocks_deregistered_observers):
+            observer(block_ids.tolist(), keys_to_delete)
 
         # Reset block state (batched tensor ops)
         self.block_hashes[block_ids] = -1

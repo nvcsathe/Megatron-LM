@@ -277,6 +277,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
         self.cuda_graph_all_prefills = inference_config.cuda_graph_all_prefills
         self.metrics_writer = inference_config.metrics_writer
+        self._metrics_listeners: list = []
+        self._prefix_cache_queries = 0
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
@@ -335,9 +337,16 @@ class DynamicInferenceEngine(AbstractEngine):
         self._mamba_conv_agent = None
         self._mamba_ssm_agent = None
         self._pending_kv_imports = deque()
+        self.role = "aggregated"
 
         # Create cuda graphs.
         self.create_cuda_graphs()
+
+    def add_kv_event_listener(self, listener) -> None:
+        self.context.add_kv_event_listener(listener)
+
+    def add_metrics_listener(self, listener) -> None:
+        self._metrics_listeners.append(listener)
 
     def setup_kv_transfer(self, role: str, listen_addr: Optional[str]) -> None:
         """Bring up the NIXL transfer agent for this engine, if configured.
@@ -347,6 +356,7 @@ class DynamicInferenceEngine(AbstractEngine):
             listen_addr: ``host:port`` for the NIXL agent. ``None`` disables
                 KV transfer.
         """
+        self.role = role
         if not listen_addr:
             return
         from megatron.core.inference.disaggregation.transfer_backends.nixl import make_agent
@@ -865,6 +875,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Prefix caching tracking.
         self._prefix_cache_hits = 0
+        self._prefix_cache_queries = 0
         self._prefix_cache_blocks_matched = 0
         self._prefix_coordination_waits = 0
 
@@ -1323,6 +1334,7 @@ class DynamicInferenceEngine(AbstractEngine):
             return
 
         InferenceMode.unset_active()
+        self.context.notify_kv_cache_cleared()
 
         # Deallocate context tensors.
         with self.__class__.suspend_resume_ctx(
@@ -2637,8 +2649,27 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.context.enable_prefix_caching:
             self._prefix_cache_hits += self.context.prefix_cache_hits
             self._prefix_cache_blocks_matched += self.context.prefix_cache_blocks_matched
+            self._prefix_cache_queries += self.context.prefix_cache_queries
             self.context.prefix_cache_hits = 0
             self.context.prefix_cache_blocks_matched = 0
+            self.context.prefix_cache_queries = 0
+
+        if self._metrics_listeners and context_state["kv_stats"] is not None:
+            snapshot = dict(context_state["kv_stats"])
+            snapshot["waiting_request_count"] = len(self.waiting_request_ids)
+            snapshot["active_request_count"] = max(
+                0, len(self.requests) - len(self.waiting_request_ids)
+            )
+            snapshot["prefix_cache_hit_rate"] = (
+                self._prefix_cache_hits / self._prefix_cache_queries
+                if self._prefix_cache_queries > 0
+                else None
+            )
+            for listener in tuple(self._metrics_listeners):
+                try:
+                    listener(snapshot)
+                except Exception:
+                    logging.exception("Inference metrics listener failed")
 
         # Log KV cache utilization stats to W&B
         nvtx_range_push("wandb_logging")
@@ -2941,6 +2972,27 @@ class DynamicInferenceEngine(AbstractEngine):
             elif header == Headers.RELEASE_KV:
                 # Coordinator-broadcast release. Unknown request ids are no-ops.
                 self.release_handoff_blocks(int(data[1]))
+            elif header == Headers.ABORT_REQUEST:
+                request_id = int(data[1])
+                entry = self.requests.get(request_id)
+                if entry is not None:
+                    request = entry.record[-1]
+                    # Requests not yet admitted will complete immediately after
+                    # their prefill bookkeeping. Active requests are forced to
+                    # reach their output length on the next engine step.
+                    request.sampling_params.num_tokens_to_generate = len(
+                        request.generated_tokens
+                    )
+                    active_ids = self.context.request_ids[
+                        : self.context.total_request_count
+                    ]
+                    matches = torch.where(active_ids == request_id)[0]
+                    if matches.numel() > 0:
+                        idx = int(matches[0].item())
+                        self.context.request_output_lengths[idx] = (
+                            self.context.request_kv_length_offsets[idx]
+                            + self.context.request_query_lengths[idx]
+                        )
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
             else:

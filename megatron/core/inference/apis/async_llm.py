@@ -2,13 +2,38 @@
 
 """Async high-level inference API for Megatron (``MegatronAsyncLLM``)."""
 
-from typing import List, Optional, Union
+import copy
+from dataclasses import dataclass
+from typing import AsyncIterator, Callable, List, Optional, Union
 
 from megatron.core.inference.apis._llm_base import _MegatronLLMBase
 from megatron.core.inference.apis.serve_config import ServeConfig
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
+
+
+@dataclass(frozen=True)
+class StreamingInferenceOutput:
+    """One token delta or the terminal result for a streaming request."""
+
+    request_id: int
+    token_ids: List[int]
+    finished: bool
+    final_request: Optional[DynamicInferenceRequest] = None
+
+
+@dataclass(frozen=True)
+class EngineMetadata:
+    """Capacity and addressing information for one coordinator-backed engine."""
+
+    context_length: int
+    block_size_tokens: int
+    total_kv_blocks: int
+    max_requests: int
+    max_tokens: int
+    coordinator_address: str
+    role: str
 
 
 class MegatronAsyncLLM(_MegatronLLMBase):
@@ -95,6 +120,152 @@ class MegatronAsyncLLM(_MegatronLLMBase):
             self._generate_impl(normalized, sampling_params)
         )
         return results if is_batch else results[0]
+
+    async def _iterate_stream(self, stream) -> AsyncIterator[StreamingInferenceOutput]:
+        """Bridge an InferenceClient stream from the runtime loop to the caller loop."""
+        assert self._loop_manager is not None
+        emitted = 0
+        completed = False
+        try:
+            while True:
+                try:
+                    item = await self._loop_manager.run_async(stream.__anext__())
+                except StopAsyncIteration:
+                    return
+                if "partial" in item:
+                    tokens = list(item["partial"].get("new_tokens") or [])
+                    emitted += len(tokens)
+                    yield StreamingInferenceOutput(
+                        request_id=stream.request_id,
+                        token_ids=tokens,
+                        finished=False,
+                    )
+                elif "final" in item:
+                    final = item["final"]
+                    generated = list(final.generated_tokens or [])
+                    completed = True
+                    yield StreamingInferenceOutput(
+                        request_id=stream.request_id,
+                        token_ids=generated[emitted:],
+                        finished=True,
+                        final_request=final,
+                    )
+                    return
+        finally:
+            if not completed:
+                await self._loop_manager.run_async(stream.aclose())
+
+    async def generate_stream(
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: Optional[SamplingParams] = None,
+        on_request_started: Optional[Callable[[int], None]] = None,
+    ) -> AsyncIterator[StreamingInferenceOutput]:
+        """Stream token deltas for one prompt."""
+        self._assert_primary()
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+        assert self._loop_manager is not None
+        stream = await self._loop_manager.run_async(
+            self._start_stream_impl(prompt, copy.deepcopy(sampling_params))
+        )
+        if on_request_started is not None:
+            on_request_started(stream.request_id)
+        async for output in self._iterate_stream(stream):
+            yield output
+
+    async def prefill_for_handoff(
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: Optional[SamplingParams] = None,
+        on_request_started: Optional[Callable[[int], None]] = None,
+    ) -> DynamicInferenceRequest:
+        """Populate and pin prompt KV, returning transfer metadata."""
+        self._assert_primary()
+        params = copy.deepcopy(sampling_params or SamplingParams())
+        params.do_kv_handoff = True
+        params.streaming = False
+        params.num_tokens_to_generate = 0
+        assert self._loop_manager is not None
+        stream = await self._loop_manager.run_async(self._start_stream_impl(prompt, params))
+        if on_request_started is not None:
+            on_request_started(stream.request_id)
+        async for output in self._iterate_stream(stream):
+            if output.finished and output.final_request is not None:
+                return output.final_request
+        raise RuntimeError("prefill stream ended without a final request")
+
+    async def generate_stream_with_kv_handoff(
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        kv_meta: dict,
+        src_block_ids: List[int],
+        on_request_started: Optional[Callable[[int], None]] = None,
+    ) -> AsyncIterator[StreamingInferenceOutput]:
+        """Import remote KV and stream decode output."""
+        self._assert_primary()
+        assert self._loop_manager is not None
+        stream = await self._loop_manager.run_async(
+            self._start_stream_impl(
+                prompt,
+                copy.deepcopy(sampling_params),
+                kv_meta=kv_meta,
+                src_block_ids=src_block_ids,
+            )
+        )
+        if on_request_started is not None:
+            on_request_started(stream.request_id)
+        async for output in self._iterate_stream(stream):
+            yield output
+
+    async def abort(self, request_id: int) -> None:
+        """Abort an in-flight request by client-visible request id."""
+        self._assert_primary()
+        assert self._loop_manager is not None
+        await self._loop_manager.run_async(self._abort_impl(request_id))
+
+    async def release_handoff(self, request_id: int) -> None:
+        """Release KV blocks pinned by a completed prefill request."""
+        self._assert_primary()
+        assert self._loop_manager is not None
+        await self._loop_manager.run_async(self._release_handoff_impl(request_id))
+
+    def add_kv_event_listener(self, listener: Callable[[str, dict], None]) -> None:
+        """Register a primary-rank callback for prefix-cache block events."""
+        self._assert_primary()
+        self.engine.add_kv_event_listener(listener)
+
+    def add_metrics_listener(self, listener: Callable[[dict], None]) -> None:
+        """Register a primary-rank callback for per-step load snapshots."""
+        self._assert_primary()
+        self.engine.add_metrics_listener(listener)
+
+    @property
+    def active_request_count(self) -> int:
+        """Return the number of scheduled or waiting requests."""
+        return len(self.engine.requests)
+
+    @property
+    def pinned_handoff_count(self) -> int:
+        """Return the number of prefill handoffs awaiting source release."""
+        return len(self.engine._pinned_handoff_blocks)
+
+    @property
+    def metadata(self) -> EngineMetadata:
+        """Return capacity metadata after coordinator startup."""
+        self._assert_primary()
+        assert self._coord_runtime is not None and self._coord_runtime.coord_addr is not None
+        allocator = self.context.kv_block_allocator
+        return EngineMetadata(
+            context_length=int(self.context.max_sequence_length),
+            block_size_tokens=int(self.context.block_size_tokens),
+            total_kv_blocks=max(0, int(allocator.total_count) - 1),
+            max_requests=int(self.context.max_requests),
+            max_tokens=int(self.context.max_tokens),
+            coordinator_address=self._coord_runtime.coord_addr,
+            role=self.engine.role,
+        )
 
     async def pause(self) -> None:
         """Transition the engine to ``PAUSED``.

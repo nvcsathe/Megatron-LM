@@ -26,6 +26,31 @@ except:
     HAVE_MSGPACK = False
 
 
+class InferenceStream:
+    """Async request stream with an addressable request id and cancellation."""
+
+    def __init__(self, client: "InferenceClient", request_id: int, queue: asyncio.Queue):
+        self.client = client
+        self.request_id = request_id
+        self.queue = queue
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        item = await self.queue.get()
+        if item is None:
+            self.closed = True
+            raise StopAsyncIteration
+        return item
+
+    async def aclose(self) -> None:
+        if not self.closed:
+            self.client.abort_request(self.request_id)
+            self.closed = True
+
+
 class InferenceClient:
     """
     An asynchronous client for communicating with an inference coordinator service.
@@ -87,6 +112,14 @@ class InferenceClient:
         # final item of None terminates the iterator after the ENGINE_REPLY
         # for that request_id has been delivered.
         self.stream_queues: dict[int, asyncio.Queue] = {}
+        self.aborted_request_ids: set[int] = set()
+
+    def _submit_stream(self, payload: list, request_id: int) -> InferenceStream:
+        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        queue: asyncio.Queue = asyncio.Queue()
+        self.stream_queues[request_id] = queue
+        self.request_submission_times[request_id] = time.perf_counter()
+        return InferenceStream(self, request_id, queue)
 
     def add_request(
         self, prompt: Union[str, List[int]], sampling_params: SamplingParams
@@ -126,7 +159,7 @@ class InferenceClient:
         kv_meta: dict,
         src_block_ids: List[int],
         first_token: Optional[int] = None,
-    ) -> AsyncIterator[dict]:
+    ) -> InferenceStream:
         """Submit a streaming request with remote KV metadata.
 
         The decode engine allocates local blocks, NIXL-pulls KV from the
@@ -150,19 +183,7 @@ class InferenceClient:
             kv_meta,
             list(src_block_ids),
         ]
-        self.socket.send(msgpack.packb(payload, use_bin_type=True))
-        queue: asyncio.Queue = asyncio.Queue()
-        self.stream_queues[request_id] = queue
-        self.request_submission_times[request_id] = time.perf_counter()
-
-        async def _iter():
-            while True:
-                item = await queue.get()
-                if item is None:
-                    return
-                yield item
-
-        return _iter()
+        return self._submit_stream(payload, request_id)
 
     def release_handoff(self, request_id: int) -> None:
         """Tell the coordinator to release the KV blocks pinned for `request_id`.
@@ -173,9 +194,23 @@ class InferenceClient:
         payload = [Headers.RELEASE_KV.value, int(request_id)]
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
 
+    def abort_request(self, request_id: int) -> None:
+        """Cancel an in-flight request and close its local response stream."""
+        request_id = int(request_id)
+        self.aborted_request_ids.add(request_id)
+        queue = self.stream_queues.pop(request_id, None)
+        if queue is not None:
+            queue.put_nowait(None)
+        future = self.completion_futures.pop(request_id, None)
+        if future is not None and not future.done():
+            future.cancel()
+        self.request_submission_times.pop(request_id, None)
+        payload = [Headers.ABORT_REQUEST.value, request_id]
+        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+
     def add_request_streaming(
         self, prompt: Union[str, List[int]], sampling_params: SamplingParams
-    ) -> AsyncIterator[dict]:
+    ) -> InferenceStream:
         """Submit a streaming inference request.
 
         Returns an async iterator that yields one dict per engine step:
@@ -200,19 +235,7 @@ class InferenceClient:
         request_id = self.next_request_id
         self.next_request_id += 1
         payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
-        self.socket.send(msgpack.packb(payload, use_bin_type=True))
-        queue: asyncio.Queue = asyncio.Queue()
-        self.stream_queues[request_id] = queue
-        self.request_submission_times[request_id] = time.perf_counter()
-
-        async def _iter():
-            while True:
-                item = await queue.get()
-                if item is None:
-                    return
-                yield item
-
-        return _iter()
+        return self._submit_stream(payload, request_id)
 
     @trace_async_exceptions
     async def _recv_task(self):
@@ -233,9 +256,12 @@ class InferenceClient:
                 header = Headers(data[0])
                 if header == Headers.ENGINE_REPLY:
                     request_id, reply = data[1:]
-                    reply['latency'] = time.perf_counter() - self.request_submission_times.pop(
-                        request_id
-                    )
+                    if request_id in self.aborted_request_ids:
+                        self.aborted_request_ids.discard(request_id)
+                        continue
+                    submitted = self.request_submission_times.pop(request_id, None)
+                    if submitted is not None:
+                        reply['latency'] = time.perf_counter() - submitted
                     # Streaming path: deliver final reply + sentinel and stop.
                     if request_id in self.stream_queues:
                         queue = self.stream_queues.pop(request_id)
@@ -372,5 +398,6 @@ class InferenceClient:
         for queue in self.stream_queues.values():
             queue.put_nowait(None)
         self.stream_queues.clear()
+        self.aborted_request_ids.clear()
         self.socket.close(linger=0)
         self.context.term()

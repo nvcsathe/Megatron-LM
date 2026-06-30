@@ -419,6 +419,29 @@ class _MegatronLLMBase:
         records = self._engine.generate(prompts, sp)
         return [r.merge() for r in records]
 
+    async def _start_stream_impl(
+        self,
+        prompt,
+        sp: SamplingParams,
+        *,
+        kv_meta: Optional[dict] = None,
+        src_block_ids: Optional[List[int]] = None,
+    ):
+        assert self._coord_runtime is not None and self._coord_runtime.client is not None
+        if kv_meta is not None:
+            return self._coord_runtime.client.add_request_with_kv_handoff(
+                prompt, sp, kv_meta, src_block_ids or []
+            )
+        return self._coord_runtime.client.add_request_streaming(prompt, sp)
+
+    async def _abort_impl(self, request_id: int) -> None:
+        assert self._coord_runtime is not None and self._coord_runtime.client is not None
+        self._coord_runtime.client.abort_request(request_id)
+
+    async def _release_handoff_impl(self, request_id: int) -> None:
+        assert self._coord_runtime is not None and self._coord_runtime.client is not None
+        self._coord_runtime.client.release_handoff(request_id)
+
     async def _pause_impl(self) -> None:
         if self._is_primary_rank:
             assert self._coord_runtime is not None and self._coord_runtime.client is not None
