@@ -48,6 +48,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     Status,
 )
+from megatron.inference.integrations.dynamo.telemetry import DynamoEngineTelemetryMixin
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
@@ -189,7 +190,9 @@ class RequestEntry:
 
 # pylint: disable=line-too-long
 @experimental_api
-class DynamicInferenceEngine(InferenceStateHandoffMixin, AbstractEngine):
+class DynamicInferenceEngine(
+    DynamoEngineTelemetryMixin, InferenceStateHandoffMixin, AbstractEngine
+):
     """The dynamic inference engine.
 
     This engine allows requests of varying length to be dynamically added and
@@ -318,39 +321,6 @@ class DynamicInferenceEngine(InferenceStateHandoffMixin, AbstractEngine):
 
     def add_metrics_listener(self, listener) -> None:
         self._metrics_listeners.append(listener)
-
-    def _send_coordinator_event(self, header: Headers, *payload) -> None:
-        """Send an engine-originated management event from the MP coordinator."""
-        if not getattr(self, "is_mp_coordinator", False):
-            return
-        socket = getattr(self, "socket_for_receiving_requests", None)
-        if socket is None or socket.closed:
-            return
-        socket.send(msgpack.packb([header.value, *payload], use_bin_type=True))
-
-    def publish_metrics_snapshot(self, snapshot: dict) -> None:
-        tagged = dict(snapshot)
-        tagged.setdefault("global_rank", self.rank)
-        self._send_coordinator_event(Headers.METRICS_SNAPSHOT, tagged)
-
-    def publish_kv_event(self, kind: str, payload: dict) -> None:
-        tagged = dict(payload)
-        tagged.setdefault("source_global_rank", self.rank)
-        self._send_coordinator_event(Headers.KV_EVENT, kind, tagged)
-
-    def engine_status(self) -> dict:
-        return {
-            "state": self.state.name.lower(),
-            "active_request_count": max(
-                0, len(self.requests) - len(self.waiting_request_ids)
-            ),
-            "waiting_request_count": len(self.waiting_request_ids),
-            "pinned_handoff_count": self.pinned_handoff_count,
-            "global_rank": self.rank,
-        }
-
-    def publish_engine_status(self) -> None:
-        self._send_coordinator_event(Headers.ENGINE_STATUS, self.engine_status())
 
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""

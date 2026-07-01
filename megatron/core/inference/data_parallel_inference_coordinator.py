@@ -25,6 +25,10 @@ from megatron.core.inference.inference_request import compute_block_hashes_batch
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.inference.integrations.dynamo.protocol import DynamoCoordinatorProtocolMixin
+from megatron.inference.integrations.dynamo.telemetry import (
+    DynamoCoordinatorTelemetryMixin,
+)
 
 try:
     import zmq
@@ -46,7 +50,9 @@ faulthandler.register(signal.SIGTERM, all_threads=False, chain=True)
 faulthandler.register(signal.SIGINT, all_threads=False, chain=True)
 
 
-class DataParallelInferenceCoordinator:
+class DataParallelInferenceCoordinator(
+    DynamoCoordinatorProtocolMixin, DynamoCoordinatorTelemetryMixin
+):
     """
     Coordinates inference requests between clients and distributed model engines.
 
@@ -206,14 +212,8 @@ class DataParallelInferenceCoordinator:
         self.prefix_caching_routing_alpha = prefix_caching_routing_alpha
         self.max_requests = max_requests
         assert self.max_requests is not None and self.max_requests > 0
-        self.engine_metadata = dict(engine_metadata or {})
-        self.engine_metadata.setdefault("protocol_version", 1)
-        self.engine_metadata.setdefault("coordinator_address", self.addr)
-        self.engine_metadata.setdefault("data_parallel_size", data_parallel_size)
-        self._latest_engine_status: dict[bytes, dict] = {}
-        self._telemetry_clients: set[bytes] = set()
-        # (client, operation id) -> (target state, engines still pending)
-        self._pending_controls: dict[tuple[bytes, int], tuple[str, set[bytes]]] = {}
+        self._initialize_dynamo_protocol(engine_metadata, data_parallel_size)
+        self._initialize_dynamo_telemetry()
 
         # Schedule recording.
         self.schedule_output_path = schedule_output_path
@@ -293,48 +293,6 @@ class DataParallelInferenceCoordinator:
                 self._remove_engine(identity)
                 return False
             raise
-
-    def _status_payload(self) -> dict:
-        statuses = list(self._latest_engine_status.values())
-        if statuses:
-            authoritative = dict(
-                min(statuses, key=lambda status: int(status.get("global_rank", 0)))
-            )
-            authoritative["rank_statuses"] = statuses
-            return authoritative
-        return {
-            "state": self.state.name.lower(),
-            "active_request_count": int(self._pending_counts.sum()),
-            "waiting_request_count": 0,
-            "pinned_handoff_count": 0,
-            "rank_statuses": [],
-        }
-
-    def _forward_to_telemetry_clients(self, payload: bytes) -> None:
-        for client in list(self._telemetry_clients):
-            try:
-                self.router_socket.send_multipart([client, payload])
-            except zmq.error.ZMQError as exc:
-                if exc.errno == zmq.EHOSTUNREACH:
-                    self._telemetry_clients.discard(client)
-                    continue
-                raise
-
-    def _observe_engine_status(self, identity: bytes, status: dict) -> None:
-        self._latest_engine_status[identity] = dict(status)
-        state = str(status.get("state", "")).lower()
-        for (client, operation_id), (target, pending) in list(
-            self._pending_controls.items()
-        ):
-            if state == target:
-                pending.discard(identity)
-            if not pending:
-                payload = msgpack.packb(
-                    [Headers.CONTROL_ACK.value, operation_id, self._status_payload()],
-                    use_bin_type=True,
-                )
-                self.router_socket.send_multipart([client, payload])
-                del self._pending_controls[(client, operation_id)]
 
     def compute_request_hashes(self, prompt):
         """Compute block hashes for a prompt on CPU.
@@ -465,54 +423,18 @@ class DataParallelInferenceCoordinator:
                 # print(f"New client connected: {sender_identity}")
                 known_clients.add(sender_identity)
                 self.router_socket.send_multipart(
-                    [
-                        sender_identity,
-                        msgpack.packb(
-                            [Headers.CONNECT_ACK.value, self.engine_metadata],
-                            use_bin_type=True,
-                        ),
-                    ]
+                    [sender_identity, self._dynamo_connect_ack()]
                 )
 
-            elif header == Headers.GET_METADATA:
-                if sender_identity not in known_clients:
-                    continue
-                operation_id = int(deserialized_payload[1])
-                self.router_socket.send_multipart(
-                    [
-                        sender_identity,
-                        msgpack.packb(
-                            [
-                                Headers.METADATA_REPLY.value,
-                                operation_id,
-                                self.engine_metadata,
-                            ],
-                            use_bin_type=True,
-                        ),
-                    ]
-                )
+            elif self._handle_dynamo_management_request(
+                header, sender_identity, deserialized_payload, known_clients
+            ):
+                continue
 
-            elif header == Headers.GET_STATUS:
-                if sender_identity not in known_clients:
-                    continue
-                operation_id = int(deserialized_payload[1])
-                self.router_socket.send_multipart(
-                    [
-                        sender_identity,
-                        msgpack.packb(
-                            [
-                                Headers.STATUS_REPLY.value,
-                                operation_id,
-                                self._status_payload(),
-                            ],
-                            use_bin_type=True,
-                        ),
-                    ]
-                )
-
-            elif header == Headers.SUBSCRIBE_TELEMETRY:
-                if sender_identity in known_clients:
-                    self._telemetry_clients.add(sender_identity)
+            elif self._handle_dynamo_telemetry_subscription(
+                header, sender_identity, known_clients
+            ):
+                continue
 
             elif header == Headers.SUBMIT_REQUEST:
                 # ToDo [Siddharth]: We might want to tokenize the prompt on the
@@ -602,23 +524,9 @@ class DataParallelInferenceCoordinator:
                     if self.state == self.CoordinatorState.RUNNING:
                         self.state = self.CoordinatorState.PAUSED
                     elif self.state in idem_states:
-                        # Already paused/suspended. A management caller still
-                        # needs a correlated acknowledgement.
-                        if len(deserialized_payload) > 1:
-                            operation_id = int(deserialized_payload[1])
-                            self.router_socket.send_multipart(
-                                [
-                                    sender_identity,
-                                    msgpack.packb(
-                                        [
-                                            Headers.CONTROL_ACK.value,
-                                            operation_id,
-                                            self._status_payload(),
-                                        ],
-                                        use_bin_type=True,
-                                    ),
-                                ]
-                            )
+                        self._acknowledge_idempotent_dynamo_control(
+                            sender_identity, deserialized_payload
+                        )
                         continue
                     else:
                         logging.warning("Coordinator: ignoring PAUSE in state %s", self.state)
@@ -652,30 +560,7 @@ class DataParallelInferenceCoordinator:
                 for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
                     self._send_to_engine(data_parallel_rank_id, broadcast_payload)
 
-                if header in (Headers.PAUSE, Headers.STOP) and len(deserialized_payload) > 1:
-                    operation_id = int(deserialized_payload[1])
-                    target = "paused" if header == Headers.PAUSE else "stopped"
-                    pending = set(self.identities_of_data_parallel_ranks)
-                    control_key = (sender_identity, operation_id)
-                    self._pending_controls[control_key] = (target, pending)
-                    for identity, status in self._latest_engine_status.items():
-                        if str(status.get("state", "")).lower() == target:
-                            pending.discard(identity)
-                    if not pending:
-                        self.router_socket.send_multipart(
-                            [
-                                sender_identity,
-                                msgpack.packb(
-                                    [
-                                        Headers.CONTROL_ACK.value,
-                                        operation_id,
-                                        self._status_payload(),
-                                    ],
-                                    use_bin_type=True,
-                                ),
-                            ]
-                        )
-                        del self._pending_controls[control_key]
+                self._track_dynamo_control(header, sender_identity, deserialized_payload)
 
                 # STOP affects engines; reset coordinator to RUNNING to allow future engines.
                 if header == Headers.STOP:
@@ -704,28 +589,10 @@ class DataParallelInferenceCoordinator:
                         ]
                     )
 
-            elif header == Headers.METRICS_SNAPSHOT:
-                assert sender_identity in self.identities_of_data_parallel_ranks
-                rank = self.identity_to_rank_index[sender_identity]
-                payload = msgpack.packb(
-                    [Headers.METRICS_SNAPSHOT.value, rank, deserialized_payload[1]],
-                    use_bin_type=True,
-                )
-                self._forward_to_telemetry_clients(payload)
-
-            elif header == Headers.KV_EVENT:
-                assert sender_identity in self.identities_of_data_parallel_ranks
-                rank = self.identity_to_rank_index[sender_identity]
-                kind, event_payload = deserialized_payload[1:]
-                payload = msgpack.packb(
-                    [Headers.KV_EVENT.value, rank, kind, event_payload],
-                    use_bin_type=True,
-                )
-                self._forward_to_telemetry_clients(payload)
-
-            elif header == Headers.ENGINE_STATUS:
-                assert sender_identity in self.identities_of_data_parallel_ranks
-                self._observe_engine_status(sender_identity, deserialized_payload[1])
+            elif self._handle_dynamo_engine_telemetry(
+                header, sender_identity, deserialized_payload
+            ):
+                continue
 
             elif header == Headers.ENGINE_REPLY:
                 # This is the output of a single engine step on some data parallel rank.

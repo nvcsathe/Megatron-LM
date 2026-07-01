@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import time
-from typing import AsyncIterator, Callable, List, Optional, Union
+from typing import AsyncIterator, List, Optional, Union
 
 from megatron.core.inference.disaggregation.handoff_wire_protocol import (
     make_release_kv_message,
@@ -12,6 +12,8 @@ from megatron.core.inference.disaggregation.handoff_wire_protocol import (
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
+from megatron.inference.integrations.dynamo.protocol import DynamoClientProtocolMixin
+from megatron.inference.integrations.dynamo.telemetry import DynamoClientTelemetryMixin
 
 from .headers import Headers
 
@@ -55,7 +57,7 @@ class InferenceStream:
             self.closed = True
 
 
-class InferenceClient:
+class InferenceClient(DynamoClientProtocolMixin, DynamoClientTelemetryMixin):
     """
     An asynchronous client for communicating with an inference coordinator service.
 
@@ -117,11 +119,8 @@ class InferenceClient:
         # for that request_id has been delivered.
         self.stream_queues: dict[int, asyncio.Queue] = {}
         self.aborted_request_ids: set[int] = set()
-        self.metadata: dict = {}
-        self._next_management_id = 0
-        self._management_futures: dict[int, asyncio.Future] = {}
-        self._metrics_listeners: list[Callable[[int, dict], None]] = []
-        self._kv_event_listeners: list[Callable[[int, str, dict], None]] = []
+        self._initialize_dynamo_protocol()
+        self._initialize_dynamo_telemetry()
 
     def _submit_stream(self, payload: list, request_id: int) -> InferenceStream:
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
@@ -295,23 +294,10 @@ class InferenceClient:
                     queue = self.stream_queues.get(request_id)
                     if queue is not None:
                         queue.put_nowait({"partial": partial})
-                elif header in (
-                    Headers.METADATA_REPLY,
-                    Headers.STATUS_REPLY,
-                    Headers.CONTROL_ACK,
-                ):
-                    operation_id, payload = data[1:]
-                    future = self._management_futures.pop(int(operation_id), None)
-                    if future is not None and not future.done():
-                        future.set_result(payload)
-                elif header == Headers.METRICS_SNAPSHOT:
-                    rank, snapshot = data[1:]
-                    for listener in tuple(self._metrics_listeners):
-                        listener(int(rank), snapshot)
-                elif header == Headers.KV_EVENT:
-                    rank, kind, payload = data[1:]
-                    for listener in tuple(self._kv_event_listeners):
-                        listener(int(rank), str(kind), payload)
+                elif self._handle_dynamo_protocol_message(header, data):
+                    continue
+                elif self._handle_dynamo_telemetry_message(header, data):
+                    continue
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
@@ -355,41 +341,6 @@ class InferenceClient:
         self._loop = get_asyncio_loop(loop)
         self._connect_with_inference_coordinator(connect_timeout_seconds)
         self.listener_task = self._loop.create_task(self._recv_task())
-
-    def subscribe_telemetry(
-        self,
-        *,
-        metrics_listener: Optional[Callable[[int, dict], None]] = None,
-        kv_event_listener: Optional[Callable[[int, str, dict], None]] = None,
-    ) -> None:
-        """Subscribe this client to engine telemetry forwarded by the coordinator."""
-        if metrics_listener is not None:
-            self._metrics_listeners.append(metrics_listener)
-        if kv_event_listener is not None:
-            self._kv_event_listeners.append(kv_event_listener)
-        self._send_signal_to_engines(Headers.SUBSCRIBE_TELEMETRY)
-
-    def _management_request(self, header: Headers) -> asyncio.Future:
-        if self._loop is None:
-            raise RuntimeError("InferenceClient.start() must be called first")
-        operation_id = self._next_management_id
-        self._next_management_id += 1
-        future = self._loop.create_future()
-        self._management_futures[operation_id] = future
-        self._send_signal_to_engines(header, operation_id)
-        return future
-
-    async def get_status(self) -> dict:
-        """Return the latest coordinator-backed engine status snapshot."""
-        return dict(await self._management_request(Headers.GET_STATUS))
-
-    async def pause_engines_and_wait(self) -> dict:
-        """Pause all engines and wait for their synchronized PAUSED state."""
-        return dict(await self._management_request(Headers.PAUSE))
-
-    async def stop_engines_and_wait(self) -> dict:
-        """Stop all engines and wait for their synchronized STOPPED state."""
-        return dict(await self._management_request(Headers.STOP))
 
     def _send_signal_to_engines(self, signal, *args):
         """
@@ -468,10 +419,7 @@ class InferenceClient:
             if not future.done():
                 future.cancel()
         self.completion_futures.clear()
-        for future in self._management_futures.values():
-            if not future.done():
-                future.cancel()
-        self._management_futures.clear()
+        self._cancel_dynamo_protocol_futures()
         # Terminate any open streaming iterators.
         for queue in self.stream_queues.values():
             queue.put_nowait(None)

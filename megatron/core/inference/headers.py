@@ -26,8 +26,9 @@ class Headers(Enum):
     RELEASE_KV = auto()  # Free pinned handoff blocks.
     ABORT_REQUEST = auto()  # Cancel one in-flight request.
 
-    # Management/telemetry protocol. Keep these entries appended so the
-    # numeric values of the established request protocol remain stable.
+    # Dynamo management/telemetry extensions. Their behavior lives under
+    # megatron.inference.integrations.dynamo. Keep these entries appended so
+    # the numeric values of the established request protocol remain stable.
     GET_METADATA = auto()
     METADATA_REPLY = auto()
     GET_STATUS = auto()
