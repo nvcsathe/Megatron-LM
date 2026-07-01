@@ -118,3 +118,57 @@ async def test_inference_client_connect_handshake_rejects_unexpected_reply():
     fake_socket.recv.return_value = msgpack.packb([Headers.STOP.value], use_bin_type=True)
     with pytest.raises(AssertionError):
         client._connect_with_inference_coordinator()
+
+
+async def test_management_metadata_status_and_telemetry():
+    client, _, fake_socket = _make_client()
+    metadata = {
+        "protocol_version": 1,
+        "context_length": 8192,
+        "logical_data_parallel_size": 1,
+    }
+    recv_queue = [msgpack.packb([Headers.CONNECT_ACK.value, metadata], use_bin_type=True)]
+    status_reply = msgpack.packb(
+        [
+            Headers.STATUS_REPLY.value,
+            0,
+            {"state": "running", "active_request_count": 2},
+        ],
+        use_bin_type=True,
+    )
+    metrics_reply = msgpack.packb(
+        [Headers.METRICS_SNAPSHOT.value, 0, {"active_request_count": 2}],
+        use_bin_type=True,
+    )
+    kv_reply = msgpack.packb(
+        [Headers.KV_EVENT.value, 0, "stored", {"block_hashes": [11]}],
+        use_bin_type=True,
+    )
+
+    def fake_recv(*args, **kwargs):
+        if recv_queue:
+            return recv_queue.pop(0)
+        raise zmq.Again()
+
+    fake_socket.recv.side_effect = fake_recv
+    client.start()
+    assert client.metadata == metadata
+
+    metrics = []
+    kv_events = []
+    client.subscribe_telemetry(
+        metrics_listener=lambda rank, snapshot: metrics.append((rank, snapshot)),
+        kv_event_listener=lambda rank, kind, payload: kv_events.append(
+            (rank, kind, payload)
+        ),
+    )
+    status_task = asyncio.create_task(client.get_status())
+    await asyncio.sleep(0)
+    recv_queue.extend([status_reply, metrics_reply, kv_reply])
+    status = await asyncio.wait_for(status_task, timeout=2)
+    await asyncio.sleep(0.02)
+
+    assert status == {"state": "running", "active_request_count": 2}
+    assert metrics == [(0, {"active_request_count": 2})]
+    assert kv_events == [(0, "stored", {"block_hashes": [11]})]
+    client.stop()

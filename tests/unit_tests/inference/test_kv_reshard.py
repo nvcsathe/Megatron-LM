@@ -14,7 +14,6 @@ import pytest
 import torch
 
 from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout, plan_kv_reshard
-from megatron.core.inference.disaggregation.utils import transfers_for_dst
 
 # global model
 L, Hh, BC, BS, HD = 12, 8, 2, 4, 5  # layers, kv-heads, block_count, block_size, head_dim
@@ -76,7 +75,9 @@ def _run_reshard(src_layouts, dst_layouts):
     out = {}
     for d in dst_layouts:
         dst = torch.full((BC, 2, d.local_num_layers(), BS, d.local_num_heads(), HD), -999.0)
-        for t in transfers_for_dst(plan, d.global_rank):
+        for t in (
+            transfer for transfer in plan if transfer.dst_rank == d.global_rank
+        ):
             s = by_rank[t.src_rank]
             block = src_buf[t.src_rank][:, :, t.src_layer_slice(s), :, t.src_head_slice(s), :]
             dst[:, :, t.dst_layer_slice(d), :, t.dst_head_slice(d), :] = block

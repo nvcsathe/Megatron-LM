@@ -26,6 +26,18 @@ class Headers(Enum):
     RELEASE_KV = auto()  # Free pinned handoff blocks.
     ABORT_REQUEST = auto()  # Cancel one in-flight request.
 
+    # Management/telemetry protocol. Keep these entries appended so the
+    # numeric values of the established request protocol remain stable.
+    GET_METADATA = auto()
+    METADATA_REPLY = auto()
+    GET_STATUS = auto()
+    STATUS_REPLY = auto()
+    SUBSCRIBE_TELEMETRY = auto()
+    METRICS_SNAPSHOT = auto()
+    KV_EVENT = auto()
+    ENGINE_STATUS = auto()
+    CONTROL_ACK = auto()
+
 
 class UnknownHeaderError(Exception):
     """A signal with an unrecognized header was received by the coordinator."""

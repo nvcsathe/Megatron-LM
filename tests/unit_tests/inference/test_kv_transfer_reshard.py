@@ -7,14 +7,14 @@
 ``pp_reshard_plan``  — PP layer re-sharding when prefill_PP != decode_PP.
 
 Both planners are pure index arithmetic (no GPU, no NIXL, no torch) and live
-in ``kv_reshard_plan``; this file tests them via their module interface directly.
+in ``disaggregation.kv_reshard``; this file tests them through that module.
 """
 
 import base64
 
 import pytest
 
-from megatron.core.inference.kv_reshard_plan import (
+from megatron.core.inference.disaggregation.kv_reshard import (
     KvTopology,
     TransferSegment,
     build_reshard_plan,

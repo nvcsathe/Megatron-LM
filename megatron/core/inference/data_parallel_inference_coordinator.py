@@ -15,6 +15,11 @@ import numpy as np
 import torch
 
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+from megatron.core.inference.disaggregation.handoff_wire_protocol import (
+    make_release_kv_message,
+    make_submit_request_with_kv_message,
+    parse_submit_request_with_kv_fields,
+)
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import compute_block_hashes_batched
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -99,6 +104,7 @@ class DataParallelInferenceCoordinator:
         prefix_caching_routing_alpha: float = 0.5,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
+        engine_metadata: dict | None = None,
     ):
         """
         Initializes the inference coordinator.
@@ -200,6 +206,14 @@ class DataParallelInferenceCoordinator:
         self.prefix_caching_routing_alpha = prefix_caching_routing_alpha
         self.max_requests = max_requests
         assert self.max_requests is not None and self.max_requests > 0
+        self.engine_metadata = dict(engine_metadata or {})
+        self.engine_metadata.setdefault("protocol_version", 1)
+        self.engine_metadata.setdefault("coordinator_address", self.addr)
+        self.engine_metadata.setdefault("data_parallel_size", data_parallel_size)
+        self._latest_engine_status: dict[bytes, dict] = {}
+        self._telemetry_clients: set[bytes] = set()
+        # (client, operation id) -> (target state, engines still pending)
+        self._pending_controls: dict[tuple[bytes, int], tuple[str, set[bytes]]] = {}
 
         # Schedule recording.
         self.schedule_output_path = schedule_output_path
@@ -279,6 +293,48 @@ class DataParallelInferenceCoordinator:
                 self._remove_engine(identity)
                 return False
             raise
+
+    def _status_payload(self) -> dict:
+        statuses = list(self._latest_engine_status.values())
+        if statuses:
+            authoritative = dict(
+                min(statuses, key=lambda status: int(status.get("global_rank", 0)))
+            )
+            authoritative["rank_statuses"] = statuses
+            return authoritative
+        return {
+            "state": self.state.name.lower(),
+            "active_request_count": int(self._pending_counts.sum()),
+            "waiting_request_count": 0,
+            "pinned_handoff_count": 0,
+            "rank_statuses": [],
+        }
+
+    def _forward_to_telemetry_clients(self, payload: bytes) -> None:
+        for client in list(self._telemetry_clients):
+            try:
+                self.router_socket.send_multipart([client, payload])
+            except zmq.error.ZMQError as exc:
+                if exc.errno == zmq.EHOSTUNREACH:
+                    self._telemetry_clients.discard(client)
+                    continue
+                raise
+
+    def _observe_engine_status(self, identity: bytes, status: dict) -> None:
+        self._latest_engine_status[identity] = dict(status)
+        state = str(status.get("state", "")).lower()
+        for (client, operation_id), (target, pending) in list(
+            self._pending_controls.items()
+        ):
+            if state == target:
+                pending.discard(identity)
+            if not pending:
+                payload = msgpack.packb(
+                    [Headers.CONTROL_ACK.value, operation_id, self._status_payload()],
+                    use_bin_type=True,
+                )
+                self.router_socket.send_multipart([client, payload])
+                del self._pending_controls[(client, operation_id)]
 
     def compute_request_hashes(self, prompt):
         """Compute block hashes for a prompt on CPU.
@@ -409,8 +465,54 @@ class DataParallelInferenceCoordinator:
                 # print(f"New client connected: {sender_identity}")
                 known_clients.add(sender_identity)
                 self.router_socket.send_multipart(
-                    [sender_identity, msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True)]
+                    [
+                        sender_identity,
+                        msgpack.packb(
+                            [Headers.CONNECT_ACK.value, self.engine_metadata],
+                            use_bin_type=True,
+                        ),
+                    ]
                 )
+
+            elif header == Headers.GET_METADATA:
+                if sender_identity not in known_clients:
+                    continue
+                operation_id = int(deserialized_payload[1])
+                self.router_socket.send_multipart(
+                    [
+                        sender_identity,
+                        msgpack.packb(
+                            [
+                                Headers.METADATA_REPLY.value,
+                                operation_id,
+                                self.engine_metadata,
+                            ],
+                            use_bin_type=True,
+                        ),
+                    ]
+                )
+
+            elif header == Headers.GET_STATUS:
+                if sender_identity not in known_clients:
+                    continue
+                operation_id = int(deserialized_payload[1])
+                self.router_socket.send_multipart(
+                    [
+                        sender_identity,
+                        msgpack.packb(
+                            [
+                                Headers.STATUS_REPLY.value,
+                                operation_id,
+                                self._status_payload(),
+                            ],
+                            use_bin_type=True,
+                        ),
+                    ]
+                )
+
+            elif header == Headers.SUBSCRIBE_TELEMETRY:
+                if sender_identity in known_clients:
+                    self._telemetry_clients.add(sender_identity)
 
             elif header == Headers.SUBMIT_REQUEST:
                 # ToDo [Siddharth]: We might want to tokenize the prompt on the
@@ -500,7 +602,23 @@ class DataParallelInferenceCoordinator:
                     if self.state == self.CoordinatorState.RUNNING:
                         self.state = self.CoordinatorState.PAUSED
                     elif self.state in idem_states:
-                        # Already paused/suspended, ignore redundant PAUSE.
+                        # Already paused/suspended. A management caller still
+                        # needs a correlated acknowledgement.
+                        if len(deserialized_payload) > 1:
+                            operation_id = int(deserialized_payload[1])
+                            self.router_socket.send_multipart(
+                                [
+                                    sender_identity,
+                                    msgpack.packb(
+                                        [
+                                            Headers.CONTROL_ACK.value,
+                                            operation_id,
+                                            self._status_payload(),
+                                        ],
+                                        use_bin_type=True,
+                                    ),
+                                ]
+                            )
                         continue
                     else:
                         logging.warning("Coordinator: ignoring PAUSE in state %s", self.state)
@@ -534,6 +652,31 @@ class DataParallelInferenceCoordinator:
                 for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
                     self._send_to_engine(data_parallel_rank_id, broadcast_payload)
 
+                if header in (Headers.PAUSE, Headers.STOP) and len(deserialized_payload) > 1:
+                    operation_id = int(deserialized_payload[1])
+                    target = "paused" if header == Headers.PAUSE else "stopped"
+                    pending = set(self.identities_of_data_parallel_ranks)
+                    control_key = (sender_identity, operation_id)
+                    self._pending_controls[control_key] = (target, pending)
+                    for identity, status in self._latest_engine_status.items():
+                        if str(status.get("state", "")).lower() == target:
+                            pending.discard(identity)
+                    if not pending:
+                        self.router_socket.send_multipart(
+                            [
+                                sender_identity,
+                                msgpack.packb(
+                                    [
+                                        Headers.CONTROL_ACK.value,
+                                        operation_id,
+                                        self._status_payload(),
+                                    ],
+                                    use_bin_type=True,
+                                ),
+                            ]
+                        )
+                        del self._pending_controls[control_key]
+
                 # STOP affects engines; reset coordinator to RUNNING to allow future engines.
                 if header == Headers.STOP:
                     self.state = self.CoordinatorState.RUNNING
@@ -560,6 +703,29 @@ class DataParallelInferenceCoordinator:
                             ),
                         ]
                     )
+
+            elif header == Headers.METRICS_SNAPSHOT:
+                assert sender_identity in self.identities_of_data_parallel_ranks
+                rank = self.identity_to_rank_index[sender_identity]
+                payload = msgpack.packb(
+                    [Headers.METRICS_SNAPSHOT.value, rank, deserialized_payload[1]],
+                    use_bin_type=True,
+                )
+                self._forward_to_telemetry_clients(payload)
+
+            elif header == Headers.KV_EVENT:
+                assert sender_identity in self.identities_of_data_parallel_ranks
+                rank = self.identity_to_rank_index[sender_identity]
+                kind, event_payload = deserialized_payload[1:]
+                payload = msgpack.packb(
+                    [Headers.KV_EVENT.value, rank, kind, event_payload],
+                    use_bin_type=True,
+                )
+                self._forward_to_telemetry_clients(payload)
+
+            elif header == Headers.ENGINE_STATUS:
+                assert sender_identity in self.identities_of_data_parallel_ranks
+                self._observe_engine_status(sender_identity, deserialized_payload[1])
 
             elif header == Headers.ENGINE_REPLY:
                 # This is the output of a single engine step on some data parallel rank.
@@ -603,17 +769,17 @@ class DataParallelInferenceCoordinator:
                         f"Received SUBMIT_REQUEST_WITH_KV from unknown client {sender_identity}; ignoring."
                     )
                     continue
-                handoff_payload = deserialized_payload[1:]
-                if len(handoff_payload) not in (5, 6):
+                try:
+                    client_request_id, prompt, sampling_params, kv_meta, src_block_ids = (
+                        parse_submit_request_with_kv_fields(deserialized_payload[1:])
+                    )
+                except ValueError:
                     logging.error(
                         "Coordinator: malformed SUBMIT_REQUEST_WITH_KV payload "
                         "with %d fields",
-                        len(handoff_payload),
+                        len(deserialized_payload) - 1,
                     )
                     continue
-                client_request_id, prompt, sampling_params, kv_meta, src_block_ids = (
-                    handoff_payload[:5]
-                )
                 request_id = self.next_request_id
                 self.next_request_id += 1
                 self.request_id_to_client_id[request_id] = sender_identity
@@ -623,14 +789,14 @@ class DataParallelInferenceCoordinator:
                 if isinstance(prompt, torch.Tensor):
                     prompt = prompt.tolist()
                 payload = msgpack.packb(
-                    [
+                    make_submit_request_with_kv_message(
                         Headers.SUBMIT_REQUEST_WITH_KV.value,
                         request_id,
                         prompt,
                         sampling_params,
                         kv_meta,
                         src_block_ids,
-                    ],
+                    ),
                     use_bin_type=True,
                 )
 
@@ -684,7 +850,7 @@ class DataParallelInferenceCoordinator:
                     continue
                 request_id = int(deserialized_payload[1])
                 broadcast_payload = msgpack.packb(
-                    [Headers.RELEASE_KV.value, request_id],
+                    make_release_kv_message(Headers.RELEASE_KV.value, request_id),
                     use_bin_type=True,
                 )
                 for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
@@ -745,6 +911,7 @@ class DataParallelInferenceCoordinator:
         prefix_caching_routing_alpha: float = 0.5,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
+        engine_metadata: dict | None = None,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -779,6 +946,7 @@ class DataParallelInferenceCoordinator:
             prefix_caching_routing_alpha=prefix_caching_routing_alpha,
             schedule_output_path=schedule_output_path,
             hostname=hostname,
+            engine_metadata=engine_metadata,
         )
         ready_event.set()
         try:

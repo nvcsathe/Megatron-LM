@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-from megatron.core.inference.kv_reshard_plan import (
+from megatron.core.inference.disaggregation.kv_reshard import (
     KvTopology,
     TransferSegment,
     build_reshard_plan,
@@ -185,7 +185,7 @@ class NixlTransferBackend:
         self._outer_stride_bytes = self._num_blocks * self._bytes_per_slice
         self._per_block_bytes = self._num_outer * self._bytes_per_slice
 
-        # Snapshot used by kv_reshard_plan at transfer time.
+        # Snapshot used by the KV reshard planner at transfer time.
         self._topology = KvTopology(
             tp_size=tp_size,
             tp_rank=tp_rank,
