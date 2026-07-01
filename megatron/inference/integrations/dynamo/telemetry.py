@@ -20,7 +20,7 @@ except ImportError:
 
 
 class DynamoEngineTelemetryMixin:
-    """Publish rank-tagged metrics, KV events, and engine status."""
+    """Publish rank-tagged KV events and engine status."""
 
     def _send_coordinator_event(self, header: Headers, *payload) -> None:
         if not getattr(self, "is_mp_coordinator", False):
@@ -29,11 +29,6 @@ class DynamoEngineTelemetryMixin:
         if socket is None or socket.closed:
             return
         socket.send(msgpack.packb([header.value, *payload], use_bin_type=True))
-
-    def publish_metrics_snapshot(self, snapshot: dict) -> None:
-        tagged = dict(snapshot)
-        tagged.setdefault("global_rank", self.rank)
-        self._send_coordinator_event(Headers.METRICS_SNAPSHOT, tagged)
 
     def publish_kv_event(self, kind: str, payload: dict) -> None:
         tagged = dict(payload)
@@ -59,15 +54,9 @@ class DynamoClientTelemetryMixin:
     """Receive coordinator-forwarded telemetry in ``InferenceClient``."""
 
     def _initialize_dynamo_telemetry(self) -> None:
-        self._metrics_listeners = []
         self._kv_event_listeners = []
 
     def _handle_dynamo_telemetry_message(self, header: Headers, data: list) -> bool:
-        if header == Headers.METRICS_SNAPSHOT:
-            rank, snapshot = data[1:]
-            for listener in tuple(self._metrics_listeners):
-                listener(int(rank), snapshot)
-            return True
         if header == Headers.KV_EVENT:
             rank, kind, payload = data[1:]
             for listener in tuple(self._kv_event_listeners):
@@ -75,9 +64,7 @@ class DynamoClientTelemetryMixin:
             return True
         return False
 
-    def subscribe_telemetry(self, *, metrics_listener=None, kv_event_listener=None) -> None:
-        if metrics_listener is not None:
-            self._metrics_listeners.append(metrics_listener)
+    def subscribe_telemetry(self, *, kv_event_listener=None) -> None:
         if kv_event_listener is not None:
             self._kv_event_listeners.append(kv_event_listener)
         self._send_signal_to_engines(Headers.SUBSCRIBE_TELEMETRY)
@@ -140,20 +127,9 @@ class DynamoCoordinatorTelemetryMixin:
     def _handle_dynamo_engine_telemetry(
         self, header: Headers, sender_identity: bytes, payload: list
     ) -> bool:
-        if header not in (
-            Headers.METRICS_SNAPSHOT,
-            Headers.KV_EVENT,
-            Headers.ENGINE_STATUS,
-        ):
+        if header not in (Headers.KV_EVENT, Headers.ENGINE_STATUS):
             return False
         assert sender_identity in self.identities_of_data_parallel_ranks
-        if header == Headers.METRICS_SNAPSHOT:
-            rank = self.identity_to_rank_index[sender_identity]
-            packed = msgpack.packb(
-                [Headers.METRICS_SNAPSHOT.value, rank, payload[1]], use_bin_type=True
-            )
-            self._forward_to_telemetry_clients(packed)
-            return True
         if header == Headers.KV_EVENT:
             rank = self.identity_to_rank_index[sender_identity]
             kind, event_payload = payload[1:]
@@ -168,22 +144,6 @@ class DynamoCoordinatorTelemetryMixin:
         return True
 
 
-def logical_planner_snapshot_fields(stats: dict) -> dict:
-    """Normalize the authoritative rank's metrics for Dynamo DP rank zero."""
-
-    total = int(stats.get("total_blocks") or 0)
-    used = int(stats.get("allocated_blocks") or 0)
-    return {
-        "kv_used_blocks": used,
-        "kv_total_blocks": total,
-        "gpu_cache_usage": float(stats.get("allocated_utilization") or 0.0),
-        "kv_cache_hit_rate": stats.get("prefix_cache_hit_rate"),
-        "dp_rank": 0,
-        "active_requests": int(stats.get("active_request_count") or 0),
-        "waiting_requests": int(stats.get("waiting_request_count") or 0),
-    }
-
-
 def authoritative_kv_event(rank: int, kind: str, payload: dict):
     """Return a normalized KV event only for the authoritative rank."""
 
@@ -196,12 +156,6 @@ def authoritative_kv_event(rank: int, kind: str, payload: dict):
 
 def attach_engine_telemetry(engine) -> None:
     """Connect Megatron engine callbacks to the Dynamo telemetry channel."""
-
-    def publish_metrics(snapshot: dict) -> None:
-        engine.publish_metrics_snapshot(snapshot)
-        engine.publish_engine_status()
-
-    engine.add_metrics_listener(publish_metrics)
     engine.add_kv_event_listener(engine.publish_kv_event)
 
 

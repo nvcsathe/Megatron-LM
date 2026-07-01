@@ -49,7 +49,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from megatron.core.inference.disaggregation.shard_range_intersection import intersect
 
-
 # ---------------------------------------------------------------------------
 # Topology descriptor
 # ---------------------------------------------------------------------------

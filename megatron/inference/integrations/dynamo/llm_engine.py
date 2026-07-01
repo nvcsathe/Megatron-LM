@@ -21,17 +21,13 @@ if TYPE_CHECKING:
 
 from dynamo._core import Context
 from dynamo.common.backend.disagg import require_prefill_result
-from dynamo.common.backend.engine import (
-    EngineConfig,
-    GenerateChunk,
-    GenerateRequest,
-    LLMEngine,
-)
+from dynamo.common.backend.engine import EngineConfig, GenerateChunk, GenerateRequest, LLMEngine
 from dynamo.common.backend.health_check import build_health_check_payload, is_probe
-from dynamo.common.backend.publisher import ComponentSnapshot, KvEventSource, PushSource
+from dynamo.common.backend.publisher import KvEventSource, PushSource
 from dynamo.common.backend.worker import WorkerConfig
 from dynamo.common.constants import DisaggregationMode
 from dynamo.llm import KvEventPublisher, ModelInput
+
 from megatron.inference.integrations.dynamo.args import Config, parse_args
 
 logger = logging.getLogger(__name__)
@@ -93,8 +89,6 @@ class MegatronLLMEngine(LLMEngine):
         self._runtime_dir: Optional[tempfile.TemporaryDirectory] = None
         self._shutting_down = False
         self._metadata: dict[str, Any] = {}
-        self._rank_metrics: dict[int, dict[str, Any]] = {}
-        self._snapshot_publisher: Any = None
         self._kv_queue: queue.Queue[tuple[str, dict]] = queue.Queue()
         self._publisher_stop = threading.Event()
         self._publisher_thread: Optional[threading.Thread] = None
@@ -172,10 +166,7 @@ class MegatronLLMEngine(LLMEngine):
                 "Megatron coordinator protocol mismatch: "
                 f"expected {PROTOCOL_VERSION}, got {protocol_version}"
             )
-        self.client.subscribe_telemetry(
-            metrics_listener=self._on_metrics,
-            kv_event_listener=self._on_kv_event,
-        )
+        self.client.subscribe_telemetry(kv_event_listener=self._on_kv_event)
         self._process_monitor = asyncio.create_task(self._monitor_process())
 
         return EngineConfig(
@@ -489,16 +480,8 @@ class MegatronLLMEngine(LLMEngine):
             return []
         return [PushSource(on_ready=self._start_publisher_thread, dp_rank=0)]
 
-    def component_metrics_dp_ranks(self) -> list[int]:
-        return [0]
-
-    def attach_snapshot_publisher(self, publisher: Any) -> None:
-        self._snapshot_publisher = publisher
-
     def _on_kv_event(self, rank: int, kind: str, payload: dict) -> None:
-        from megatron.inference.integrations.dynamo.telemetry import (
-            authoritative_kv_event,
-        )
+        from megatron.inference.integrations.dynamo.telemetry import authoritative_kv_event
 
         event = authoritative_kv_event(rank, kind, payload)
         if event is None:
@@ -529,18 +512,3 @@ class MegatronLLMEngine(LLMEngine):
                     publisher.publish_all_cleared()
             except Exception:
                 logger.exception("Failed to publish Megatron KV event %s", kind)
-
-    def _on_metrics(self, rank: int, stats: dict) -> None:
-        self._rank_metrics[rank] = dict(stats)
-        if rank != 0:
-            return
-        if self._snapshot_publisher is None:
-            return
-        from megatron.inference.integrations.dynamo.telemetry import (
-            logical_planner_snapshot_fields,
-        )
-
-        self._snapshot_publisher.publish(
-            0,
-            ComponentSnapshot(**logical_planner_snapshot_fields(stats)),
-        )

@@ -1,18 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for InferenceClient.add_request_streaming.
-
-The streaming contract (see InferenceClient.add_request_streaming):
-
-- ``SamplingParams.streaming`` is forced True before submission.
-- The submit payload uses the existing ``SUBMIT_REQUEST`` header; the engine
-  reads ``streaming`` off the sampling params to decide whether to emit
-  partials.
-- ENGINE_REPLY_PARTIAL frames arrive as ``[header, request_id, partial_dict]``
-  and surface as ``{"partial": partial_dict}`` items on the iterator.
-- A terminal ENGINE_REPLY surfaces as a single ``{"final": reply}`` item, after
-  which the iterator stops.
-"""
+"""Unit tests for ``InferenceClient.add_request_streaming``."""
 
 import asyncio
 from unittest.mock import MagicMock, patch
@@ -70,14 +58,12 @@ async def test_add_request_streaming_emits_partials_then_final():
 
     iterator = client.add_request_streaming("hi", params)
 
-    # Submission side-effects.
     assert params.streaming is True
     assert 0 in client.stream_queues
     submit_payload = msgpack.unpackb(fake_socket.send.call_args.args[0], raw=False)
     assert submit_payload[0] == Headers.SUBMIT_REQUEST.value
     assert submit_payload[3]["streaming"] is True
 
-    # Drain the iterator.
     items = []
     async for item in iterator:
         items.append(item)
@@ -88,7 +74,6 @@ async def test_add_request_streaming_emits_partials_then_final():
     assert "final" in items[2]
     assert items[2]["final"]["generated_tokens"] == [1, 2, 3]
 
-    # Routing state for the request is fully cleaned up.
     assert 0 not in client.stream_queues
     assert 0 not in client.request_submission_times
 
@@ -115,7 +100,6 @@ async def test_streaming_partial_for_unknown_request_is_dropped():
     fake_socket.recv.side_effect = fake_recv
     client.start()
 
-    # Give the listener a chance to consume the stray partial.
     await asyncio.sleep(0.02)
     assert client.stream_queues == {}
 

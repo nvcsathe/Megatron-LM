@@ -114,9 +114,7 @@ class InferenceClient(DynamoClientProtocolMixin, DynamoClientTelemetryMixin):
         self.completion_futures = {}
         self.request_submission_times = {}
         self.next_request_id = 0
-        # Streaming requests: request_id -> asyncio.Queue of partial dicts. A
-        # final item of None terminates the iterator after the ENGINE_REPLY
-        # for that request_id has been delivered.
+        # A None queue item terminates a request stream after its final reply.
         self.stream_queues: dict[int, asyncio.Queue] = {}
         self.aborted_request_ids: set[int] = set()
         self._initialize_dynamo_protocol()

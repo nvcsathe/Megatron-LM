@@ -111,7 +111,7 @@ class InferenceStateHandoffMixin:
             layer_end=layer_end,
         )
 
-        # Gather TP-rank metadata once for heterogeneous-TP pulls.
+        # Cache peer metadata for cross-TP pulls.
         self._kv_peer_metas = None
         if self._kv_transfer_agent is not None and torch.distributed.is_initialized() and tp_size > 1:
             local_meta = self._kv_transfer_agent.export_meta()
@@ -121,8 +121,7 @@ class InferenceStateHandoffMixin:
             )
             self._kv_peer_metas = gathered
 
-        # Mamba state transfer reuses the matched-layout block path.
-        # Mamba TP/PP re-sharding is not implemented.
+        # Mamba state transfer currently requires a matched layout.
         self._mamba_conv_agent = None
         self._mamba_ssm_agent = None
         if getattr(self.context, "is_hybrid_model", False):
@@ -160,16 +159,7 @@ class InferenceStateHandoffMixin:
     def _capture_handoff_meta(
         self, request: "DynamicInferenceRequest", block_ids: list
     ) -> None:
-        """Stamp ``disaggregated_params`` and record pinned blocks.
-
-        Called when a ``do_kv_handoff=True`` request transitions to finished.
-        ``block_ids`` comes from the controller's pre-``update_requests``
-        snapshot (`finished_handoff_block_ids`). By the time we get here the
-        context tensors have already been cleared, so reading
-        ``request_to_kv_block_ids`` directly would return all -1. The
-        controller also pinned these blocks before releasing slots, so they
-        are safely out of the free pool until :meth:`release_handoff_blocks`.
-        """
+        """Attach transfer metadata and retain the request's pinned blocks."""
         rid = request.request_id
         if not block_ids:
             logging.warning(
@@ -179,10 +169,8 @@ class InferenceStateHandoffMixin:
             )
             return
 
-        # Each PP rank pins and releases its own local blocks.
         self._pinned_handoff_blocks[rid] = list(block_ids)
 
-        # Build per-rank KV metadata.
         local_kv: Any = {}
         if self._kv_peer_metas is not None:
             local_kv = self._kv_peer_metas
@@ -191,7 +179,6 @@ class InferenceStateHandoffMixin:
 
         pp_size = get_pg_size(self.pg_collection.pp)
         if pp_size > 1 and torch.distributed.is_initialized():
-            # All PP ranks call this together after the same completion step.
             local_entry = {"kv_meta": local_kv, "block_ids": list(block_ids)}
             gathered: list = [None] * pp_size
             torch.distributed.all_gather_object(
@@ -203,13 +190,11 @@ class InferenceStateHandoffMixin:
                     for e in gathered
                 ]
             }
-            # Keep top-level block_ids for existing Dynamo handlers.
             top_block_ids: Any = gathered[0]["block_ids"]
         else:
             kv_meta = local_kv
             top_block_ids = block_ids
 
-        # Hybrid models include Mamba slot metadata in the same handoff object.
         if self._mamba_conv_agent is not None and isinstance(kv_meta, dict):
             msa = self.context.mamba_slot_allocator
             mamba_blocks = []
@@ -283,9 +268,7 @@ class InferenceStateHandoffMixin:
         src_block_ids: list,
     ) -> "asyncio.Future[DynamicInferenceRequest]":
         """Submit an async NIXL pull, then admit the request when KV is local."""
-        from megatron.core.inference.inference_request import (
-            compute_block_hashes_batched,
-        )
+        from megatron.core.inference.inference_request import compute_block_hashes_batched
 
         allocator = self.context.kv_block_allocator
         if not allocator.enable_prefix_caching:
@@ -294,12 +277,7 @@ class InferenceStateHandoffMixin:
                 "decode engine; the prefill-skip path uses the prefix-cache match logic."
             )
 
-        # 1. Allocate local blocks to hold the imported KV state.
-        # For heterogeneous-PP handoffs, kv_meta carries per-PP-rank block_ids
-        # inside "pp_metas"; the top-level src_block_ids contains only pp_rank=0's
-        # blocks. Use the count from the first PP-rank entry as the canonical
-        # sequence-block count (all PP ranks hold the same number of blocks for a
-        # given sequence length).
+        # PP entries all have the same sequence-block count.
         if isinstance(kv_meta, dict) and "pp_metas" in kv_meta:
             pp_metas = kv_meta["pp_metas"]
             num_blocks = len(pp_metas[0]["block_ids"]) if pp_metas else 0
@@ -319,9 +297,7 @@ class InferenceStateHandoffMixin:
         else:
             handle = None
 
-        # Hashes are registered only after the async transfer completes.
-        # include_partial=True lets short prompts skip their imported partial
-        # block instead of falling back to a full decode-side prefill.
+        # Register hashes only after transfer; include short partial blocks.
         prompt_tensor = torch.tensor(prompt, dtype=torch.int64)
         hashes = compute_block_hashes_batched(
             prompt_tensor, self.context.block_size_tokens, include_partial=True

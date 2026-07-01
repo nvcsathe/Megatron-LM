@@ -34,7 +34,6 @@ class Headers(Enum):
     GET_STATUS = auto()
     STATUS_REPLY = auto()
     SUBSCRIBE_TELEMETRY = auto()
-    METRICS_SNAPSHOT = auto()
     KV_EVENT = auto()
     ENGINE_STATUS = auto()
     CONTROL_ACK = auto()

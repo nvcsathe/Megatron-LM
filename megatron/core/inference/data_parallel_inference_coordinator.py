@@ -26,9 +26,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.inference.integrations.dynamo.protocol import DynamoCoordinatorProtocolMixin
-from megatron.inference.integrations.dynamo.telemetry import (
-    DynamoCoordinatorTelemetryMixin,
-)
+from megatron.inference.integrations.dynamo.telemetry import DynamoCoordinatorTelemetryMixin
 
 try:
     import zmq
@@ -567,16 +565,13 @@ class DataParallelInferenceCoordinator(
                     self.state = self.CoordinatorState.RUNNING
 
             elif header == Headers.ENGINE_REPLY_PARTIAL:
-                # Per-step partial output for streaming requests. Routing state
-                # (request_id_to_client_id / request_id_to_client_request_id) is
-                # left intact; it will be cleaned up by the matching ENGINE_REPLY.
+                # Preserve routing until the final ENGINE_REPLY.
                 assert sender_identity in self.identities_of_data_parallel_ranks
                 partials = deserialized_payload[1]
                 for partial in partials:
                     fid = partial["request_id"]
                     client_identity = self.request_id_to_client_id.get(fid)
                     if client_identity is None:
-                        # Request already finalized or unknown — drop the partial.
                         continue
                     client_request_identity = self.request_id_to_client_request_id[fid]
                     self.router_socket.send_multipart(
@@ -627,10 +622,7 @@ class DataParallelInferenceCoordinator(
                     )
 
             elif header == Headers.SUBMIT_REQUEST_WITH_KV:
-                # Decode-side handoff import. Payload:
-                #   [header, client_request_id, prompt, sampling_params,
-                #    kv_meta, src_block_ids]
-                # Routed exactly like SUBMIT_REQUEST — round-robin to a DP rank.
+                # Decode-side handoff import, routed like SUBMIT_REQUEST.
                 if sender_identity not in known_clients:
                     logging.info(
                         f"Received SUBMIT_REQUEST_WITH_KV from unknown client {sender_identity}; ignoring."
@@ -667,9 +659,7 @@ class DataParallelInferenceCoordinator(
                     use_bin_type=True,
                 )
 
-                # Disagg requests bypass prefix-aware routing: KV handoff
-                # already determined which decode worker the request belongs
-                # to via the bootstrap rendezvous. Round-robin is fine here.
+                # The handoff has already selected a decode worker.
                 for _ in range(len(self.identities_of_data_parallel_ranks)):
                     next_identity = self.get_next_data_parallel_rank()
                     if self._send_to_engine(next_identity, payload):
@@ -708,10 +698,7 @@ class DataParallelInferenceCoordinator(
                     )
 
             elif header == Headers.RELEASE_KV:
-                # Coordinator → all engines: release pinned blocks for an
-                # explicit prefill engine request id. Prefill handoff metadata
-                # carries this id because the normal client-id mapping is gone
-                # by the time the completed prefill reply reaches decode.
+                # Release the source request's pinned blocks on all ranks.
                 if sender_identity not in known_clients:
                     logging.warning("Coordinator: ignoring RELEASE_KV from unknown client.")
                     continue

@@ -4,6 +4,7 @@
 """Unified entrypoint for the Megatron-owned Dynamo backend."""
 
 from dynamo.common.backend.run import run
+
 from megatron.inference.integrations.dynamo.llm_engine import MegatronLLMEngine
 
 

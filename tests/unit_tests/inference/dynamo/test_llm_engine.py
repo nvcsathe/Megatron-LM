@@ -5,7 +5,10 @@ from types import SimpleNamespace
 import pytest
 
 from megatron.inference.integrations.dynamo.args import Config
-from megatron.inference.integrations.dynamo.llm_engine import MegatronLLMEngine, build_sampling_params
+from megatron.inference.integrations.dynamo.llm_engine import (
+    MegatronLLMEngine,
+    build_sampling_params,
+)
 
 
 def _config(role="aggregated"):
@@ -104,30 +107,3 @@ async def test_abort_uses_megatron_request_id_recorded_for_context():
     await engine.abort(_Context())
 
     assert aborted == [77]
-
-
-def test_metrics_snapshot_includes_scheduler_load():
-    published = []
-    publisher = SimpleNamespace(
-        publish=lambda rank, snapshot: published.append((rank, snapshot))
-    )
-    engine = MegatronLLMEngine(_config())
-    engine.attach_snapshot_publisher(publisher)
-
-    engine._on_metrics(
-        0,
-        {
-            "allocated_blocks": 25,
-            "total_blocks": 100,
-            "allocated_utilization": 0.25,
-            "prefix_cache_hit_rate": 0.5,
-            "active_request_count": 3,
-            "waiting_request_count": 2,
-        }
-    )
-
-    rank, snapshot = published[0]
-    assert rank == 0
-    assert snapshot.active_requests == 3
-    assert snapshot.waiting_requests == 2
-    assert engine._rank_metrics[0]["allocated_blocks"] == 25

@@ -283,7 +283,6 @@ class NixlTransferBackend:
                 f"peer_meta for {peer_name!r} is missing agent_metadata_b64"
             )
         peer_id = self._agent.add_remote_agent(base64.b64decode(metadata_b64))
-        # NIXL versions return either the peer name or an opaque id.
         resolved = peer_id if peer_id else peer_name
         self._known_peers[peer_name] = resolved
         logger.info(
@@ -345,11 +344,7 @@ class NixlTransferBackend:
         )
 
     def _begin_segment(self, seg: TransferSegment, dst_block_ids: List[int]) -> tuple[Any, str]:
-        """Submit one :class:`TransferSegment` via NIXL.
-
-        ``n_heads == 0`` copies full slices. Otherwise, copy per-token head
-        fragments for heterogeneous TP.
-        """
+        """Submit one full-slice or head-fragment transfer segment."""
         pm = seg.peer_meta
         peer_base = pm["base_addr"]
         peer_device_id = pm.get("device_id", 0)
@@ -368,7 +363,7 @@ class NixlTransferBackend:
         dst_tuples: List[Any] = []
 
         if seg.n_heads == 0:
-            # Full-slice copy: one descriptor per (block, outer).
+            # One descriptor per block and outer slice.
             for src_b, dst_b in zip(src_block_ids, dst_block_ids):
                 for i in range(n_outer):
                     src_o = src_o_start + i

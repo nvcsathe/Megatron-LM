@@ -2,11 +2,7 @@
 
 """KV transfer backends for disaggregated inference."""
 
-from .base import (
-    KVTransportBackend,
-    get_kv_transport_backend,
-    set_kv_transport_backend,
-)
+from .base import KVTransportBackend, get_kv_transport_backend, set_kv_transport_backend
 
 __all__ = [
     "KVTransportBackend",

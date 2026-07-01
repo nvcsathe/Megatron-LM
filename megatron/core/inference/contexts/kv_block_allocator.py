@@ -43,7 +43,7 @@ class KVBlockAllocator:
         self._blocks_registered_observers: list[Callable] = []
         self._blocks_deregistered_observers: list[Callable] = []
 
-        # Pinned blocks stay out of the free pool until RELEASE_KV unpins them.
+        # Handoff blocks remain pinned until decode finishes pulling them.
         self.pinned_blocks: set = set()
 
         self.total_count = total_count
@@ -209,9 +209,7 @@ class KVBlockAllocator:
         if blocks.numel() == 0:
             return
 
-        # Filter out pinned (disagg handoff) blocks before any release logic.
-        # They'll be released by release_handoff_blocks() once the decode peer
-        # has finished pulling them.
+        # Handoff blocks are released separately after the remote pull.
         if self.pinned_blocks:
             pinned = self.pinned_blocks
             keep_mask = torch.tensor(

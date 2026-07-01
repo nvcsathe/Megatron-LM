@@ -30,53 +30,12 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     parser.add_argument(
         "--parsers", type=str, nargs="+", default=[], help="Parsers to use for parsing the response"
     )
-    parser.add_argument(
-        "--frontend",
-        type=str,
-        choices=["flask", "dynamo", "both"],
-        default="flask",
-        help=(
-            "Which user-facing frontend to launch. 'flask' (default) starts the existing "
-            "REST server. 'dynamo' skips the Flask server and just runs the DP coordinator + "
-            "engine; downstream Dynamo workers connect to the coordinator address printed on "
-            "stdout as MEGATRON_COORDINATOR_ADDR=<addr>. 'both' runs Flask AND prints the "
-            "coordinator address."
-        ),
-    )
-    # Phase-3 disagg.
-    parser.add_argument(
-        "--disagg-role",
-        type=str,
-        choices=["prefill", "decode", "aggregated"],
-        default="aggregated",
-        help=(
-            "Role for this Megatron engine when serving disaggregated. 'aggregated' "
-            "(default) preserves Phase-0 behavior. 'prefill'/'decode' enable the NIXL "
-            "KV-transfer bridge — pair with --kv-transfer-listen-addr."
-        ),
-    )
-    parser.add_argument(
-        "--kv-transfer-listen-addr",
-        type=str,
-        default=None,
-        help=(
-            "host:port that the local NIXL agent listens on. Required when "
-            "--disagg-role is prefill or decode. Each rank uses a distinct agent "
-            "name derived from the role + global rank."
-        ),
-    )
     return parser
 
 
 @trace_async_exceptions
 async def run_text_generation_server(
-    engine: DynamicInferenceEngine,
-    coordinator_port: int,
-    server_port: int,
-    hostname: str | None = None,
-    frontend: str = "flask",
-    disagg_role: str = "aggregated",
-    kv_transfer_listen_addr: str | None = None,
+    engine: DynamicInferenceEngine, coordinator_port: int, server_port: int, hostname: str | None = None,
 ):
     """
     Runs the text generation server from rank 0 and initializes the
@@ -86,10 +45,6 @@ async def run_text_generation_server(
         engine (DynamicInferenceEngine): The dynamic inference engine.
         coordinator_port (int): The network port for the dynamic inference DP coordinator.
         server_port (int): The network for port the frontend text generation server.
-        hostname (str | None): Bind hostname for the coordinator and Flask server.
-        frontend (str): One of "flask", "dynamo", or "both". Controls whether the
-            legacy Flask REST server is spawned and whether the coordinator
-            address is printed to stdout for Dynamo workers.
     """
 
     rank = torch.distributed.get_rank()
@@ -99,44 +54,24 @@ async def run_text_generation_server(
         hostname=hostname,
     )
 
-    # Phase-3 disagg: stand up the NIXL transfer agent. No-op when the role is
-    # aggregated or the listen-addr is unset.
-    if disagg_role in ("prefill", "decode"):
-        engine.setup_kv_transfer(role=disagg_role, listen_addr=kv_transfer_listen_addr)
-
-    launched_flask = False
     try:
         if rank == 0:
-            if frontend in ("dynamo", "both"):
-                # Single-line, parseable advertisement for sbatch wrappers.
-                print(f"MEGATRON_COORDINATOR_ADDR={coordinator_addr}", flush=True)
-                if disagg_role != "aggregated":
-                    print(
-                        f"MEGATRON_DISAGG_ROLE={disagg_role}", flush=True
-                    )
-                    if kv_transfer_listen_addr:
-                        print(
-                            f"MEGATRON_KV_TRANSFER_ADDR={kv_transfer_listen_addr}",
-                            flush=True,
-                        )
-            if frontend in ("flask", "both"):
-                start_text_gen_server(
-                    coordinator_addr=coordinator_addr,
-                    tokenizer=engine.controller.tokenizer,
-                    parsers=args.parsers,
-                    rank=rank,
-                    server_port=server_port,
-                    verbose=args.inference_text_gen_server_logging,
-                    hostname=hostname,
-                )
-                launched_flask = True
+            start_text_gen_server(
+                coordinator_addr=coordinator_addr,
+                tokenizer=engine.controller.tokenizer,
+                parsers=args.parsers,
+                rank=rank,
+                server_port=server_port,
+                verbose=args.inference_text_gen_server_logging,
+                hostname=hostname,
+            )
 
         # Await the engine loop directly since the server is running in a separate process
         await engine.engine_loop_task
 
     finally:
         # Guarantee that the separate process is terminated when the engine loop stops or is interrupted
-        if rank == 0 and launched_flask:
+        if rank == 0:
             stop_text_gen_server()
 
 
@@ -166,15 +101,7 @@ if __name__ == "__main__":
 
         try:
             asyncio.run(
-                run_text_generation_server(
-                    engine,
-                    args.inference_coordinator_port,
-                    args.port,
-                    args.host,
-                    frontend=args.frontend,
-                    disagg_role=args.disagg_role,
-                    kv_transfer_listen_addr=args.kv_transfer_listen_addr,
-                )
+                run_text_generation_server(engine, args.inference_coordinator_port, args.port, args.host)
             )
         except KeyboardInterrupt:
             # Catching at the top level ensures clean stdout without spamming the traceback

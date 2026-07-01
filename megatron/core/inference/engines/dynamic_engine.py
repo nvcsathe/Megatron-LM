@@ -48,7 +48,6 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     Status,
 )
-from megatron.inference.integrations.dynamo.telemetry import DynamoEngineTelemetryMixin
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
@@ -72,6 +71,7 @@ from megatron.core.utils import (
     trace_async_exceptions,
     unwrap_model,
 )
+from megatron.inference.integrations.dynamo.telemetry import DynamoEngineTelemetryMixin
 
 from .async_zmq_communicator import AsyncZMQCommunicator
 
@@ -261,8 +261,6 @@ class DynamicInferenceEngine(
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
         self.cuda_graph_all_prefills = inference_config.cuda_graph_all_prefills
         self.metrics_writer = inference_config.metrics_writer
-        self._metrics_listeners: list = []
-        self._prefix_cache_queries = 0
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
@@ -319,9 +317,6 @@ class DynamicInferenceEngine(
     def add_kv_event_listener(self, listener) -> None:
         self.context.add_kv_event_listener(listener)
 
-    def add_metrics_listener(self, listener) -> None:
-        self._metrics_listeners.append(listener)
-
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
 
@@ -336,8 +331,7 @@ class DynamicInferenceEngine(
         self.waiting_request_ids = deque()
         self._reset_pending_kv_imports()
         self.failed_request_ids = []
-        # For streaming: tracks how many generated_tokens have already been
-        # forwarded as ENGINE_REPLY_PARTIAL frames per request_id.
+        # Generated token count already streamed for each request.
         self._partial_emit_lengths: Dict[int, int] = {}
         self._generation_epoch: Optional[int] = None
         # Track requests that should stop due to stop words (detected in post_process_requests)
@@ -374,7 +368,6 @@ class DynamicInferenceEngine(
 
         # Prefix caching tracking.
         self._prefix_cache_hits = 0
-        self._prefix_cache_queries = 0
         self._prefix_cache_blocks_matched = 0
         self._prefix_coordination_waits = 0
 
@@ -1430,11 +1423,7 @@ class DynamicInferenceEngine(
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
                     request.add_event_finish()
-                    # Attach KV handoff metadata when requested. Otherwise,
-                    # release the blocks pinned by the controller snapshot.
-                    #   - do_kv_handoff=False: unpin and free immediately. The
-                    #     controller pinned universally because it doesn't have
-                    #     SamplingParams visibility.
+                    # Keep handoff blocks only when the request needs them.
                     handoff_blocks = (finished_handoff_block_ids or {}).get(
                         request_id, []
                     )
@@ -2119,10 +2108,7 @@ class DynamicInferenceEngine(
                 self.socket_for_receiving_requests.send(payload)
                 nvtx_range_pop("coordinator_communication")
 
-            # Emit ENGINE_REPLY_PARTIAL frames for any still-active streaming
-            # requests that produced new tokens this step. Finished records are
-            # already covered above; their entries are also pruned from
-            # _partial_emit_lengths here.
+            # Stream newly generated tokens for active requests.
             finished_ids_this_step = {r.requests[-1].request_id for r in finished_request_records}
             partials: list = []
             for rid, entry in self.requests.items():
@@ -2151,27 +2137,8 @@ class DynamicInferenceEngine(
         if self.context.enable_prefix_caching:
             self._prefix_cache_hits += self.context.prefix_cache_hits
             self._prefix_cache_blocks_matched += self.context.prefix_cache_blocks_matched
-            self._prefix_cache_queries += self.context.prefix_cache_queries
             self.context.prefix_cache_hits = 0
             self.context.prefix_cache_blocks_matched = 0
-            self.context.prefix_cache_queries = 0
-
-        if self._metrics_listeners and context_state["kv_stats"] is not None:
-            snapshot = dict(context_state["kv_stats"])
-            snapshot["waiting_request_count"] = len(self.waiting_request_ids)
-            snapshot["active_request_count"] = max(
-                0, len(self.requests) - len(self.waiting_request_ids)
-            )
-            snapshot["prefix_cache_hit_rate"] = (
-                self._prefix_cache_hits / self._prefix_cache_queries
-                if self._prefix_cache_queries > 0
-                else None
-            )
-            for listener in tuple(self._metrics_listeners):
-                try:
-                    listener(snapshot)
-                except Exception:
-                    logging.exception("Inference metrics listener failed")
 
         # Log KV cache utilization stats to W&B
         nvtx_range_push("wandb_logging")
@@ -2473,9 +2440,7 @@ class DynamicInferenceEngine(
                 entry = self.requests.get(request_id)
                 if entry is not None:
                     request = entry.record[-1]
-                    # Requests not yet admitted will complete immediately after
-                    # their prefill bookkeeping. Active requests are forced to
-                    # reach their output length on the next engine step.
+                    # Force active requests to finish on the next step.
                     request.sampling_params.num_tokens_to_generate = len(
                         request.generated_tokens
                     )
@@ -2565,9 +2530,7 @@ class DynamicInferenceEngine(
         """
         self.state = EngineState.STOPPED
         self.publish_engine_status()
-        # Give libzmq a scheduling turn to flush the terminal state before
-        # closing the DEALER socket with linger=0. The external supervisor
-        # waits for this status as its acknowledged STOP boundary.
+        # Flush the terminal status before closing the zero-linger socket.
         if getattr(self, "is_mp_coordinator", False):
             await asyncio.sleep(0.05)
 

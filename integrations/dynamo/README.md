@@ -16,7 +16,7 @@ are not registered as Dynamo workers.
 megatron/inference/integrations/dynamo/   backend adapter and engine protocol
 megatron/core/inference/disaggregation/  engine-native KV/state handoff
 tests/unit_tests/inference/dynamo/        adapter unit tests
-examples/inference/dynamo/                local and Slurm examples
+examples/inference/dynamo/                Slurm test
 integrations/dynamo/container/            Megatron-owned runtime image
 integrations/dynamo/deploy/               DynamoGraphDeployment manifests
 ```
@@ -111,15 +111,12 @@ python -m dynamo.frontend \
   --event-plane nats
 ```
 
-The local examples start etcd, NATS, the frontend, and the required workers:
+The Nano v3 Slurm test starts etcd, NATS, the frontend, and matched TP=1/PP=1
+prefill and decode workers:
 
 ```bash
-bash examples/inference/dynamo/phase0/orchestrate.sh
-bash examples/inference/dynamo/phase3/orchestrate.sh
+bash examples/inference/dynamo/nano-v3-test/launch.sh
 ```
-
-Phase 3 uses one prefill GPU and one decode GPU by default. Override
-`TP_PREFILL`, `PP_PREFILL`, `TP_DECODE`, and `PP_DECODE` for other layouts.
 
 ## Tests
 
@@ -128,13 +125,8 @@ Adapter tests require an environment containing both Megatron and Dynamo:
 ```bash
 pytest -q tests/unit_tests/inference/dynamo
 pytest -q tests/unit_tests/inference/test_dynamo_engine_service.py
-pytest -q tests/unit_tests/inference/test_kv_reshard.py
+pytest -q tests/unit_tests/inference/test_kv_transfer_backends.py
 ```
-
-For Kubernetes, build and publish the image, replace the image references in
-`integrations/dynamo/deploy/`, and apply either `disagg.yaml` or
-`disagg_planner.yaml`. Planner support is optional; it is not required for
-disaggregation or KV routing.
 
 ## Runtime contract
 
@@ -143,8 +135,8 @@ disaggregation or KV routing.
 - The frontend forwards the prefill result to the selected decode worker.
 - Decode imports the blocks before generation and releases the source handoff
   after the first post-import output.
-- Prefix block events and scheduler snapshots cross the private coordinator's
-  telemetry channel and are published by the parent as logical DP rank zero.
+- Prefix block events cross the private coordinator and are published by the
+  parent as logical DP rank zero.
 - Cancellation targets the exact Megatron request; shutdown unregisters the
   endpoint, drains requests and pinned handoffs, and then stops all ranks.
 

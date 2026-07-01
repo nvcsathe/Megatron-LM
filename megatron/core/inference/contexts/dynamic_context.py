@@ -277,7 +277,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Prefix caching hit tracking (accumulated, reset by engine after logging).
         self.prefix_cache_hits = 0  # requests that matched at least one cached block
-        self.prefix_cache_queries = 0
         self.prefix_cache_blocks_matched = 0  # total matched blocks across all requests
 
         # Engine step counter (used for logging, metrics, and event tracking)
@@ -2906,8 +2905,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         effective_kv_offset = req.finished_chunk_token_count + prefix_skip_tokens
 
         # Track prefix cache hits.
-        if self.enable_prefix_caching:
-            self.prefix_cache_queries += 1
         if num_matched_blocks > 0:
             self.prefix_cache_hits += 1
             self.prefix_cache_blocks_matched += num_matched_blocks

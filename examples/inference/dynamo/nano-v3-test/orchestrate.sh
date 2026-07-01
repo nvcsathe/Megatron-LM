@@ -1,34 +1,5 @@
 #!/usr/bin/env bash
-# Hybrid (Mamba) disaggregation orchestrator — Nemotron-3 Nano.
-#
-# Validates that the Mamba conv/ssm recurrent state is handed off from prefill
-# to decode over NIXL alongside the attention KV cache. Without that transfer a
-# hybrid model silently decodes from ZERO Mamba state and produces wrong tokens
-# (see disaggregation/inference_state_handoff.py and transfer_backends/nixl.py).
-#
-#     NATS + etcd
-#     ├── Megatron coordinator [PREFILL]   (TP=1 PP=1 EP=2, GPUs 0,1)  --disagg-role prefill
-#     ├── Megatron coordinator [DECODE]    (TP=1 PP=1 EP=2, GPUs 2,3)  --disagg-role decode
-#     ├── megatron.inference.integrations.dynamo worker [PREFILL] --role prefill
-#     ├── megatron.inference.integrations.dynamo worker [DECODE]  --role decode
-#     ├── dynamo.frontend                  (disagg stack, :$HTTP_PORT)
-#     └── [optional baseline, WITH_BASELINE=1, needs its own spare GPUs]
-#         ├── Megatron coordinator [AGG]   (TP=1 PP=1, GPUs $GPU_BASELINE)  --disagg-role aggregated
-#         ├── megatron.inference.integrations.dynamo worker [AGG] --role aggregated
-#         └── dynamo.frontend              (baseline stack, :$HTTP_PORT_AGG)
-#
-# The baseline is a normal single-engine (non-disagg) server of the SAME model.
-# verify_mamba.sh greedy-decodes the same prompt through both stacks and diffs
-# the token text — the only check that reliably catches lost Mamba state, since
-# attention-only checks pass even when conv/ssm state is zeroed.
-#
-# Mamba transfer is matched TP=1/PP=1 only (enforced in setup_kv_transfer); the
-# conv/ssm state has no TP/PP reshard plan yet. EP>1 is allowed and is how this
-# 30B-A3B MoE is sharded to fit (experts split across GPUs, replicated Mamba
-# state pulled rank-to-rank — each rank runs its own NIXL agent).
-#
-# Outputs: /tmp/phase3_mamba.env + per-component logs in $LOG_DIR.
-# Emits "PHASE3_MAMBA_READY" on stdout once healthy.
+# Launch matched TP=1/PP=1 Nano v3 prefill and decode workers on one Slurm node.
 
 set -uo pipefail
 
@@ -36,18 +7,10 @@ export UCX_TLS="${UCX_TLS_OVERRIDE:-cuda_ipc,cuda_copy,tcp,shm,cma,self}"
 export UCX_MEMTYPE_CACHE="${UCX_MEMTYPE_CACHE_OVERRIDE:-n}"
 export UCX_LOG_LEVEL="${UCX_LOG_LEVEL_OVERRIDE:-info}"
 export UCX_LOG_FILE="${UCX_LOG_FILE_OVERRIDE:-/tmp/ucx_%p.log}"
-# The owned-engine parent forwards child stdout through a pipe. Keep checkpoint
-# and CUDA-graph progress visible instead of block-buffering it for minutes.
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 
 STAGE="${STAGE:-/lustre/fsw/portfolios/nemotron/users/csathe}"
-# Nemotron-3 Nano mcore (torch_dist) checkpoint, its pretrained source, and the
-# tokenizer — the exact artifacts the Nano v3 functional test consumes. These
-# already live on the cluster; override only if you staged your own copy.
-#   MODEL_CHECKPOINT      -> --load (the mcore dist checkpoint to serve)
-#   PRETRAINED_CHECKPOINT -> --pretrained-checkpoint
-#   TOKENIZER_MODEL       -> Megatron tiktoken vocab restored by the checkpoint
-#   DYNAMO_MODEL          -> Dynamo frontend model dir / HF id (config + tokenizer)
+# Cluster artifact defaults; launch.sh mounts them at these paths.
 MODEL_CHECKPOINT="${MODEL_CHECKPOINT:-/lustre/fsw/portfolios/llmservice/users/ksanthanam/nemotron-3-nano-30b}"
 PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-/lustre/fsw/portfolios/llmservice/users/ksanthanam/nanov3}"
 TOKENIZER_MODEL="${TOKENIZER_MODEL:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json}"
@@ -55,34 +18,17 @@ DYNAMO_MODEL="${DYNAMO_MODEL:-nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-nemotron3-nano}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"
-# Engine's max inference sequence length. Sizes the per-request KV/activation
-# workspace, so keep it at the context length we actually serve — the original
-# 73728 sized the engine for a 72K context and wasted GPU memory on a 4K serve.
 INFER_MAX_SEQ_LEN="${INFER_MAX_SEQ_LEN:-$CONTEXT_LENGTH}"
-# Dynamic-batching KV buffer budget (per engine). Keep this close to the known
-# working Nano serving config; larger buffers leave too little headroom for
-# Mamba prefix-cache staging on each rank.
 INFER_BUFFER_GB="${INFER_BUFFER_GB:-20}"
 INFER_MAX_TOKENS="${INFER_MAX_TOKENS:-8192}"
 INFER_MAX_REQUESTS="${INFER_MAX_REQUESTS:-256}"
 
-# Mamba / prefix-cache budgets. BOTH prefill and decode need the Mamba state
-# cache: prefill commits block-boundary conv/ssm snapshots into it (the source
-# of the handoff) and decode restores them. Bump MAMBA_GB if you see
-# "No Mamba slots available" / "No evictable Mamba cache slots".
 PREFIX_CACHE="${PREFIX_CACHE:-1}"
 MAMBA_GB="${MAMBA_GB:-4.0}"
 
-# Bring up the non-disagg reference stack for the gold-standard token diff.
-# Defaults OFF: on a 4-GPU node the disagg roles below already claim all four
-# GPUs (EP=2 prefill + EP=2 decode), leaving none for the baseline. Set
-# WITH_BASELINE=1 only when you have spare GPUs (e.g. assign GPU_BASELINE="4,5").
+# The optional baseline needs a separate EP-sized GPU set.
 WITH_BASELINE="${WITH_BASELINE:-0}"
 
-# GPUs per role. The test topology is fixed to TP=1, PP=1, EP=2 for both
-# prefill and decode; each role therefore needs exactly two visible GPUs.
-# EP shards experts only. TP/PP stay 1, which is exactly what the Mamba
-# conv/ssm handoff requires (the handoff is gated on TP=1/PP=1, not EP).
 ROLE_EP_SIZE="${ROLE_EP_SIZE:-2}"
 GPU_PREFILL="${GPU_PREFILL:-0,1}"
 GPU_DECODE="${GPU_DECODE:-2,3}"
@@ -113,8 +59,6 @@ die()  { log "FATAL: $*" >&2; cleanup; exit 1; }
 
 cleanup() {
     log "cleaning up..."
-    # `${array[@]}` is treated as unset for an empty array by older Bash
-    # versions when `set -u` is active (including the login-node Bash).
     for pid in "${PIDS[@]-}"; do
         [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
     done
@@ -159,17 +103,7 @@ fi
 
 log "Hybrid disagg (Mamba transfer): TP=1 PP=1 EP=$ROLE_EP_SIZE; prefill GPUs=$GPU_PREFILL, decode GPUs=$GPU_DECODE; baseline=$WITH_BASELINE (GPUs=$GPU_BASELINE)"
 
-###############################################################################
-# Tokenizer/model-card preflight.
-#
-# Megatron loads weights from MODEL_CHECKPOINT and gets its tokenizer arguments
-# from that checkpoint (--use-checkpoint-args). Dynamo needs a separate HF-style
-# metadata directory in order to tokenize HTTP requests. register_model() treats
-# an unresolved HF id as a full model fetch, so resolve it here with
-# ignore_weights=True and pass the resulting local directory to every worker.
-# This downloads only config/tokenizer metadata and makes tokenizer errors fail
-# before four expensive coordinator loads begin.
-###############################################################################
+# Resolve Dynamo tokenizer metadata without downloading model weights.
 resolve_dynamo_metadata() {
     if [[ -d "$DYNAMO_MODEL" ]]; then
         printf '%s\n' "$DYNAMO_MODEL"
@@ -188,8 +122,6 @@ print(asyncio.run(main()))' \
 log "resolving Dynamo tokenizer metadata for $DYNAMO_MODEL (weights excluded)..."
 DYNAMO_MODEL_METADATA=$(resolve_dynamo_metadata) \
     || die "could not resolve Dynamo metadata for '$DYNAMO_MODEL' (check HF_HOME/network/HF_TOKEN)"
-# Keep the final line in case the downloader emitted informational output on
-# stdout before printing the resolved snapshot path.
 DYNAMO_MODEL_METADATA="${DYNAMO_MODEL_METADATA##*$'\n'}"
 [[ -d "$DYNAMO_MODEL_METADATA" ]] \
     || die "Dynamo metadata resolver returned a non-directory: '$DYNAMO_MODEL_METADATA'"
@@ -200,25 +132,11 @@ DYNAMO_MODEL_METADATA="${DYNAMO_MODEL_METADATA##*$'\n'}"
 log "Dynamo tokenizer metadata ready: $DYNAMO_MODEL_METADATA"
 
 if [[ "$PREFLIGHT_ONLY" == "1" ]]; then
-    echo "PHASE3_MAMBA_PREFLIGHT_OK"
+    echo "NANO_V3_PREFLIGHT_OK"
     exit 0
 fi
 
-###############################################################################
-# Model args — Nemotron-3 Nano (hybrid Mamba-2 + attention + MoE).
-#
-# Taken verbatim from the Nano v3 functional test, MINUS the flags the launch
-# helper already supplies (--load and tensor/pipeline-model-parallel-size).
-# Architecture and tokenizer come from the checkpoint (--use-checkpoint-args)
-# unless TOKENIZER_MODEL is explicitly set.
-#
-# EP is pinned to ROLE_EP_SIZE=2 for this test. The Mamba handoff is gated only
-# on TP=1/PP=1 (setup_kv_transfer raises otherwise); EP shards experts while
-# leaving the replicated attention/Mamba state — and therefore the conv/ssm
-# handoff layout — identical on every rank.
-#
-# Override the whole block with MODEL_ARGS_OVERRIDE="--foo ... --bar ...".
-###############################################################################
+# Nano v3 serving arguments. MODEL_ARGS_OVERRIDE replaces this list.
 if [[ -n "${MODEL_ARGS_OVERRIDE:-}" ]]; then
     # shellcheck disable=SC2206
     MODEL_ARGS=( $MODEL_ARGS_OVERRIDE )
@@ -269,8 +187,7 @@ fi
 TOKENIZER_ARGS=()
 TOKENIZER_ARGS=(--tokenizer-model "$TOKENIZER_MODEL")
 
-# Launch one owned Dynamo Megatron engine. Args:
-# role gpus coordinator_port nixl_port log [Megatron args...].
+# Args: role, GPUs, coordinator port, NIXL port, log, extra Megatron args.
 launch_engine() {
     local role="$1" gpus="$2" coord_port="$3" nixl_port="$4" logf="$5"; shift 5
     local nproc="$ROLE_EP_SIZE"
@@ -300,9 +217,7 @@ launch_engine() {
     PIDS+=($!)
 }
 
-###############################################################################
-# 1. NATS + etcd
-###############################################################################
+# Runtime services.
 log "starting NATS..."
 nats-server --jetstream --store_dir /tmp/nats-jetstream --port 4222 -m 8222 \
     > "$LOG_DIR/nats.log" 2>&1 &
@@ -316,11 +231,7 @@ PIDS+=($!)
 wait_for "nats /healthz"  30 curl -sf http://127.0.0.1:8222/healthz || die "nats never healthy"
 wait_for "etcd /health"   30 curl -sf http://127.0.0.1:2379/health  || die "etcd never healthy"
 
-###############################################################################
-# 2. Disagg owned engines (prefill + decode). Both need the Mamba state cache.
-# Launch concurrently to minimize total startup time; the 30B checkpoint and
-# CUDA-graph capture can keep both workers below readiness for several minutes.
-###############################################################################
+# Start both workers concurrently; model loading may take several minutes.
 launch_engine prefill "$GPU_PREFILL" "$COORD_PORT_PREFILL" "$NIXL_PORT_PREFILL" \
     "$LOG_DIR/worker-prefill.log" \
     "${PREFIX_ARGS[@]}"
@@ -346,9 +257,7 @@ wait_for "frontend exposes $SERVED_MODEL_NAME" 60 \
     bash -c "curl -sf http://127.0.0.1:$HTTP_PORT/v1/models | grep -q '$SERVED_MODEL_NAME'" \
     || die "frontend never exposed model (see $LOG_DIR/frontend.log)"
 
-###############################################################################
-# 4. Optional aggregated baseline stack (one owned engine + frontend).
-###############################################################################
+# Optional aggregated reference.
 BASELINE_URL=""
 if [[ "$WITH_BASELINE" == "1" ]]; then
     DYN_NAMESPACE=baseline launch_engine aggregated "$GPU_BASELINE" "$COORD_PORT_AGG" "" \
@@ -368,22 +277,20 @@ if [[ "$WITH_BASELINE" == "1" ]]; then
     BASELINE_URL="http://127.0.0.1:$HTTP_PORT_AGG"
 fi
 
-###############################################################################
-# 5. Publish env + block
-###############################################################################
-cat > /tmp/phase3_mamba.env <<ENV
-export PHASE3_FRONTEND_URL="http://127.0.0.1:$HTTP_PORT"
-export PHASE3_BASELINE_URL="$BASELINE_URL"
-export PHASE3_MODEL_NAME="$SERVED_MODEL_NAME"
-export PHASE3_LOG_DIR="$LOG_DIR"
-export PHASE3_PREFILL_LOG="$LOG_DIR/worker-prefill.log"
-export PHASE3_DECODE_LOG="$LOG_DIR/worker-decode.log"
+# Publish connection details for verify.sh.
+cat > /tmp/nano_v3_test.env <<ENV
+export NANO_V3_FRONTEND_URL="http://127.0.0.1:$HTTP_PORT"
+export NANO_V3_BASELINE_URL="$BASELINE_URL"
+export NANO_V3_MODEL_NAME="$SERVED_MODEL_NAME"
+export NANO_V3_LOG_DIR="$LOG_DIR"
+export NANO_V3_PREFILL_LOG="$LOG_DIR/worker-prefill.log"
+export NANO_V3_DECODE_LOG="$LOG_DIR/worker-decode.log"
 ENV
 
 log "all components healthy."
 log "  disagg:   http://127.0.0.1:$HTTP_PORT"
 [[ -n "$BASELINE_URL" ]] && log "  baseline: $BASELINE_URL"
-echo "PHASE3_MAMBA_READY"
+echo "NANO_V3_TEST_READY"
 wait -n "${PIDS[@]}"
 log "a component exited; tearing down"
 exit 1
