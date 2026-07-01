@@ -1,0 +1,93 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: nvidia.com/v1alpha1
+kind: DynamoGraphDeployment
+metadata:
+  name: megatron-disagg
+spec:
+  services:
+    Frontend:
+      componentType: frontend
+      replicas: 1
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/megatron-runtime:my-tag
+          command: [python3]
+          args: [-m, dynamo.frontend, --router-mode, kv]
+    MegatronDecodeWorker:
+      componentType: worker
+      subComponentType: decode
+      replicas: 1
+      resources:
+        limits:
+          gpu: "4"
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/megatron-runtime:my-tag
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          command: [python3, -m, megatron.inference.integrations.dynamo]
+          args:
+            - --role
+            - decode
+            - --model
+            - Qwen/Qwen3-8B
+            - --nproc-per-node
+            - "4"
+            - --coordinator-host
+            - $(POD_IP)
+            - --kv-transfer-listen-addr
+            - $(POD_IP):7000
+            - --
+            - --load
+            - /models/qwen3-8b-megatron
+            - --tensor-model-parallel-size
+            - "4"
+            - --tokenizer-type
+            - HuggingFaceTokenizer
+            - --tokenizer-model
+            - Qwen/Qwen3-8B
+            - --inference-dynamic-batching
+            - --inference-dynamic-batching-prefix-caching
+    MegatronPrefillWorker:
+      componentType: worker
+      subComponentType: prefill
+      replicas: 1
+      resources:
+        limits:
+          gpu: "4"
+      extraPodSpec:
+        mainContainer:
+          image: nvcr.io/nvidia/ai-dynamo/megatron-runtime:my-tag
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          command: [python3, -m, megatron.inference.integrations.dynamo]
+          args:
+            - --role
+            - prefill
+            - --model
+            - Qwen/Qwen3-8B
+            - --nproc-per-node
+            - "4"
+            - --coordinator-host
+            - $(POD_IP)
+            - --kv-transfer-listen-addr
+            - $(POD_IP):7000
+            - --
+            - --load
+            - /models/qwen3-8b-megatron
+            - --tensor-model-parallel-size
+            - "4"
+            - --tokenizer-type
+            - HuggingFaceTokenizer
+            - --tokenizer-model
+            - Qwen/Qwen3-8B
+            - --inference-dynamic-batching
+            - --inference-dynamic-batching-prefix-caching

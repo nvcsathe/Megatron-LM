@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Dynamo-owned Megatron distributed engine service.
+"""Megatron-owned distributed engine service for the Dynamo integration.
 
 This module is intended to be launched by ``torch.distributed.run``.  It owns
 the model-parallel rank group and private inference coordinator, but no Dynamo
