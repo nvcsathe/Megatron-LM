@@ -4,8 +4,8 @@
 
 This module is intended to be launched by ``torch.distributed.run``.  It owns
 the model-parallel rank group and private inference coordinator, but no Dynamo
-runtime objects.  Rank zero advertises coordinator readiness through an atomic
-JSON file supplied by the supervising process.
+runtime objects. Rank zero advertises coordinator readiness through the
+parent-owned engine event socket.
 """
 
 from __future__ import annotations
@@ -18,14 +18,11 @@ import torch.distributed as dist
 
 from megatron.core.utils import get_pg_size
 from megatron.inference.integrations.dynamo.protocol import (
+    build_ready_payload,
     build_engine_metadata,
     logical_replica_group,
-    write_ready_descriptor,
 )
-from megatron.inference.integrations.dynamo.telemetry import (
-    attach_engine_telemetry,
-    report_engine_status,
-)
+from megatron.inference.integrations.dynamo.telemetry import EngineEventReporter
 from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_args
@@ -35,7 +32,7 @@ from megatron.training.initialize import initialize_megatron
 
 def _extra_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser = add_inference_args(add_modelopt_args(parser))
-    parser.add_argument("--dynamo-ready-file", required=True)
+    parser.add_argument("--dynamo-parent-event-address", required=True)
     parser.add_argument(
         "--dynamo-role",
         choices=["aggregated", "prefill", "decode"],
@@ -68,23 +65,26 @@ async def _serve() -> None:
             listen_addr=args.dynamo_kv_transfer_listen_addr,
         )
 
-    attach_engine_telemetry(engine)
-
     coordinator_address = await engine.start_listening_to_data_parallel_coordinator(
         inference_coordinator_port=args.dynamo_coordinator_port,
         hostname=args.dynamo_coordinator_host,
-        engine_metadata=build_engine_metadata(engine, args),
     )
+    reporter = EngineEventReporter(engine, args.dynamo_parent_event_address)
+    reporter.start()
 
     if dist.get_rank() == 0:
-        write_ready_descriptor(args.dynamo_ready_file, coordinator_address)
+        reporter.observe(
+            "ready",
+            build_ready_payload(
+                coordinator_address,
+                build_engine_metadata(engine, args),
+            ),
+        )
 
-    reporter = asyncio.create_task(report_engine_status(engine))
     try:
         await engine.engine_loop_task
     finally:
-        reporter.cancel()
-        await asyncio.gather(reporter, return_exceptions=True)
+        reporter.stop()
 
 
 def main() -> None:

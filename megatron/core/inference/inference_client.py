@@ -115,7 +115,6 @@ class InferenceClient:
         # A None queue item terminates a request stream after its final reply.
         self.stream_queues: dict[int, asyncio.Queue] = {}
         self.aborted_request_ids: set[int] = set()
-        self.metadata: dict = {}
 
     def _submit_stream(self, payload: list, request_id: int) -> InferenceStream:
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
@@ -123,14 +122,6 @@ class InferenceClient:
         self.stream_queues[request_id] = queue
         self.request_submission_times[request_id] = time.perf_counter()
         return InferenceStream(self, request_id, queue)
-
-    def _handle_extension_message(self, header: Headers, data: list) -> bool:
-        """Handle an integration-specific coordinator message."""
-        return False
-
-    def _cleanup_extension_state(self) -> None:
-        """Clean up integration-specific client state."""
-        pass
 
     def add_request(
         self, prompt: Union[str, List[int]], sampling_params: SamplingParams
@@ -297,8 +288,6 @@ class InferenceClient:
                     queue = self.stream_queues.get(request_id)
                     if queue is not None:
                         queue.put_nowait({"partial": partial})
-                elif self._handle_extension_message(header, data):
-                    continue
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
@@ -324,7 +313,6 @@ class InferenceClient:
             )
         reply = msgpack.unpackb(self.socket.recv(), raw=False)
         assert Headers(reply[0]) == Headers.CONNECT_ACK
-        self.metadata = dict(reply[1]) if len(reply) > 1 else {}
 
     def start(
         self,
@@ -420,7 +408,6 @@ class InferenceClient:
             if not future.done():
                 future.cancel()
         self.completion_futures.clear()
-        self._cleanup_extension_state()
         # Terminate any open streaming iterators.
         for queue in self.stream_queues.values():
             queue.put_nowait(None)

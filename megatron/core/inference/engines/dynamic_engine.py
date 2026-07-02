@@ -71,8 +71,6 @@ from megatron.core.utils import (
     trace_async_exceptions,
     unwrap_model,
 )
-from megatron.inference.integrations.dynamo.telemetry import DynamoEngineTelemetryMixin
-
 from .async_zmq_communicator import AsyncZMQCommunicator
 
 try:
@@ -190,9 +188,7 @@ class RequestEntry:
 
 # pylint: disable=line-too-long
 @experimental_api
-class DynamicInferenceEngine(
-    DynamoEngineTelemetryMixin, InferenceStateHandoffMixin, AbstractEngine
-):
+class DynamicInferenceEngine(InferenceStateHandoffMixin, AbstractEngine):
     """The dynamic inference engine.
 
     This engine allows requests of varying length to be dynamically added and
@@ -329,6 +325,8 @@ class DynamicInferenceEngine(
 
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
+        if hasattr(self, "_pinned_handoff_blocks"):
+            self._pinned_handoff_blocks.clear()
         self._reset_pending_kv_imports()
         self.failed_request_ids = []
         # Generated token count already streamed for each request.
@@ -562,7 +560,6 @@ class DynamicInferenceEngine(
         hostname: str | None = None,
         coordinator_schedule_output_path: str | None = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
-        engine_metadata: Optional[dict] = None,
     ):
         """Initializes ZMQ communication to connect the engine with an inference coordinator.
 
@@ -657,7 +654,6 @@ class DynamicInferenceEngine(
                     "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
                     "schedule_output_path": coordinator_schedule_output_path,
                     "hostname": hostname,
-                    "engine_metadata": engine_metadata,
                 },
             )
             self.inference_coordinator_process.start()
@@ -754,8 +750,6 @@ class DynamicInferenceEngine(
         # Finally run the engine infinite loop.
         loop = get_asyncio_loop(loop)
         self.engine_loop_task = loop.create_task(self.run_engine_with_coordinator(loop=loop))
-        self.publish_engine_status()
-
         return dp_addr
 
     @contextmanager
@@ -1927,6 +1921,10 @@ class DynamicInferenceEngine(
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             raise EngineSuspendedError(self.context.step_count)
 
+        # Discard registrations left by an interrupted prior step before this
+        # step's scheduling queues new registrations.
+        self.context.discard_pending_kv_stored_events()
+
         # schedule requests
         self.schedule_waiting_requests()
 
@@ -1966,6 +1964,7 @@ class DynamicInferenceEngine(
         if will_log_this_step:
             self.step_start_event.record()
         result = await self.controller.async_generate_output_tokens_dynamic_batch()
+        self.context.publish_pending_kv_stored_events()
         if will_log_this_step:
             self.step_end_event.record()
             self.step_end_event.synchronize()
@@ -2529,10 +2528,6 @@ class DynamicInferenceEngine(
         Called from the engine loop's finally block after the loop exits.
         """
         self.state = EngineState.STOPPED
-        self.publish_engine_status()
-        # Flush the terminal status before closing the zero-linger socket.
-        if getattr(self, "is_mp_coordinator", False):
-            await asyncio.sleep(0.05)
 
         # Cleanup the request futures.
         for entry in self.requests.values():
@@ -2688,7 +2683,6 @@ class DynamicInferenceEngine(
                             await self._world_barrier()
                             self.state = EngineState.PAUSED
                             self._state_events[EngineState.PAUSED].set()
-                            self.publish_engine_status()
                         elif local_schedulable > 0:
                             await self.async_step()
                         else:
@@ -2728,7 +2722,6 @@ class DynamicInferenceEngine(
                         await self._world_barrier()
                         self.state = EngineState.PAUSED
                         self._state_events[EngineState.PAUSED].set()
-                        self.publish_engine_status()
                     elif global_work > 0:
                         # At least one EP peer has work: all must participate.
                         if local_schedulable > 0:
@@ -2757,13 +2750,11 @@ class DynamicInferenceEngine(
                     self._state_events[EngineState.RUNNING].set()
                     # Clear stale pause consensus before returning to RUNNING.
                     self._last_ep_consensus = (0, False)
-                    self.publish_engine_status()
 
                 elif self.state == EngineState.SUSPENDING:
                     await self._world_barrier()
                     self.state = EngineState.SUSPENDED
                     self._state_events[EngineState.SUSPENDED].set()
-                    self.publish_engine_status()
 
                 elif self.state == EngineState.SUSPENDED:
                     await asyncio.sleep(0.02)
@@ -2772,7 +2763,6 @@ class DynamicInferenceEngine(
                     await self._world_barrier()
                     self.state = EngineState.PAUSED
                     self._state_events[EngineState.RESUMED].set()
-                    self.publish_engine_status()
 
                 elif self.state == EngineState.STOPPING:
                     await self._world_barrier()

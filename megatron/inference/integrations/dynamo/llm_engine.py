@@ -4,16 +4,13 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import queue
 import signal
 import sys
-import tempfile
 import threading
 from collections.abc import AsyncGenerator
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
@@ -28,8 +25,9 @@ from dynamo.common.backend.worker import WorkerConfig
 from dynamo.common.constants import DisaggregationMode
 from dynamo.llm import KvEventPublisher, ModelInput
 
+from megatron.core.inference.inference_client import InferenceClient
 from megatron.inference.integrations.dynamo.args import Config, parse_args
-from megatron.inference.integrations.dynamo.client import DynamoInferenceClient
+from megatron.inference.integrations.dynamo.telemetry import EngineEventReceiver
 
 logger = logging.getLogger(__name__)
 
@@ -87,12 +85,13 @@ class MegatronLLMEngine(LLMEngine):
         self._process: Optional[asyncio.subprocess.Process] = None
         self._process_monitor: Optional[asyncio.Task] = None
         self._log_tasks: list[asyncio.Task] = []
-        self._runtime_dir: Optional[tempfile.TemporaryDirectory] = None
         self._shutting_down = False
         self._metadata: dict[str, Any] = {}
+        self._ready_messages: queue.Queue[dict] = queue.Queue(maxsize=1)
         self._kv_queue: queue.Queue[tuple[str, dict]] = queue.Queue()
         self._publisher_stop = threading.Event()
         self._publisher_thread: Optional[threading.Thread] = None
+        self._event_receiver: Optional[EngineEventReceiver] = None
         self._release_clients: dict[str, Any] = {}
         self._request_ids: dict[str, int] = {}
 
@@ -131,17 +130,25 @@ class MegatronLLMEngine(LLMEngine):
                 f"Megatron root does not exist: {self.config.megatron_root}"
             )
 
-        self._runtime_dir = tempfile.TemporaryDirectory(prefix="dynamo-megatron-")
-        ready_path = Path(self._runtime_dir.name) / "ready.json"
-        command = self._engine_command(ready_path)
-        logger.info("Launching owned Megatron engine: %s", " ".join(command))
-        self._process = await asyncio.create_subprocess_exec(
-            *command,
-            cwd=self.config.megatron_root,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
+        self._event_receiver = EngineEventReceiver(
+            self._on_engine_event,
+            self.config.parent_event_host,
         )
+        parent_event_address = self._event_receiver.start()
+        command = self._engine_command(parent_event_address)
+        logger.info("Launching owned Megatron engine: %s", " ".join(command))
+        try:
+            self._process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=self.config.megatron_root,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+        except Exception:
+            self._event_receiver.stop()
+            self._event_receiver = None
+            raise
         assert self._process.stdout is not None
         assert self._process.stderr is not None
         self._log_tasks = [
@@ -149,24 +156,24 @@ class MegatronLLMEngine(LLMEngine):
             asyncio.create_task(self._forward_logs(self._process.stderr, logging.WARNING)),
         ]
 
-        readiness = await self._wait_for_readiness(ready_path)
+        readiness = await self._wait_for_readiness()
         from megatron.inference.integrations.dynamo.protocol import PROTOCOL_VERSION
 
-        self.client = DynamoInferenceClient(
+        protocol_version = int(readiness.get("version", 0))
+        if protocol_version != PROTOCOL_VERSION:
+            raise RuntimeError(
+                "Megatron engine-service protocol mismatch: "
+                f"expected {PROTOCOL_VERSION}, got {protocol_version}"
+            )
+        self.client = InferenceClient(
             str(readiness["coordinator_address"]), deserialize=False
         )
         self.client.start(
             loop=asyncio.get_running_loop(),
             connect_timeout_seconds=min(30.0, self.config.engine_start_timeout),
         )
-        self._metadata = dict(self.client.metadata)
-        protocol_version = int(self._metadata.get("protocol_version", 0))
-        if protocol_version != PROTOCOL_VERSION:
-            raise RuntimeError(
-                "Megatron coordinator protocol mismatch: "
-                f"expected {PROTOCOL_VERSION}, got {protocol_version}"
-            )
-        self.client.subscribe_telemetry(kv_event_listener=self._on_kv_event)
+        self._metadata = dict(readiness["engine"])
+        self._metadata["coordinator_address"] = str(readiness["coordinator_address"])
         self._process_monitor = asyncio.create_task(self._monitor_process())
 
         return EngineConfig(
@@ -182,7 +189,7 @@ class MegatronLLMEngine(LLMEngine):
             runtime_data={"role": self.config.role},
         )
 
-    def _engine_command(self, ready_path: Path) -> list[str]:
+    def _engine_command(self, parent_event_address: str) -> list[str]:
         command = [
             sys.executable,
             "-m",
@@ -191,8 +198,8 @@ class MegatronLLMEngine(LLMEngine):
             f"--nproc-per-node={self.config.nproc_per_node}",
             "--module",
             "megatron.inference.integrations.dynamo.engine_service",
-            "--dynamo-ready-file",
-            str(ready_path),
+            "--dynamo-parent-event-address",
+            parent_event_address,
             "--dynamo-role",
             self.config.role,
         ]
@@ -220,11 +227,13 @@ class MegatronLLMEngine(LLMEngine):
         while line := await stream.readline():
             logger.log(level, "[megatron-engine] %s", line.decode(errors="replace").rstrip())
 
-    async def _wait_for_readiness(self, ready_path: Path) -> dict[str, Any]:
+    async def _wait_for_readiness(self) -> dict[str, Any]:
         deadline = asyncio.get_running_loop().time() + self.config.engine_start_timeout
         while True:
-            if ready_path.exists():
-                return json.loads(ready_path.read_text())
+            try:
+                return self._ready_messages.get_nowait()
+            except queue.Empty:
+                pass
             if self._process is None:
                 raise RuntimeError("Megatron process disappeared during startup")
             if self._process.returncode is not None:
@@ -383,64 +392,51 @@ class MegatronLLMEngine(LLMEngine):
             self.client.abort_request(request_id)
 
     async def drain(self) -> None:
-        if self.client is None:
-            return
         deadline = asyncio.get_running_loop().time() + self.config.drain_timeout
-        while True:
-            status = await self.client.get_status()
-            if not int(status.get("active_request_count") or 0) and not int(
-                status.get("pinned_handoff_count") or 0
-            ):
-                return
+        while self._request_ids:
             if asyncio.get_running_loop().time() >= deadline:
-                logger.warning("Timed out draining Megatron requests and KV handoffs")
+                logger.warning("Timed out draining Megatron requests")
                 return
             await asyncio.sleep(0.05)
 
     async def cleanup(self) -> None:
         self._shutting_down = True
-        self._publisher_stop.set()
-        if self._publisher_thread is not None:
-            self._publisher_thread.join(timeout=2)
-            self._publisher_thread = None
         for client in self._release_clients.values():
             try:
                 client.stop()
             except Exception:
                 logger.exception("Failed to close Megatron handoff client")
         self._release_clients.clear()
-        if self.client is not None:
-            client = self.client
-            self.client = None
+        client = self.client
+        self.client = None
+        if client is not None:
             try:
-                await asyncio.wait_for(
-                    client.pause_engines_and_wait(),
-                    timeout=self.config.engine_shutdown_timeout,
-                )
-                await asyncio.wait_for(
-                    client.stop_engines_and_wait(),
-                    timeout=self.config.engine_shutdown_timeout,
-                )
+                client.pause_engines()
+                client.stop_engines()
                 client.shutdown_coordinator()
             except Exception:
                 logger.exception("Graceful Megatron coordinator shutdown failed")
-            finally:
-                try:
-                    client.stop()
-                except Exception:
-                    logger.exception("Failed to close Megatron coordinator client")
 
         await self._wait_or_terminate_process()
+        if client is not None:
+            try:
+                client.stop()
+            except Exception:
+                logger.exception("Failed to close Megatron coordinator client")
         if self._process_monitor is not None:
             self._process_monitor.cancel()
             await asyncio.gather(self._process_monitor, return_exceptions=True)
             self._process_monitor = None
+        if self._event_receiver is not None:
+            self._event_receiver.stop()
+            self._event_receiver = None
+        self._publisher_stop.set()
+        if self._publisher_thread is not None:
+            self._publisher_thread.join(timeout=2)
+            self._publisher_thread = None
         if self._log_tasks:
             await asyncio.gather(*self._log_tasks, return_exceptions=True)
             self._log_tasks.clear()
-        if self._runtime_dir is not None:
-            self._runtime_dir.cleanup()
-            self._runtime_dir = None
 
     async def _wait_or_terminate_process(self) -> None:
         process = self._process
@@ -480,13 +476,17 @@ class MegatronLLMEngine(LLMEngine):
             return []
         return [PushSource(on_ready=self._start_publisher_thread, dp_rank=0)]
 
-    def _on_kv_event(self, rank: int, kind: str, payload: dict) -> None:
-        from megatron.inference.integrations.dynamo.telemetry import authoritative_kv_event
-
-        event = authoritative_kv_event(rank, kind, payload)
-        if event is None:
+    def _on_engine_event(self, kind: str, payload: dict) -> None:
+        if kind == "ready":
+            try:
+                self._ready_messages.put_nowait(payload)
+            except queue.Full:
+                logger.warning("Ignoring duplicate Megatron readiness message")
             return
-        self._kv_queue.put(event)
+        if kind in ("stored", "removed", "cleared"):
+            self._kv_queue.put((kind, payload))
+            return
+        logger.warning("Ignoring unknown Megatron engine event %s", kind)
 
     def _start_publisher_thread(self, publisher: KvEventPublisher) -> None:
         self._publisher_thread = threading.Thread(

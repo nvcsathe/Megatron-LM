@@ -112,6 +112,10 @@ python -m dynamo.frontend \
   --event-plane nats
 ```
 
+The parent event socket binds to `127.0.0.1` by default. A future launcher that
+places global rank zero on another host can pass `--parent-event-host` with a
+routable local interface; only global rank zero connects to this endpoint.
+
 The Nano v3 Slurm test starts etcd, NATS, the frontend, and matched TP=1/PP=1
 prefill and decode workers:
 
@@ -140,15 +144,22 @@ pytest -q tests/unit_tests/inference/test_kv_transfer_backends.py
 
 ## Runtime contract
 
+- The parent binds an engine-event socket before launch and passes its address
+  to the child. Rank zero sends readiness, the request-coordinator address, and
+  static engine capabilities as the first message on that socket.
+- Normal requests, streaming replies, cancellation, and KV handoff commands use
+  the ordinary Megatron `InferenceClient` protocol; the coordinator has no
+  Dynamo mixins or Dynamo-only management headers.
 - Prefill runs a zero-token request, pins prompt blocks, and returns NIXL
   metadata in `disaggregated_params`.
 - The frontend forwards the prefill result to the selected decode worker.
 - Decode imports the blocks before generation and releases the source handoff
   after the first post-import output.
-- Prefix block events cross the private coordinator and are published by the
-  parent as logical DP rank zero.
+- Rank zero queues prefix block events after successful forwards; a dedicated
+  thread sends them directly to the Dynamo parent without crossing the request
+  coordinator or stalling the forward path.
 - Cancellation targets the exact Megatron request; shutdown unregisters the
-  endpoint, drains requests and pinned handoffs, and then stops all ranks.
+  endpoint, drains active requests, and then stops all ranks.
 
 The current launcher supports one node per engine. Scale horizontally by
 adding complete Dynamo component replicas.

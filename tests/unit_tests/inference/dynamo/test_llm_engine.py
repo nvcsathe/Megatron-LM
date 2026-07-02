@@ -48,7 +48,7 @@ def test_sampling_params_maps_greedy_and_limits():
 
 
 @pytest.mark.asyncio
-async def test_start_uses_dynamo_inference_client(tmp_path):
+async def test_start_uses_parent_event_socket_and_base_client(tmp_path):
     config = _config()
     config.megatron_root = str(tmp_path)
     engine = MegatronLLMEngine(config)
@@ -64,38 +64,45 @@ async def test_start_uses_dynamo_inference_client(tmp_path):
 
     process = SimpleNamespace(stdout=stdout, stderr=stderr, returncode=None, wait=wait_for_process)
     metadata = {
-        "protocol_version": 1,
         "context_length": 8192,
         "kv_cache_block_size": 64,
         "total_kv_blocks": 100,
         "max_num_seqs": 32,
         "max_num_batched_tokens": 4096,
     }
-    client = SimpleNamespace(metadata=metadata, start=MagicMock(), subscribe_telemetry=MagicMock())
+    client = SimpleNamespace(start=MagicMock())
+    event_receiver = SimpleNamespace(start=MagicMock(return_value="tcp://127.0.0.1:5556"))
     engine._wait_for_readiness = AsyncMock(
-        return_value={"coordinator_address": "tcp://127.0.0.1:5555"}
+        return_value={
+            "version": 3,
+            "coordinator_address": "tcp://127.0.0.1:5555",
+            "engine": metadata,
+        }
     )
 
     try:
         with (
             patch("asyncio.create_subprocess_exec", AsyncMock(return_value=process)),
             patch(
-                "megatron.inference.integrations.dynamo.llm_engine.DynamoInferenceClient",
+                "megatron.inference.integrations.dynamo.llm_engine.InferenceClient",
                 return_value=client,
             ) as client_class,
+            patch(
+                "megatron.inference.integrations.dynamo.llm_engine.EngineEventReceiver",
+                return_value=event_receiver,
+            ) as receiver_class,
         ):
             await engine.start(worker_id=0)
 
         client_class.assert_called_once_with("tcp://127.0.0.1:5555", deserialize=False)
         client.start.assert_called_once()
-        client.subscribe_telemetry.assert_called_once_with(kv_event_listener=engine._on_kv_event)
+        receiver_class.assert_called_once_with(engine._on_engine_event, "127.0.0.1")
+        event_receiver.start.assert_called_once()
     finally:
         if engine._process_monitor is not None:
             engine._process_monitor.cancel()
             await asyncio.gather(engine._process_monitor, return_exceptions=True)
         await asyncio.gather(*engine._log_tasks)
-        if engine._runtime_dir is not None:
-            engine._runtime_dir.cleanup()
 
 
 class _Context:

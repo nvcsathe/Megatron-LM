@@ -443,7 +443,10 @@ class MambaMetadata:
                     torch.int32
                 )
 
-                # Pad unused CUDA graph slots; _ssm_prefill clamps short warmups.
+                # Pad unused slots with safe defaults for CUDA graph replay:
+                # - chunk_indices=0: reads from chunk 0 (always exists), output ignored
+                # - abs_positions=d_conv: conv gather reads tokens [0..d_conv-1],
+                #   which are within bounds and produce a valid but unused state
                 if real_count < max_count:
                     self._intermediate_chunk_indices_buffer[real_count:max_count].fill_(0)
                     self._intermediate_abs_positions_buffer[real_count:max_count].fill_(self.d_conv)
@@ -460,7 +463,8 @@ class MambaMetadata:
             self.intermediate_chunk_indices = self._intermediate_chunk_indices_buffer[:max_count]
             self.intermediate_abs_positions = self._intermediate_abs_positions_buffer[:max_count]
         else:
-            # Safe defaults for CUDA graph warmup; extracted values are unused.
+            # No extraction: fill with safe defaults for CUDA graph warmup
+            # (same rationale as padding comment above)
             self._intermediate_chunk_indices_buffer[:max_count] = 0
             self._intermediate_abs_positions_buffer[:max_count] = self.d_conv
             self.intermediate_count = 0

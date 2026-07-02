@@ -25,9 +25,6 @@ from megatron.core.inference.inference_request import compute_block_hashes_batch
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.inference.integrations.dynamo.protocol import DynamoCoordinatorProtocolMixin
-from megatron.inference.integrations.dynamo.telemetry import DynamoCoordinatorTelemetryMixin
-
 try:
     import zmq
 
@@ -48,9 +45,7 @@ faulthandler.register(signal.SIGTERM, all_threads=False, chain=True)
 faulthandler.register(signal.SIGINT, all_threads=False, chain=True)
 
 
-class DataParallelInferenceCoordinator(
-    DynamoCoordinatorProtocolMixin, DynamoCoordinatorTelemetryMixin
-):
+class DataParallelInferenceCoordinator:
     """
     Coordinates inference requests between clients and distributed model engines.
 
@@ -108,7 +103,6 @@ class DataParallelInferenceCoordinator(
         prefix_caching_routing_alpha: float = 0.5,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
-        engine_metadata: dict | None = None,
     ):
         """
         Initializes the inference coordinator.
@@ -210,9 +204,6 @@ class DataParallelInferenceCoordinator(
         self.prefix_caching_routing_alpha = prefix_caching_routing_alpha
         self.max_requests = max_requests
         assert self.max_requests is not None and self.max_requests > 0
-        self._initialize_dynamo_protocol(engine_metadata, data_parallel_size)
-        self._initialize_dynamo_telemetry()
-
         # Schedule recording.
         self.schedule_output_path = schedule_output_path
         self.schedule_records = [] if schedule_output_path else None
@@ -421,18 +412,11 @@ class DataParallelInferenceCoordinator(
                 # print(f"New client connected: {sender_identity}")
                 known_clients.add(sender_identity)
                 self.router_socket.send_multipart(
-                    [sender_identity, self._dynamo_connect_ack()]
+                    [
+                        sender_identity,
+                        msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True),
+                    ]
                 )
-
-            elif self._handle_dynamo_management_request(
-                header, sender_identity, deserialized_payload, known_clients
-            ):
-                continue
-
-            elif self._handle_dynamo_telemetry_subscription(
-                header, sender_identity, known_clients
-            ):
-                continue
 
             elif header == Headers.SUBMIT_REQUEST:
                 # ToDo [Siddharth]: We might want to tokenize the prompt on the
@@ -522,9 +506,7 @@ class DataParallelInferenceCoordinator(
                     if self.state == self.CoordinatorState.RUNNING:
                         self.state = self.CoordinatorState.PAUSED
                     elif self.state in idem_states:
-                        self._acknowledge_idempotent_dynamo_control(
-                            sender_identity, deserialized_payload
-                        )
+                        # Already paused/suspended; ignore redundant PAUSE.
                         continue
                     else:
                         logging.warning("Coordinator: ignoring PAUSE in state %s", self.state)
@@ -558,8 +540,6 @@ class DataParallelInferenceCoordinator(
                 for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
                     self._send_to_engine(data_parallel_rank_id, broadcast_payload)
 
-                self._track_dynamo_control(header, sender_identity, deserialized_payload)
-
                 # STOP affects engines; reset coordinator to RUNNING to allow future engines.
                 if header == Headers.STOP:
                     self.state = self.CoordinatorState.RUNNING
@@ -583,11 +563,6 @@ class DataParallelInferenceCoordinator(
                             ),
                         ]
                     )
-
-            elif self._handle_dynamo_engine_telemetry(
-                header, sender_identity, deserialized_payload
-            ):
-                continue
 
             elif header == Headers.ENGINE_REPLY:
                 # This is the output of a single engine step on some data parallel rank.
@@ -765,7 +740,6 @@ class DataParallelInferenceCoordinator(
         prefix_caching_routing_alpha: float = 0.5,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
-        engine_metadata: dict | None = None,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -800,7 +774,6 @@ class DataParallelInferenceCoordinator(
             prefix_caching_routing_alpha=prefix_caching_routing_alpha,
             schedule_output_path=schedule_output_path,
             hostname=hostname,
-            engine_metadata=engine_metadata,
         )
         ready_event.set()
         try:

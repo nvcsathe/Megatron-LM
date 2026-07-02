@@ -551,6 +551,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             prefix_caching_eviction_policy=self.prefix_caching_eviction_policy,
         )
         self._kv_event_listeners: list = []
+        self._pending_kv_stored_events: list[dict] = []
         self.kv_block_allocator.add_blocks_deregistered_observer(
             self._on_kv_blocks_deregistered
         )
@@ -2549,12 +2550,23 @@ class DynamicInferenceContext(BaseInferenceContext):
             except Exception:
                 logging.exception("KV event listener failed for %s", kind)
 
+    def publish_pending_kv_stored_events(self) -> None:
+        """Publish blocks whose KV contents were produced by a successful forward pass."""
+        pending, self._pending_kv_stored_events = self._pending_kv_stored_events, []
+        for payload in pending:
+            self._emit_kv_event("stored", payload)
+
+    def discard_pending_kv_stored_events(self) -> None:
+        """Discard registrations left by an interrupted or failed forward pass."""
+        self._pending_kv_stored_events.clear()
+
     def _on_kv_blocks_deregistered(self, _block_ids, hashes) -> None:
         if hashes:
             self._emit_kv_event("removed", {"block_hashes": list(hashes)})
 
     def notify_kv_cache_cleared(self) -> None:
         """Notify observers that no previously advertised block is routable."""
+        self.discard_pending_kv_stored_events()
         if self._kv_event_listeners:
             self._emit_kv_event("cleared", {})
 
@@ -3032,19 +3044,19 @@ class DynamicInferenceContext(BaseInferenceContext):
                 token_start = start * self.block_size_tokens
                 token_end = end * self.block_size_tokens
                 token_ids = req.prompt_tokens[token_start:token_end].tolist()
-                self._emit_kv_event(
-                    "stored",
-                    {
-                        "block_hashes": list(block_hashes_slice),
-                        "token_ids": token_ids,
-                        "num_block_tokens": [self.block_size_tokens] * (end - start),
-                        "parent_hash": (
-                            int(req.precomputed_block_hashes[start - 1])
-                            if start > 0
-                            else None
-                        ),
-                    },
-                )
+                if self._kv_event_listeners:
+                    self._pending_kv_stored_events.append(
+                        {
+                            "block_hashes": list(block_hashes_slice),
+                            "token_ids": token_ids,
+                            "num_block_tokens": [self.block_size_tokens] * (end - start),
+                            "parent_hash": (
+                                int(req.precomputed_block_hashes[start - 1])
+                                if start > 0
+                                else None
+                            ),
+                        }
+                    )
 
             # Range 1: prior-chunk partial block that this chunk just completed
             _register_range(previously_complete, min(already_allocated_blocks, num_complete_blocks))

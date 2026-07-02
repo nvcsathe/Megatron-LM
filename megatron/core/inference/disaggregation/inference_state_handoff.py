@@ -233,31 +233,9 @@ class InferenceStateHandoffMixin:
         )
 
     def _release_pinned_handoff_blocks(self, block_ids: list) -> int:
-        """Unpin and release handoff blocks that are still owned by the pin set."""
+        """Release this request's ownership of its pinned handoff blocks."""
         allocator = self.context.kv_block_allocator
-        pinned = allocator.pinned_blocks
-        candidate_ids = [int(b) for b in block_ids if int(b) in pinned]
-        if not candidate_ids:
-            return 0
-
-        for block_id in candidate_ids:
-            pinned.discard(block_id)
-
-        if allocator.enable_prefix_caching:
-            live_ids = [
-                block_id for block_id in candidate_ids
-                if int(allocator.block_ref_counts[block_id].item()) > 0
-            ]
-        else:
-            free_ids = set(int(b) for b in allocator.block_bag[: allocator.total_avail].tolist())
-            live_ids = [block_id for block_id in candidate_ids if block_id not in free_ids]
-
-        if not live_ids:
-            return 0
-
-        block_tensor = torch.tensor(live_ids, dtype=torch.int32, device='cpu')
-        allocator.release_memory_blocks(block_tensor)
-        return len(live_ids)
+        return allocator.release_pinned_memory_blocks(block_ids)
 
     def add_request_with_kv_handoff(
         self,

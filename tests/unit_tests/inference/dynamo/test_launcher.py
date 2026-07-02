@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -66,11 +64,14 @@ def test_public_entrypoint_uses_common_runner():
 def test_owned_engine_command_targets_megatron_only_service():
     config = parse_args(_argv())
     engine = MegatronLLMEngine(config)
-    command = engine._engine_command(Path("/tmp/ready.json"))
+    command = engine._engine_command("tcp://127.0.0.1:5556")
 
     assert command[1:4] == ["-m", "torch.distributed.run", "--standalone"]
     assert "--nproc-per-node=2" in command
     assert "megatron.inference.integrations.dynamo.engine_service" in command
+    assert command[command.index("--dynamo-parent-event-address") + 1] == (
+        "tcp://127.0.0.1:5556"
+    )
     assert "dynamo.megatron" not in command
     assert command[-4:] == [
         "--load",
@@ -95,17 +96,17 @@ async def test_from_args_is_side_effect_free(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_readiness_reports_early_child_failure(tmp_path):
+async def test_readiness_reports_early_child_failure():
     engine = MegatronLLMEngine(parse_args(_argv()))
     engine._process = SimpleNamespace(returncode=17)
     with pytest.raises(RuntimeError, match="exited before readiness.*17"):
-        await engine._wait_for_readiness(tmp_path / "missing.json")
+        await engine._wait_for_readiness()
 
 
 @pytest.mark.asyncio
-async def test_readiness_descriptor_is_loaded(tmp_path):
+async def test_readiness_message_is_received():
     engine = MegatronLLMEngine(parse_args(_argv()))
-    path = tmp_path / "ready.json"
     expected = {"coordinator_address": "tcp://127.0.0.1:5000"}
-    path.write_text(json.dumps(expected))
-    assert await engine._wait_for_readiness(path) == expected
+    engine._process = SimpleNamespace(returncode=None)
+    engine._on_engine_event("ready", expected)
+    assert await engine._wait_for_readiness() == expected

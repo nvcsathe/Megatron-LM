@@ -29,6 +29,7 @@ class Config:
     megatron_argv: list[str]
     engine_start_timeout: float = 1800.0
     engine_shutdown_timeout: float = 30.0
+    parent_event_host: str = "127.0.0.1"
 
 
 def _split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
@@ -65,6 +66,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser.add_argument("--drain-timeout", type=float, default=30.0)
     parser.add_argument("--engine-start-timeout", type=float, default=1800.0)
     parser.add_argument("--engine-shutdown-timeout", type=float, default=30.0)
+    parser.add_argument(
+        "--parent-event-host",
+        default="127.0.0.1",
+        help="Interface or hostname for the parent-owned engine event socket.",
+    )
     args = parser.parse_args(dynamo_argv)
 
     if args.nproc_per_node < 1:
@@ -102,4 +108,5 @@ def parse_args(argv: list[str] | None = None) -> Config:
         megatron_argv=megatron_argv,
         engine_start_timeout=args.engine_start_timeout,
         engine_shutdown_timeout=args.engine_shutdown_timeout,
+        parent_event_host=args.parent_event_host,
     )

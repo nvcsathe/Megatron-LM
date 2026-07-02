@@ -1027,12 +1027,6 @@ class MambaMixer(MegatronModule):
                     intermediate_abs_positions.unsqueeze(1).long()
                     + conv_gather_offsets.unsqueeze(0).long()
                 )  # [n, d_conv]
-                # Padding/warmup slots use abs_position == d_conv. For CUDA-graph
-                # buckets shorter than d_conv, that would index beyond the token
-                # axis. Real extraction positions are already in range; padded
-                # results are ignored by readers.
-                seq_len = xBC_pre_conv.shape[1]
-                gather_positions = gather_positions.clamp_(0, seq_len - 1)
                 intermediate_conv = xBC_pre_conv[0, gather_positions, :]
                 # [n, d_conv, conv_dim]
                 intermediate_conv_out[:n].copy_(intermediate_conv.transpose(1, 2))
