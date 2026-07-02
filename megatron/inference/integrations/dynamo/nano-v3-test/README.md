@@ -11,7 +11,7 @@ From an `salloc` shell:
 ```bash
 export DMG_SQSH=/path/to/dynamo-megatron.sqsh
 export STAGE=/path/to/staging
-bash examples/inference/dynamo/nano-v3-test/launch.sh
+bash megatron/inference/integrations/dynamo/nano-v3-test/launch.sh
 ```
 
 The launcher defaults to the cluster-staged Nano v3 checkpoint, pretrained
@@ -22,7 +22,7 @@ artifacts. Use `EXTRA_MOUNTS=src:dst,...` for additional container mounts.
 To validate model metadata without loading the model:
 
 ```bash
-PREFLIGHT_ONLY=1 bash examples/inference/dynamo/nano-v3-test/launch.sh
+PREFLIGHT_ONLY=1 bash megatron/inference/integrations/dynamo/nano-v3-test/launch.sh
 ```
 
 After the stack reports `NANO_V3_TEST_READY`, run in a second shell attached to
@@ -30,7 +30,7 @@ the same container:
 
 ```bash
 source /tmp/nano_v3_test.env
-bash /opt/megatron-lm/examples/inference/dynamo/nano-v3-test/verify.sh
+bash /opt/megatron-lm/megatron/inference/integrations/dynamo/nano-v3-test/verify.sh
 ```
 
 The verifier requires a non-empty completion, a KV import marker, and a Mamba

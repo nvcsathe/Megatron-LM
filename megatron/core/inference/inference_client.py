@@ -12,8 +12,6 @@ from megatron.core.inference.disaggregation.handoff_wire_protocol import (
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
-from megatron.inference.integrations.dynamo.protocol import DynamoClientProtocolMixin
-from megatron.inference.integrations.dynamo.telemetry import DynamoClientTelemetryMixin
 
 from .headers import Headers
 
@@ -57,7 +55,7 @@ class InferenceStream:
             self.closed = True
 
 
-class InferenceClient(DynamoClientProtocolMixin, DynamoClientTelemetryMixin):
+class InferenceClient:
     """
     An asynchronous client for communicating with an inference coordinator service.
 
@@ -117,8 +115,7 @@ class InferenceClient(DynamoClientProtocolMixin, DynamoClientTelemetryMixin):
         # A None queue item terminates a request stream after its final reply.
         self.stream_queues: dict[int, asyncio.Queue] = {}
         self.aborted_request_ids: set[int] = set()
-        self._initialize_dynamo_protocol()
-        self._initialize_dynamo_telemetry()
+        self.metadata: dict = {}
 
     def _submit_stream(self, payload: list, request_id: int) -> InferenceStream:
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
@@ -126,6 +123,14 @@ class InferenceClient(DynamoClientProtocolMixin, DynamoClientTelemetryMixin):
         self.stream_queues[request_id] = queue
         self.request_submission_times[request_id] = time.perf_counter()
         return InferenceStream(self, request_id, queue)
+
+    def _handle_extension_message(self, header: Headers, data: list) -> bool:
+        """Handle an integration-specific coordinator message."""
+        return False
+
+    def _cleanup_extension_state(self) -> None:
+        """Clean up integration-specific client state."""
+        pass
 
     def add_request(
         self, prompt: Union[str, List[int]], sampling_params: SamplingParams
@@ -292,9 +297,7 @@ class InferenceClient(DynamoClientProtocolMixin, DynamoClientTelemetryMixin):
                     queue = self.stream_queues.get(request_id)
                     if queue is not None:
                         queue.put_nowait({"partial": partial})
-                elif self._handle_dynamo_protocol_message(header, data):
-                    continue
-                elif self._handle_dynamo_telemetry_message(header, data):
+                elif self._handle_extension_message(header, data):
                     continue
             except zmq.Again:
                 await asyncio.sleep(0.005)
@@ -417,7 +420,7 @@ class InferenceClient(DynamoClientProtocolMixin, DynamoClientTelemetryMixin):
             if not future.done():
                 future.cancel()
         self.completion_futures.clear()
-        self._cancel_dynamo_protocol_futures()
+        self._cleanup_extension_state()
         # Terminate any open streaming iterators.
         for queue in self.stream_queues.values():
             queue.put_nowait(None)

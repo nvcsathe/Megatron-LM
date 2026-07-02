@@ -45,6 +45,8 @@ async def test_inference_client_lifecycle():
     assert opts[zmq.SNDHWM] == 0 and opts[zmq.RCVHWM] == 0
     assert client.next_request_id == 0
     assert client.completion_futures == {}
+    assert not hasattr(client, "get_status")
+    assert not hasattr(client, "subscribe_telemetry")
 
     # start(): handshake sends CONNECT, expects CONNECT_ACK, spawns listener task.
     # We stage two recv() replies: the CONNECT_ACK during handshake, and an
@@ -118,50 +120,3 @@ async def test_inference_client_connect_handshake_rejects_unexpected_reply():
     fake_socket.recv.return_value = msgpack.packb([Headers.STOP.value], use_bin_type=True)
     with pytest.raises(AssertionError):
         client._connect_with_inference_coordinator()
-
-
-async def test_management_metadata_status_and_telemetry():
-    client, _, fake_socket = _make_client()
-    metadata = {
-        "protocol_version": 1,
-        "context_length": 8192,
-        "logical_data_parallel_size": 1,
-    }
-    recv_queue = [msgpack.packb([Headers.CONNECT_ACK.value, metadata], use_bin_type=True)]
-    status_reply = msgpack.packb(
-        [
-            Headers.STATUS_REPLY.value,
-            0,
-            {"state": "running", "active_request_count": 2},
-        ],
-        use_bin_type=True,
-    )
-    kv_reply = msgpack.packb(
-        [Headers.KV_EVENT.value, 0, "stored", {"block_hashes": [11]}],
-        use_bin_type=True,
-    )
-
-    def fake_recv(*args, **kwargs):
-        if recv_queue:
-            return recv_queue.pop(0)
-        raise zmq.Again()
-
-    fake_socket.recv.side_effect = fake_recv
-    client.start()
-    assert client.metadata == metadata
-
-    kv_events = []
-    client.subscribe_telemetry(
-        kv_event_listener=lambda rank, kind, payload: kv_events.append(
-            (rank, kind, payload)
-        ),
-    )
-    status_task = asyncio.create_task(client.get_status())
-    await asyncio.sleep(0)
-    recv_queue.extend([status_reply, kv_reply])
-    status = await asyncio.wait_for(status_task, timeout=2)
-    await asyncio.sleep(0.02)
-
-    assert status == {"state": "running", "active_request_count": 2}
-    assert kv_events == [(0, "stored", {"block_hashes": [11]})]
-    client.stop()

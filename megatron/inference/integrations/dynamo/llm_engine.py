@@ -29,6 +29,7 @@ from dynamo.common.constants import DisaggregationMode
 from dynamo.llm import KvEventPublisher, ModelInput
 
 from megatron.inference.integrations.dynamo.args import Config, parse_args
+from megatron.inference.integrations.dynamo.client import DynamoInferenceClient
 
 logger = logging.getLogger(__name__)
 
@@ -149,10 +150,9 @@ class MegatronLLMEngine(LLMEngine):
         ]
 
         readiness = await self._wait_for_readiness(ready_path)
-        from megatron.core.inference.inference_client import InferenceClient
         from megatron.inference.integrations.dynamo.protocol import PROTOCOL_VERSION
 
-        self.client = InferenceClient(
+        self.client = DynamoInferenceClient(
             str(readiness["coordinator_address"]), deserialize=False
         )
         self.client.start(

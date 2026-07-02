@@ -6,7 +6,7 @@
 #
 # Build from the Megatron-LM repository root:
 #
-#   docker build -f integrations/dynamo/container/Dockerfile \
+#   docker build -f megatron/inference/integrations/dynamo/container/Dockerfile \
 #     --build-arg DYNAMO_REF=9db71762e6d1a47bff42d55938e0ec27583fcef7 \
 #     -t megatron-dynamo:dev .
 #
@@ -21,7 +21,7 @@ ARG BASE_IMAGE_TAG=26.04-py3
 FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG} AS runtime
 
 # Pinned to the current tip of ai-dynamo/dynamo main. Update this together
-# with integrations/dynamo/dynamo-ref.txt after validating a newer revision.
+# with megatron/inference/integrations/dynamo/dynamo-ref.txt after validating a newer revision.
 ARG DYNAMO_REF=9db71762e6d1a47bff42d55938e0ec27583fcef7
 ARG DYNAMO_REPO=https://github.com/ai-dynamo/dynamo.git
 ARG NIXL_SPEC=nixl==0.10.1
@@ -84,8 +84,8 @@ RUN python3 -m venv --system-site-packages /opt/dynamo/venv \
     && python -m pip install --upgrade pip uv
 
 WORKDIR /opt/megatron-lm
-COPY integrations/dynamo/container/requirements.txt /tmp/megatron-dynamo-requirements.txt
-COPY integrations/dynamo/scripts/install-dynamo.sh /tmp/install-dynamo.sh
+COPY megatron/inference/integrations/dynamo/container/requirements.txt /tmp/megatron-dynamo-requirements.txt
+COPY megatron/inference/integrations/dynamo/scripts/install-dynamo.sh /tmp/install-dynamo.sh
 
 # Install Dynamo first so its Python and native runtime are pinned together.
 # Install NIXL separately because it is the Megatron disaggregation transport,

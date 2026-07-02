@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -43,6 +45,57 @@ def test_sampling_params_maps_greedy_and_limits():
     assert params.top_k == 1
     assert params.top_p == 0.0
     assert params.num_tokens_to_generate == 7
+
+
+@pytest.mark.asyncio
+async def test_start_uses_dynamo_inference_client(tmp_path):
+    config = _config()
+    config.megatron_root = str(tmp_path)
+    engine = MegatronLLMEngine(config)
+    stdout = asyncio.StreamReader()
+    stderr = asyncio.StreamReader()
+    stdout.feed_eof()
+    stderr.feed_eof()
+    process_exit = asyncio.Event()
+
+    async def wait_for_process():
+        await process_exit.wait()
+        return 0
+
+    process = SimpleNamespace(stdout=stdout, stderr=stderr, returncode=None, wait=wait_for_process)
+    metadata = {
+        "protocol_version": 1,
+        "context_length": 8192,
+        "kv_cache_block_size": 64,
+        "total_kv_blocks": 100,
+        "max_num_seqs": 32,
+        "max_num_batched_tokens": 4096,
+    }
+    client = SimpleNamespace(metadata=metadata, start=MagicMock(), subscribe_telemetry=MagicMock())
+    engine._wait_for_readiness = AsyncMock(
+        return_value={"coordinator_address": "tcp://127.0.0.1:5555"}
+    )
+
+    try:
+        with (
+            patch("asyncio.create_subprocess_exec", AsyncMock(return_value=process)),
+            patch(
+                "megatron.inference.integrations.dynamo.llm_engine.DynamoInferenceClient",
+                return_value=client,
+            ) as client_class,
+        ):
+            await engine.start(worker_id=0)
+
+        client_class.assert_called_once_with("tcp://127.0.0.1:5555", deserialize=False)
+        client.start.assert_called_once()
+        client.subscribe_telemetry.assert_called_once_with(kv_event_listener=engine._on_kv_event)
+    finally:
+        if engine._process_monitor is not None:
+            engine._process_monitor.cancel()
+            await asyncio.gather(engine._process_monitor, return_exceptions=True)
+        await asyncio.gather(*engine._log_tasks)
+        if engine._runtime_dir is not None:
+            engine._runtime_dir.cleanup()
 
 
 class _Context:

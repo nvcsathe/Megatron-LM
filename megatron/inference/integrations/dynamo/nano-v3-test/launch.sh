@@ -19,7 +19,7 @@ DYNAMO_MODEL="${DYNAMO_MODEL:-nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16}"
 export MODEL_CHECKPOINT PRETRAINED_CHECKPOINT TOKENIZER_MODEL DYNAMO_MODEL
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MEGATRON_ROOT="${MEGATRON_LOCAL_DEV:-$(cd "$SCRIPT_DIR/../../../.." && pwd)}"
+MEGATRON_ROOT="${MEGATRON_LOCAL_DEV:-$(cd "$SCRIPT_DIR/../../../../.." && pwd)}"
 [[ -d "$MEGATRON_ROOT" ]] || { echo "MEGATRON_ROOT not a dir: $MEGATRON_ROOT" >&2; exit 1; }
 
 # Bind artifact directories read-only at their original paths.
@@ -77,4 +77,4 @@ exec srun \
     --container-mounts="$MOUNTS" \
     --container-workdir=/opt/megatron-lm \
     --export="ALL,$EXPORT_VARS,UCX_TLS=$UCX_TLS,UCX_MEMTYPE_CACHE=$UCX_MEMTYPE_CACHE,UCX_LOG_LEVEL=$UCX_LOG_LEVEL,UCX_LOG_FILE=$UCX_LOG_FILE" \
-    bash /opt/megatron-lm/examples/inference/dynamo/nano-v3-test/orchestrate.sh
+    bash /opt/megatron-lm/megatron/inference/integrations/dynamo/nano-v3-test/orchestrate.sh

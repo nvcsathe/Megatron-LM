@@ -13,12 +13,12 @@ are not registered as Dynamo workers.
 ## Layout
 
 ```text
-megatron/inference/integrations/dynamo/   backend adapter and engine protocol
-megatron/core/inference/disaggregation/  engine-native KV/state handoff
-tests/unit_tests/inference/dynamo/        adapter unit tests
-examples/inference/dynamo/                Slurm test
-integrations/dynamo/container/            Megatron-owned runtime image
-integrations/dynamo/deploy/               DynamoGraphDeployment manifests
+megatron/inference/integrations/dynamo/             adapter and engine protocol
+megatron/inference/integrations/dynamo/container/   runtime image
+megatron/inference/integrations/dynamo/deploy/      deployment manifests
+megatron/inference/integrations/dynamo/nano-v3-test/ Slurm test
+megatron/core/inference/disaggregation/            reusable KV/state handoff
+tests/unit_tests/inference/dynamo/                  adapter unit tests
 ```
 
 Logic reusable by other inference engines belongs in Dynamo's
@@ -27,15 +27,15 @@ Logic reusable by other inference engines belongs in Dynamo's
 ## Build the image
 
 Build from the Megatron-LM repository root. The default Dynamo ref is recorded
-in `integrations/dynamo/dynamo-ref.txt`; use a release, branch, tag, or commit to
+in `megatron/inference/integrations/dynamo/dynamo-ref.txt`; use a release, branch, tag, or commit to
 keep the adapter and common backend API compatible.
 
 ```bash
 export IMAGE=megatron-dynamo:dev
-export DYNAMO_REF="$(cat integrations/dynamo/dynamo-ref.txt)"
+export DYNAMO_REF="$(cat megatron/inference/integrations/dynamo/dynamo-ref.txt)"
 
 docker build \
-  -f integrations/dynamo/container/Dockerfile \
+  -f megatron/inference/integrations/dynamo/container/Dockerfile \
   --build-arg DYNAMO_REF="$DYNAMO_REF" \
   -t "$IMAGE" \
   .
@@ -115,7 +115,7 @@ The Nano v3 Slurm test starts etcd, NATS, the frontend, and matched TP=1/PP=1
 prefill and decode workers:
 
 ```bash
-bash examples/inference/dynamo/nano-v3-test/launch.sh
+bash megatron/inference/integrations/dynamo/nano-v3-test/launch.sh
 ```
 
 ## Tests
