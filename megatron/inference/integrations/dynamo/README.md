@@ -17,6 +17,7 @@ megatron/inference/integrations/dynamo/             adapter and engine protocol
 megatron/inference/integrations/dynamo/container/   runtime image
 megatron/inference/integrations/dynamo/deploy/      deployment manifests
 megatron/inference/integrations/dynamo/nano-v3-test/ Slurm test
+megatron/inference/integrations/dynamo/nano-v3-kv-routing-test/ multi-node KV routing tests
 megatron/core/inference/disaggregation/            reusable KV/state handoff
 tests/unit_tests/inference/dynamo/                  adapter unit tests
 ```
@@ -116,6 +117,15 @@ prefill and decode workers:
 
 ```bash
 bash megatron/inference/integrations/dynamo/nano-v3-test/launch.sh
+```
+
+The multi-node Nano v3 harness validates aggregated KV events, event-driven
+routing, and an otherwise identical round-robin baseline in separate runs:
+
+```bash
+bash megatron/inference/integrations/dynamo/nano-v3-kv-routing-test/launch-events.sh
+bash megatron/inference/integrations/dynamo/nano-v3-kv-routing-test/launch-routing.sh
+bash megatron/inference/integrations/dynamo/nano-v3-kv-routing-test/launch-baseline.sh
 ```
 
 ## Tests
