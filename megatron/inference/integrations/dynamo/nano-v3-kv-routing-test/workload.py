@@ -24,6 +24,9 @@ from typing import Any
 BAD_EVENT_STATUSES = {"parent_block_not_found", "block_not_found", "invalid_block"}
 WORKER_LABEL_RE = re.compile(r'(?:worker_id|instance_id)="(?P<worker>[0-9]+)"')
 INSTANCE_LIST_RE = re.compile(r"instance_ids=\[(?P<workers>[0-9, ]*)\]")
+BACKEND_WORKER_RE = re.compile(
+    r"Initializing KvEventPublisher for worker (?P<worker>[0-9]+) in component backend"
+)
 CACHE_COUNTER_RE = re.compile(
     r"prefix cache \(cumul\):\s*(?P<hits>[0-9]+) hits,\s*(?P<blocks>[0-9]+) blocks matched"
 )
@@ -107,6 +110,15 @@ def discover_workers_from_log(path: Path) -> list[int]:
     )
 
 
+def discover_workers_from_backend_logs(log_dir: Path) -> list[int]:
+    """Discover backend instance IDs published by each logical worker."""
+    workers: set[int] = set()
+    for path in sorted(log_dir.glob("node-*-worker-*.log")):
+        for match in BACKEND_WORKER_RE.finditer(path.read_text(errors="replace")):
+            workers.add(int(match.group("worker")))
+    return sorted(workers)
+
+
 def wait_for_workers(
     url: str,
     expected: int,
@@ -117,6 +129,7 @@ def wait_for_workers(
     deadline = time.monotonic() + timeout
     last_metrics: list[int] = []
     last_log: list[int] = []
+    last_backends: list[int] = []
     while time.monotonic() < deadline:
         last_metrics = discover_workers(http_text(f"{url}/metrics"))
         if len(last_metrics) == expected:
@@ -125,10 +138,14 @@ def wait_for_workers(
             last_log = discover_workers_from_log(log_dir / "frontend.log")
             if len(last_log) == expected:
                 return last_log
+            last_backends = discover_workers_from_backend_logs(log_dir)
+            if len(last_backends) == expected:
+                return last_backends
         time.sleep(2)
     raise RuntimeError(
         f"expected {expected} workers; frontend metrics found {len(last_metrics)}: "
-        f"{last_metrics}, frontend log found {len(last_log)}: {last_log}"
+        f"{last_metrics}, frontend log found {len(last_log)}: {last_log}, "
+        f"backend logs found {len(last_backends)}: {last_backends}"
     )
 
 

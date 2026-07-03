@@ -24,7 +24,7 @@ FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG} AS runtime
 # with megatron/inference/integrations/dynamo/dynamo-ref.txt after validating a newer revision.
 ARG DYNAMO_REF=9db71762e6d1a47bff42d55938e0ec27583fcef7
 ARG DYNAMO_REPO=https://github.com/ai-dynamo/dynamo.git
-ARG NIXL_SPEC=nixl==0.10.1
+ARG NIXL_VERSION=0.10.1
 ARG NATS_VERSION=v2.10.28
 ARG ETCD_VERSION=v3.5.30
 
@@ -89,10 +89,14 @@ COPY megatron/inference/integrations/dynamo/scripts/install-dynamo.sh /tmp/insta
 
 # Install Dynamo first so its Python and native runtime are pinned together.
 # Install NIXL separately because it is the Megatron disaggregation transport,
-# not part of the backend adapter's Python dependency contract.
+# not part of the backend adapter's Python dependency contract. Select the
+# CUDA 13 wheel explicitly and do not resolve its generic torch dependency:
+# the NGC base already provides a matched Torch/CUDA/Transformer Engine stack.
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     DYNAMO_REPO="${DYNAMO_REPO}" bash /tmp/install-dynamo.sh "${DYNAMO_REF}" \
-    && uv pip install "${NIXL_SPEC}" \
+    && uv pip install --no-deps \
+        "nixl==${NIXL_VERSION}" \
+        "nixl-cu13==${NIXL_VERSION}" \
     && uv pip install --no-deps --requirement /tmp/megatron-dynamo-requirements.txt
 
 COPY . /opt/megatron-lm

@@ -15,7 +15,7 @@
 
 # Megatron imports `accelerate` from megatron.training during init.
 accelerate
-# NIXL is selected independently by the Dockerfile's NIXL_SPEC build argument.
+# NIXL is selected independently by the Dockerfile's NIXL_VERSION build argument.
 # Datasets — imported by dist_checkpointing under some code paths.
 datasets
 # Megatron uses einops heavily in attention/MLP modules.
