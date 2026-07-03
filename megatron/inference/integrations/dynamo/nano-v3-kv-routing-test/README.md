@@ -70,7 +70,8 @@ Use a unique `RUN_ID` when repeating a mode inside the same allocation.
 - Requires exactly one multi-block `stored` event per logical worker, which
   detects duplicate publication by EP ranks, and rejects invalid,
   missing-parent, or missing-block indexer statuses.
-- Requires no `removed` events between the initial request and its replay.
+- Requires no `removed` or `cleared` events between the initial request and its
+  replay. Idle EP dummy forwards preserve the KV and Mamba prefix caches.
 - Requires every worker log to gain exactly one Megatron prefix-cache hit from
   the repeated request.
 

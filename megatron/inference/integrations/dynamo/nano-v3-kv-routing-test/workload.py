@@ -312,6 +312,9 @@ def run_events(args: argparse.Namespace) -> None:
     removed_after_store = after_store.get(("removed", "ok"), 0) - before.get(
         ("removed", "ok"), 0
     )
+    cleared_after_store = after_store.get(("cleared", "ok"), 0) - before.get(
+        ("cleared", "ok"), 0
+    )
     cache_before_reuse = cache_counters(args.log_dir)
     diagnostics = {
         "workers": workers,
@@ -319,6 +322,7 @@ def run_events(args: argparse.Namespace) -> None:
         "event_counters_after_store": serialize_event_counters(after_store),
         "stored_events_from_initial_prompts": stored_ok_delta,
         "removed_events_after_initial_prompts": removed_after_store,
+        "cleared_events_after_initial_prompts": cleared_after_store,
         "cache_counters_before_reuse": cache_before_reuse,
     }
     append_jsonl(args.run_dir / "records.jsonl", records)
@@ -332,6 +336,11 @@ def run_events(args: argparse.Namespace) -> None:
         raise AssertionError(
             f"initial prompts unexpectedly produced {removed_after_store} removed events; "
             "sequential reuse requires the lru prefix-cache eviction policy"
+        )
+    if cleared_after_store != 0:
+        raise AssertionError(
+            f"initial prompts unexpectedly produced {cleared_after_store} cleared events; "
+            "an idle reset discarded the prefix cache before reuse"
         )
     if len(cache_before_reuse["per_worker"]) != args.expected_workers:
         raise AssertionError(
@@ -355,6 +364,9 @@ def run_events(args: argparse.Namespace) -> None:
     removed_after_reuse = final_events.get(("removed", "ok"), 0) - after_store.get(
         ("removed", "ok"), 0
     )
+    cleared_after_reuse = final_events.get(("cleared", "ok"), 0) - after_store.get(
+        ("cleared", "ok"), 0
+    )
     time.sleep(args.log_settle_seconds)
     counters = cache_counters(args.log_dir)
     counter_deltas = cache_counter_deltas(cache_before_reuse, counters)
@@ -364,6 +376,7 @@ def run_events(args: argparse.Namespace) -> None:
             "event_counters_after_reuse": serialize_event_counters(final_events),
             "stored_events_from_repeated_prompts": stored_after_reuse,
             "removed_events_from_repeated_prompts": removed_after_reuse,
+            "cleared_events_from_repeated_prompts": cleared_after_reuse,
             "cache_counters_after_reuse": counters,
             "cache_counter_deltas_from_repeated_prompts": counter_deltas,
             "event_warning_counters": warnings,
@@ -371,13 +384,17 @@ def run_events(args: argparse.Namespace) -> None:
     )
     append_jsonl(args.run_dir / "records.jsonl", records)
     write_json(args.run_dir / "event-diagnostics.json", diagnostics)
-    if stored_after_reuse != 0:
+    if cleared_after_reuse != 0:
         raise AssertionError(
-            f"identical repeated prompts unexpectedly produced {stored_after_reuse} new stored events"
+            f"identical repeated prompts unexpectedly produced {cleared_after_reuse} cleared events"
         )
     if removed_after_reuse != 0:
         raise AssertionError(
             f"identical repeated prompts unexpectedly produced {removed_after_reuse} removed events"
+        )
+    if stored_after_reuse != 0:
+        raise AssertionError(
+            f"identical repeated prompts unexpectedly produced {stored_after_reuse} new stored events"
         )
     bad = {
         f"{event_type}:{status}": value
@@ -409,8 +426,10 @@ def run_events(args: argparse.Namespace) -> None:
         "workers": workers,
         "stored_ok_event_delta": stored_ok_delta,
         "removed_events_after_initial_prompts": removed_after_store,
+        "cleared_events_after_initial_prompts": cleared_after_store,
         "stored_events_from_repeated_prompts": stored_after_reuse,
         "removed_events_from_repeated_prompts": removed_after_reuse,
+        "cleared_events_from_repeated_prompts": cleared_after_reuse,
         "event_counters_before": serialize_event_counters(before),
         "event_counters_after_store": serialize_event_counters(after_store),
         "event_counters_after": serialize_event_counters(final_events),
