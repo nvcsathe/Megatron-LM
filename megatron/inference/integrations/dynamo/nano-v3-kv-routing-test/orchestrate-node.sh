@@ -13,10 +13,18 @@ CONTEXT_LENGTH="${CONTEXT_LENGTH:-8192}"
 INFER_MAX_SEQ_LEN="${INFER_MAX_SEQ_LEN:-$CONTEXT_LENGTH}"
 INFER_BUFFER_GB="${INFER_BUFFER_GB:-20}"
 INFER_MAX_TOKENS="${INFER_MAX_TOKENS:-8192}"
-INFER_MAX_REQUESTS="${INFER_MAX_REQUESTS:-256}"
+# Mamba extraction scratch scales as 3 * max_requests state slots. Nano needs
+# about 18 GB at 256 requests, which exhausts the default 4 GB Mamba budget.
+# Sixteen supports the test's concurrency while leaving durable cache capacity.
+INFER_MAX_REQUESTS="${INFER_MAX_REQUESTS:-16}"
 KV_BLOCK_SIZE="${KV_BLOCK_SIZE:-256}"
 MAMBA_GB="${MAMBA_GB:-4.0}"
 PREFIX_CACHE="${PREFIX_CACHE:-1}"
+CUDA_GRAPH_IMPL="${CUDA_GRAPH_IMPL:-none}"
+if [[ "$CUDA_GRAPH_IMPL" != "none" && "$CUDA_GRAPH_IMPL" != "local" ]]; then
+    echo "CUDA_GRAPH_IMPL must be none or local, got $CUDA_GRAPH_IMPL" >&2
+    exit 2
+fi
 
 HTTP_PORT="${HTTP_PORT:-8100}"
 NATS_PORT="${NATS_PORT:-4222}"
@@ -30,6 +38,11 @@ export NATS_SERVER="nats://$HEAD_HOST:$NATS_PORT"
 export ETCD_ENDPOINTS="http://$HEAD_HOST:$ETCD_PORT"
 export HF_HOME="${HF_HOME:-$STAGE/hf-cache}"
 export PYTHONUNBUFFERED=1
+# Match the known-good Nano dynamic-inference environment. Deterministic Mamba
+# selects one safe Triton configuration instead of autotuning during graph warmup.
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+export MAMBA_DETERMINISTIC="${MAMBA_DETERMINISTIC:-1}"
+export TRITON_CACHE_AUTOTUNING="${TRITON_CACHE_AUTOTUNING:-0}"
 
 LOG_DIR="$RUN_DIR/logs"
 READY_DIR="$RUN_DIR/ready"
@@ -143,19 +156,23 @@ else
         --transformer-impl inference_optimized
         --te-rng-tracker
         --inference-rng-tracker
-        --cuda-graph-impl local
+        --cuda-graph-impl "$CUDA_GRAPH_IMPL"
         --inference-grouped-gemm-backend vllm
         --inference-use-synchronous-zmq-collectives
         --inference-dynamic-batching-buffer-size-gb "$INFER_BUFFER_GB"
         --inference-dynamic-batching-max-tokens "$INFER_MAX_TOKENS"
         --inference-dynamic-batching-block-size "$KV_BLOCK_SIZE"
         --enable-chunked-prefill
-        --inference-dynamic-batching-num-cuda-graphs -1
-        --inference-cuda-graph-scope block
         --inference-dynamic-batching-max-requests "$INFER_MAX_REQUESTS"
         --inference-logging-step-interval 1
         --micro-batch-size 1
     )
+    if [[ "$CUDA_GRAPH_IMPL" == "local" ]]; then
+        MODEL_ARGS+=(
+            --inference-dynamic-batching-num-cuda-graphs -1
+            --inference-cuda-graph-scope block
+        )
+    fi
 fi
 
 PREFIX_ARGS=()

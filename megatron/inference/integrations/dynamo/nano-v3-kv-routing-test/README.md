@@ -110,7 +110,9 @@ prefill/decode architecture comparison.
 | `CONTEXT_LENGTH` | `8192` | Served context length |
 | `KV_BLOCK_SIZE` | `256` | Megatron dynamic-batching block size |
 | `INFER_BUFFER_GB` | `20` | Inference buffer per worker |
+| `INFER_MAX_REQUESTS` | `16` | Request slots; bounds Mamba extraction scratch |
 | `MAMBA_GB` | `4.0` | Mamba prefix-cache budget |
+| `CUDA_GRAPH_IMPL` | `none` | Set to `local` to opt into CUDA-graph warmup |
 | `PREFIX_FAMILIES` | `32` | Shared-prefix families in the routing dataset |
 | `TURNS_PER_FAMILY` | `8` | Growing requests per family |
 | `PREFIX_REPEAT` | `3072` | Repeated words in each shared prefix |
