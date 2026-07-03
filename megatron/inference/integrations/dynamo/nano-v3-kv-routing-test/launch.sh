@@ -60,8 +60,15 @@ if [[ -e "$RUN_DIR/test-complete" ]]; then
 fi
 mkdir -p "$RUN_DIR" "$(dirname "$DATASET_PATH")"
 
-HEAD_HOST="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)"
-NNODES="${SLURM_NNODES:-$(scontrol show hostnames "$SLURM_JOB_NODELIST" | wc -l)}"
+ALLOCATED_NODES="${SLURM_NNODES:-$(scontrol show hostnames "$SLURM_JOB_NODELIST" | wc -l)}"
+NNODES="${TEST_NNODES:-2}"
+if (( NNODES < 1 || NNODES > ALLOCATED_NODES )); then
+    echo "TEST_NNODES must be between 1 and the $ALLOCATED_NODES allocated nodes, got $NNODES" >&2
+    exit 2
+fi
+mapfile -t TEST_HOSTS < <(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n "$NNODES")
+HEAD_HOST="${TEST_HOSTS[0]}"
+TEST_NODELIST="$(IFS=,; echo "${TEST_HOSTS[*]}")"
 
 declare -A SEEN_MOUNTS
 MOUNTS="$STAGE:$STAGE,$MEGATRON_ROOT:/opt/megatron-lm"
@@ -110,6 +117,7 @@ exec srun \
     --nodes="$NNODES" \
     --ntasks="$NNODES" \
     --ntasks-per-node=1 \
+    --nodelist="$TEST_NODELIST" \
     --container-image="$DMG_SQSH" \
     --container-mounts="$MOUNTS" \
     --container-workdir=/opt/megatron-lm \

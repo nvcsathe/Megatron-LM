@@ -4,17 +4,17 @@ This Slurm harness validates the Dynamo-Megatron KV event and aggregated
 KV-routing path for Nemotron-3 Nano. It runs one complete Megatron replica per
 Dynamo worker. Model-parallel ranks remain private to that worker.
 
-The default four-node topology is:
+The default two-node topology is:
 
 ```text
-4 nodes x 4 GPUs
+2 nodes x 4 GPUs
 2 aggregated workers per node
 2 GPUs per worker: TP=1, PP=1, EP=2
-8 independent Dynamo workers and KV caches
+4 independent Dynamo workers and KV caches
 ```
 
 Set `ROLE_EP_SIZE=4` to run one EP=4 worker per node instead. EP=2 is the
-recommended routing and baseline topology because it provides eight routing
+recommended routing and baseline topology because it provides four routing
 targets. EP=4 is useful as an additional event-deduplication smoke test.
 
 ## Prerequisites
@@ -30,7 +30,8 @@ previous test's physical KV cache cannot affect the next test.
 
 ## Run the tests
 
-From an allocation with four 4-GPU nodes:
+From an allocation containing at least two 4-GPU nodes (the test selects two
+nodes and uses eight GPUs total):
 
 ```bash
 export DMG_SQSH=/path/to/dynamo-megatron.sqsh
@@ -102,6 +103,7 @@ prefill/decode architecture comparison.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `TEST_NNODES` | `2` | Slurm nodes selected from the allocation |
 | `ROLE_EP_SIZE` | `2` | GPUs and expert-parallel ranks per worker |
 | `GPUS_PER_NODE` | `4` | GPUs visible to each Slurm node task |
 | `NAMESPACE` | `nano-kv-test` | Dynamo namespace |
@@ -109,11 +111,11 @@ prefill/decode architecture comparison.
 | `KV_BLOCK_SIZE` | `256` | Megatron dynamic-batching block size |
 | `INFER_BUFFER_GB` | `20` | Inference buffer per worker |
 | `MAMBA_GB` | `4.0` | Mamba prefix-cache budget |
-| `PREFIX_FAMILIES` | `64` | Shared-prefix families in the routing dataset |
+| `PREFIX_FAMILIES` | `32` | Shared-prefix families in the routing dataset |
 | `TURNS_PER_FAMILY` | `8` | Growing requests per family |
 | `PREFIX_REPEAT` | `3072` | Repeated words in each shared prefix |
-| `ROUTING_CONCURRENCY` | `8` | Concurrent measured routing requests |
-| `BASELINE_CONCURRENCY` | `8` | Concurrent baseline requests |
+| `ROUTING_CONCURRENCY` | `4` | Concurrent measured routing requests |
+| `BASELINE_CONCURRENCY` | `4` | Concurrent baseline requests |
 | `MAX_TOKENS` | `32` | Output tokens per workload request |
 | `MIN_AFFINITY` | `0.95` | Minimum post-warmup family affinity |
 | `FRONTEND_SETTLE_SECONDS` | `5` | Discovery delay before the driver starts |

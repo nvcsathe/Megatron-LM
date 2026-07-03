@@ -237,7 +237,7 @@ if (( NODE_RANK == 0 )); then
         --expected-workers "$EXPECTED_WORKERS"
         --block-size "$KV_BLOCK_SIZE"
         --max-tokens "${MAX_TOKENS:-32}"
-        --families "${PREFIX_FAMILIES:-64}"
+        --families "${PREFIX_FAMILIES:-32}"
         --turns "${TURNS_PER_FAMILY:-8}"
         --prefix-repeat "${PREFIX_REPEAT:-3072}"
         --seed "${WORKLOAD_SEED:-42}"
@@ -247,9 +247,9 @@ if (( NODE_RANK == 0 )); then
         --log-dir "$LOG_DIR"
     )
     if [[ "$TEST_MODE" == "routing" ]]; then
-        DRIVER+=(--concurrency "${ROUTING_CONCURRENCY:-8}" --min-affinity "${MIN_AFFINITY:-0.95}")
+        DRIVER+=(--concurrency "${ROUTING_CONCURRENCY:-4}" --min-affinity "${MIN_AFFINITY:-0.95}")
     elif [[ "$TEST_MODE" == "baseline" ]]; then
-        DRIVER+=(--concurrency "${BASELINE_CONCURRENCY:-8}")
+        DRIVER+=(--concurrency "${BASELINE_CONCURRENCY:-4}")
     fi
 
     log "running $TEST_MODE driver"
