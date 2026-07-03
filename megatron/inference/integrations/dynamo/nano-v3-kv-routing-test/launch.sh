@@ -28,6 +28,10 @@ DYNAMO_MODEL="${DYNAMO_MODEL:-nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16}"
 for artifact in "$MODEL_CHECKPOINT" "$PRETRAINED_CHECKPOINT" "$TOKENIZER_MODEL"; do
     [[ -e "$artifact" ]] || { echo "required artifact not found: $artifact" >&2; exit 1; }
 done
+if [[ -e "$DYNAMO_MODEL" && ! -d "$DYNAMO_MODEL" ]]; then
+    echo "DYNAMO_MODEL must be a directory or Hugging Face model ID, got file: $DYNAMO_MODEL" >&2
+    exit 1
+fi
 
 ROLE_EP_SIZE="${ROLE_EP_SIZE:-2}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-4}"

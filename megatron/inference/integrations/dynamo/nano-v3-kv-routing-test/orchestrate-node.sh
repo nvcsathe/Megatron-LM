@@ -96,12 +96,26 @@ if (( NODE_RANK == 0 )); then
         'import asyncio, pathlib, sys
 from dynamo.llm import fetch_model
 model, output = sys.argv[1:]
-path = model if pathlib.Path(model).is_dir() else asyncio.run(fetch_model(model, ignore_weights=True))
+async def resolve():
+    return await fetch_model(model, ignore_weights=True)
+path = model if pathlib.Path(model).is_dir() else asyncio.run(resolve())
 pathlib.Path(output).write_text(str(path))' \
         "$DYNAMO_MODEL" "$MODEL_PATH_FILE" || exit 1
 fi
 wait_for "Dynamo model metadata" 300 test -s "$MODEL_PATH_FILE" || exit 1
 DYNAMO_MODEL_METADATA="$(<"$MODEL_PATH_FILE")"
+if [[ ! -d "$DYNAMO_MODEL_METADATA" ]]; then
+    log "Dynamo metadata resolver returned a non-directory: $DYNAMO_MODEL_METADATA"
+    exit 1
+fi
+if [[ ! -f "$DYNAMO_MODEL_METADATA/config.json" ]]; then
+    log "Dynamo metadata is missing config.json: $DYNAMO_MODEL_METADATA"
+    exit 1
+fi
+if [[ ! -f "$DYNAMO_MODEL_METADATA/tokenizer.json" ]]; then
+    log "Dynamo metadata is missing tokenizer.json: $DYNAMO_MODEL_METADATA"
+    exit 1
+fi
 
 if [[ -n "${MODEL_ARGS_OVERRIDE:-}" ]]; then
     # shellcheck disable=SC2206

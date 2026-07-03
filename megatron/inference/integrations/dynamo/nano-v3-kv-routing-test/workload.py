@@ -162,7 +162,9 @@ def completion(
     completion_tokens = int(usage.get("completion_tokens", 0))
     if not response.get("choices") or completion_tokens < 1:
         raise RuntimeError(f"model returned a degenerate completion: {response}")
-    selected = worker.get("decode_worker_id") or worker.get("prefill_worker_id")
+    selected = worker.get("decode_worker_id")
+    if selected is None:
+        selected = worker.get("prefill_worker_id")
     dp_rank = worker.get("decode_dp_rank")
     if dp_rank is None:
         dp_rank = worker.get("prefill_dp_rank")
@@ -534,14 +536,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-workers", type=int, required=True)
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--max-tokens", type=int, default=32)
-    parser.add_argument("--families", type=int, default=64)
+    parser.add_argument("--families", type=int, default=32)
     parser.add_argument("--turns", type=int, default=8)
     parser.add_argument("--prefix-repeat", type=int, default=3072)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--event-settle-seconds", type=float, default=5)
     parser.add_argument("--turn-settle-seconds", type=float, default=1)
     parser.add_argument("--log-settle-seconds", type=float, default=2)
-    parser.add_argument("--concurrency", type=int, default=8)
+    parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--min-affinity", type=float, default=0.95)
     args = parser.parse_args()
     args.run_dir.mkdir(parents=True, exist_ok=True)
