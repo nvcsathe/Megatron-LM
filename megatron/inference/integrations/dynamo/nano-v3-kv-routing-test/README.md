@@ -63,19 +63,25 @@ Use a unique `RUN_ID` when repeating a mode inside the same allocation.
 
 - Starts the frontend with event-driven KV routing. Approximate routing is not
   enabled.
-- Discovers every logical Dynamo worker from frontend metrics.
+- Loads every logical Dynamo worker ID from the adapter's structured readiness records.
 - Directs a distinct long prompt to every worker and repeats it.
 - Verifies that the response identifies the requested worker and logical DP
   rank zero.
 - Requires exactly one multi-block `stored` event per logical worker, which
   detects duplicate publication by EP ranks, and rejects invalid,
   missing-parent, or missing-block indexer statuses.
-- Requires every worker log to report a Megatron prefix-cache hit after the
-  repeated request.
+- Requires no `removed` events between the initial request and its replay.
+- Requires every worker log to gain exactly one Megatron prefix-cache hit from
+  the repeated request.
 
 The event prompt is kept below the default prefill window so its many blocks
 are carried in one event message. Do not reduce `INFER_MAX_TOKENS` below that
 prompt size when running this exact-count assertion.
+
+All three modes require the `lru` prefix-cache eviction policy so completed
+requests remain available to later requests. The launcher rejects `ref_zero`,
+which deliberately removes blocks as soon as their last active reference is
+released and therefore cannot validate sequential cache reuse.
 
 ### `launch-routing.sh`
 
@@ -112,6 +118,7 @@ prefill/decode architecture comparison.
 | `INFER_BUFFER_GB` | `20` | Inference buffer per worker |
 | `INFER_MAX_REQUESTS` | `16` | Request slots; bounds Mamba extraction scratch |
 | `MAMBA_GB` | `4.0` | Mamba prefix-cache budget |
+| `PREFIX_CACHE_EVICTION_POLICY` | `lru` | Retain completed-request blocks for sequential reuse |
 | `CUDA_GRAPH_IMPL` | `none` | Set to `local` to opt into CUDA-graph warmup |
 | `PREFIX_FAMILIES` | `32` | Shared-prefix families in the routing dataset |
 | `TURNS_PER_FAMILY` | `8` | Growing requests per family |
@@ -120,7 +127,7 @@ prefill/decode architecture comparison.
 | `BASELINE_CONCURRENCY` | `4` | Concurrent baseline requests |
 | `MAX_TOKENS` | `32` | Output tokens per workload request |
 | `MIN_AFFINITY` | `0.95` | Minimum post-warmup family affinity |
-| `FRONTEND_SETTLE_SECONDS` | `5` | Discovery delay before the driver starts |
+| `FRONTEND_SETTLE_SECONDS` | `5` | Registration propagation delay before the driver starts |
 | `EVENT_SETTLE_SECONDS` | `5` | Delay after warm-up before measured routing |
 | `TURN_SETTLE_SECONDS` | `1` | Delay between later conversation turns |
 | `LOG_SETTLE_SECONDS` | `2` | Delay before cumulative counters are parsed |

@@ -20,6 +20,7 @@ INFER_MAX_REQUESTS="${INFER_MAX_REQUESTS:-16}"
 KV_BLOCK_SIZE="${KV_BLOCK_SIZE:-256}"
 MAMBA_GB="${MAMBA_GB:-4.0}"
 PREFIX_CACHE="${PREFIX_CACHE:-1}"
+PREFIX_CACHE_EVICTION_POLICY="${PREFIX_CACHE_EVICTION_POLICY:-lru}"
 CUDA_GRAPH_IMPL="${CUDA_GRAPH_IMPL:-none}"
 if [[ "$CUDA_GRAPH_IMPL" != "none" && "$CUDA_GRAPH_IMPL" != "local" ]]; then
     echo "CUDA_GRAPH_IMPL must be none or local, got $CUDA_GRAPH_IMPL" >&2
@@ -179,6 +180,7 @@ PREFIX_ARGS=()
 if [[ "$PREFIX_CACHE" == "1" ]]; then
     PREFIX_ARGS=(
         --inference-dynamic-batching-prefix-caching
+        --inference-dynamic-batching-prefix-caching-eviction-policy "$PREFIX_CACHE_EVICTION_POLICY"
         --inference-dynamic-batching-prefix-caching-mamba-gb "$MAMBA_GB"
     )
 fi
@@ -192,6 +194,7 @@ for ((local_worker = 0; local_worker < WORKERS_PER_NODE; local_worker++)); do
         gpu_list+=$((first_gpu + offset))
     done
     worker_log="$LOG_DIR/node-${NODE_RANK}-worker-${global_worker}.log"
+    worker_id_file="$READY_DIR/worker-$global_worker"
     : > "$worker_log"
     log "starting worker $global_worker on GPUs $gpu_list"
     (
@@ -205,6 +208,7 @@ for ((local_worker = 0; local_worker < WORKERS_PER_NODE; local_worker++)); do
             --coordinator-host 127.0.0.1 \
             --coordinator-port "$((COORD_PORT_BASE + local_worker))" \
             --megatron-root /opt/megatron-lm \
+            --worker-id-file "$worker_id_file" \
             --engine-start-timeout "$WORKER_START_TIMEOUT" \
             -- \
             --tensor-model-parallel-size 1 \
@@ -224,7 +228,8 @@ for ((local_worker = 0; local_worker < WORKERS_PER_NODE; local_worker++)); do
     wait_for "worker $global_worker registration" "$WORKER_START_TIMEOUT" \
         grep -Eq "Registered base model|Starting NATS push endpoint listener" "$worker_log" \
         || { tail -n 100 "$worker_log" >&2; exit 1; }
-    : > "$READY_DIR/worker-$global_worker"
+    wait_for "worker $global_worker identity" "$WORKER_START_TIMEOUT" \
+        test -s "$READY_DIR/worker-$global_worker" || exit 1
 done
 
 if (( NODE_RANK == 0 )); then
@@ -276,6 +281,7 @@ if (( NODE_RANK == 0 )); then
         --turn-settle-seconds "${TURN_SETTLE_SECONDS:-1}"
         --log-settle-seconds "${LOG_SETTLE_SECONDS:-2}"
         --log-dir "$LOG_DIR"
+        --worker-dir "$READY_DIR"
     )
     if [[ "$TEST_MODE" == "routing" ]]; then
         DRIVER+=(--concurrency "${ROUTING_CONCURRENCY:-4}" --min-affinity "${MIN_AFFINITY:-0.95}")

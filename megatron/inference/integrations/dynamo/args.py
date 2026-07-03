@@ -24,6 +24,7 @@ class Config:
     coordinator_host: str | None
     coordinator_port: int | None
     kv_transfer_listen_addr: str | None
+    worker_id_file: str | None
     megatron_root: str
     drain_timeout: float
     megatron_argv: list[str]
@@ -62,6 +63,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser.add_argument("--coordinator-host", default=None)
     parser.add_argument("--coordinator-port", type=int, default=None)
     parser.add_argument("--kv-transfer-listen-addr", default=None)
+    parser.add_argument(
+        "--worker-id-file",
+        default=None,
+        help="Write this worker's assigned Dynamo identity as JSON after engine readiness.",
+    )
     parser.add_argument("--megatron-root", default="/opt/megatron-lm")
     parser.add_argument("--drain-timeout", type=float, default=30.0)
     parser.add_argument("--engine-start-timeout", type=float, default=1800.0)
@@ -103,6 +109,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         coordinator_host=args.coordinator_host,
         coordinator_port=args.coordinator_port,
         kv_transfer_listen_addr=args.kv_transfer_listen_addr,
+        worker_id_file=args.worker_id_file,
         megatron_root=args.megatron_root,
         drain_timeout=args.drain_timeout,
         megatron_argv=megatron_argv,

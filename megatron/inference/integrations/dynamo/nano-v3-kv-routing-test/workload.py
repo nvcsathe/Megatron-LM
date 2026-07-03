@@ -22,11 +22,6 @@ from typing import Any
 
 
 BAD_EVENT_STATUSES = {"parent_block_not_found", "block_not_found", "invalid_block"}
-WORKER_LABEL_RE = re.compile(r'(?:worker_id|instance_id)="(?P<worker>[0-9]+)"')
-INSTANCE_LIST_RE = re.compile(r"instance_ids=\[(?P<workers>[0-9, ]*)\]")
-BACKEND_WORKER_RE = re.compile(
-    r"Initializing KvEventPublisher for worker (?P<worker>[0-9]+) in component backend"
-)
 CACHE_COUNTER_RE = re.compile(
     r"prefix cache \(cumul\):\s*(?P<hits>[0-9]+) hits,\s*(?P<blocks>[0-9]+) blocks matched"
 )
@@ -90,62 +85,34 @@ def event_warning_counters(metrics: str) -> dict[str, float]:
     return dict(counters)
 
 
-def discover_workers(metrics: str) -> list[int]:
-    """Discover logical backend workers from frontend per-worker metrics."""
-    workers = {int(match.group("worker")) for match in WORKER_LABEL_RE.finditer(metrics)}
-    return sorted(workers)
+def serialize_event_counters(counters: dict[tuple[str, str], float]) -> dict[str, float]:
+    """Convert tuple-keyed event counters into stable JSON object keys."""
+    return {
+        f"{event_type}:{status}": value
+        for (event_type, status), value in sorted(counters.items())
+    }
 
 
-def discover_workers_from_log(path: Path) -> list[int]:
-    """Return the most recently logged active backend-instance set."""
-    if not path.is_file():
-        return []
-    matches = list(INSTANCE_LIST_RE.finditer(path.read_text(errors="replace")))
-    if not matches:
-        return []
-    return sorted(
-        int(worker)
-        for worker in matches[-1].group("workers").split(",")
-        if worker.strip()
-    )
-
-
-def discover_workers_from_backend_logs(log_dir: Path) -> list[int]:
-    """Discover backend instance IDs published by each logical worker."""
-    workers: set[int] = set()
-    for path in sorted(log_dir.glob("node-*-worker-*.log")):
-        for match in BACKEND_WORKER_RE.finditer(path.read_text(errors="replace")):
-            workers.add(int(match.group("worker")))
-    return sorted(workers)
-
-
-def wait_for_workers(
-    url: str,
-    expected: int,
-    log_dir: Path | None = None,
-    timeout: float = 180,
-) -> list[int]:
-    """Wait until frontend metrics expose the expected worker count."""
+def wait_for_workers(worker_dir: Path, expected: int, timeout: float = 180) -> list[int]:
+    """Load the structured identities emitted by ready backend adapters."""
     deadline = time.monotonic() + timeout
-    last_metrics: list[int] = []
-    last_log: list[int] = []
-    last_backends: list[int] = []
+    last_workers: list[int] = []
+    last_error: str | None = None
     while time.monotonic() < deadline:
-        last_metrics = discover_workers(http_text(f"{url}/metrics"))
-        if len(last_metrics) == expected:
-            return last_metrics
-        if log_dir is not None:
-            last_log = discover_workers_from_log(log_dir / "frontend.log")
-            if len(last_log) == expected:
-                return last_log
-            last_backends = discover_workers_from_backend_logs(log_dir)
-            if len(last_backends) == expected:
-                return last_backends
+        identities = sorted(worker_dir.glob("worker-*"))
+        try:
+            last_workers = sorted(
+                {int(json.loads(path.read_text())["worker_id"]) for path in identities}
+            )
+            last_error = None
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            last_error = str(error)
+        if len(identities) == expected and len(last_workers) == expected:
+            return last_workers
         time.sleep(2)
     raise RuntimeError(
-        f"expected {expected} workers; frontend metrics found {len(last_metrics)}: "
-        f"{last_metrics}, frontend log found {len(last_log)}: {last_log}, "
-        f"backend logs found {len(last_backends)}: {last_backends}"
+        f"expected {expected} structured worker identities in {worker_dir}, "
+        f"found {len(last_workers)}: {last_workers}; last parse error: {last_error}"
     )
 
 
@@ -291,6 +258,27 @@ def cache_counters(log_dir: Path) -> dict[str, Any]:
     }
 
 
+def cache_counter_deltas(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """Compute per-worker cache-counter changes between two log snapshots."""
+    before_workers = before["per_worker"]
+    after_workers = after["per_worker"]
+    workers = sorted(set(before_workers) | set(after_workers))
+    per_worker = {
+        worker: {
+            "hits": after_workers.get(worker, {}).get("hits", 0)
+            - before_workers.get(worker, {}).get("hits", 0),
+            "blocks_matched": after_workers.get(worker, {}).get("blocks_matched", 0)
+            - before_workers.get(worker, {}).get("blocks_matched", 0),
+        }
+        for worker in workers
+    }
+    return {
+        "per_worker": per_worker,
+        "hits": sum(item["hits"] for item in per_worker.values()),
+        "blocks_matched": sum(item["blocks_matched"] for item in per_worker.values()),
+    }
+
+
 def make_event_prompt(worker_index: int, prefix_repeat: int) -> str:
     """Build a worker-specific prompt containing many reusable full blocks."""
     marker = f"This is the private cache-validation corpus for logical worker {worker_index}. "
@@ -300,7 +288,7 @@ def make_event_prompt(worker_index: int, prefix_repeat: int) -> str:
 
 def run_events(args: argparse.Namespace) -> None:
     """Validate event ingestion and repeated-prompt cache reuse on every worker."""
-    workers = wait_for_workers(args.url, args.expected_workers, args.log_dir)
+    workers = wait_for_workers(args.worker_dir, args.expected_workers)
     before = event_counters(http_text(f"{args.url}/metrics"))
     records: list[dict[str, Any]] = []
     prompts: dict[int, str] = {}
@@ -321,10 +309,34 @@ def run_events(args: argparse.Namespace) -> None:
     after_store, stored_ok_delta = wait_for_stored_events(
         args.url, initial_stored, args.expected_workers
     )
+    removed_after_store = after_store.get(("removed", "ok"), 0) - before.get(
+        ("removed", "ok"), 0
+    )
+    cache_before_reuse = cache_counters(args.log_dir)
+    diagnostics = {
+        "workers": workers,
+        "event_counters_before": serialize_event_counters(before),
+        "event_counters_after_store": serialize_event_counters(after_store),
+        "stored_events_from_initial_prompts": stored_ok_delta,
+        "removed_events_after_initial_prompts": removed_after_store,
+        "cache_counters_before_reuse": cache_before_reuse,
+    }
+    append_jsonl(args.run_dir / "records.jsonl", records)
+    write_json(args.run_dir / "event-diagnostics.json", diagnostics)
     if stored_ok_delta != args.expected_workers:
         raise AssertionError(
             f"expected exactly one stored event from each of {args.expected_workers} workers, "
             f"got {stored_ok_delta}; model-parallel ranks may be publishing duplicates"
+        )
+    if removed_after_store != 0:
+        raise AssertionError(
+            f"initial prompts unexpectedly produced {removed_after_store} removed events; "
+            "sequential reuse requires the lru prefix-cache eviction policy"
+        )
+    if len(cache_before_reuse["per_worker"]) != args.expected_workers:
+        raise AssertionError(
+            f"found {len(cache_before_reuse['per_worker'])} worker logs before reuse, "
+            f"expected {args.expected_workers}"
         )
 
     for worker in workers:
@@ -340,9 +352,32 @@ def run_events(args: argparse.Namespace) -> None:
     stored_after_reuse = final_events.get(("stored", "ok"), 0) - after_store.get(
         ("stored", "ok"), 0
     )
+    removed_after_reuse = final_events.get(("removed", "ok"), 0) - after_store.get(
+        ("removed", "ok"), 0
+    )
+    time.sleep(args.log_settle_seconds)
+    counters = cache_counters(args.log_dir)
+    counter_deltas = cache_counter_deltas(cache_before_reuse, counters)
+    warnings = {key: value for key, value in event_warning_counters(final_metrics).items() if value}
+    diagnostics.update(
+        {
+            "event_counters_after_reuse": serialize_event_counters(final_events),
+            "stored_events_from_repeated_prompts": stored_after_reuse,
+            "removed_events_from_repeated_prompts": removed_after_reuse,
+            "cache_counters_after_reuse": counters,
+            "cache_counter_deltas_from_repeated_prompts": counter_deltas,
+            "event_warning_counters": warnings,
+        }
+    )
+    append_jsonl(args.run_dir / "records.jsonl", records)
+    write_json(args.run_dir / "event-diagnostics.json", diagnostics)
     if stored_after_reuse != 0:
         raise AssertionError(
             f"identical repeated prompts unexpectedly produced {stored_after_reuse} new stored events"
+        )
+    if removed_after_reuse != 0:
+        raise AssertionError(
+            f"identical repeated prompts unexpectedly produced {removed_after_reuse} removed events"
         )
     bad = {
         f"{event_type}:{status}": value
@@ -351,29 +386,38 @@ def run_events(args: argparse.Namespace) -> None:
     }
     if bad:
         raise AssertionError(f"router indexer reported invalid events: {bad}")
-    warnings = {key: value for key, value in event_warning_counters(final_metrics).items() if value}
     if warnings:
         raise AssertionError(f"router indexer reported suspicious events: {warnings}")
 
-    counters = cache_counters(args.log_dir)
     if len(counters["per_worker"]) != args.expected_workers:
         raise AssertionError(
             f"found {len(counters['per_worker'])} worker logs, expected {args.expected_workers}"
         )
-    missing_hits = [name for name, item in counters["per_worker"].items() if item["hits"] < 1]
-    if missing_hits:
-        raise AssertionError(f"workers did not report a repeated-prompt cache hit: {missing_hits}")
+    invalid_hit_deltas = {
+        name: item["hits"]
+        for name, item in counter_deltas["per_worker"].items()
+        if item["hits"] != 1
+    }
+    if invalid_hit_deltas:
+        raise AssertionError(
+            "expected exactly one repeated-prompt cache hit per worker, got "
+            f"{invalid_hit_deltas}"
+        )
 
-    append_jsonl(args.run_dir / "records.jsonl", records)
     summary = {
         "mode": "events",
         "workers": workers,
         "stored_ok_event_delta": stored_ok_delta,
+        "removed_events_after_initial_prompts": removed_after_store,
         "stored_events_from_repeated_prompts": stored_after_reuse,
-        "event_counters_before": {f"{key[0]}:{key[1]}": value for key, value in before.items()},
-        "event_counters_after": {f"{key[0]}:{key[1]}": value for key, value in final_events.items()},
+        "removed_events_from_repeated_prompts": removed_after_reuse,
+        "event_counters_before": serialize_event_counters(before),
+        "event_counters_after_store": serialize_event_counters(after_store),
+        "event_counters_after": serialize_event_counters(final_events),
         "event_warning_counters": warnings,
+        "cache_counters_before_reuse": cache_before_reuse,
         "cache_counters": counters,
+        "cache_counter_deltas_from_repeated_prompts": counter_deltas,
         "latency": latency_summary(records),
         "ttft": field_summary(records, "ttft_ms"),
         "result": "PASS",
@@ -503,7 +547,7 @@ def workload_summary(
 
 def run_routing(args: argparse.Namespace) -> None:
     """Warm each family, then verify event-driven KV routing affinity."""
-    workers = wait_for_workers(args.url, args.expected_workers, args.log_dir)
+    workers = wait_for_workers(args.worker_dir, args.expected_workers)
     dataset = generate_dataset(args)
     all_records = execute_turns(args, dataset, args.event_settle_seconds)
     warm_records = [record for record in all_records if record["turn"] == 0]
@@ -578,6 +622,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--log-dir", type=Path, required=True)
+    parser.add_argument("--worker-dir", type=Path, required=True)
     parser.add_argument("--expected-workers", type=int, required=True)
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--max-tokens", type=int, default=32)

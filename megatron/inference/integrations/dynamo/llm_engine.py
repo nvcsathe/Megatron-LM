@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import queue
@@ -11,6 +12,7 @@ import signal
 import sys
 import threading
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
@@ -94,6 +96,7 @@ class MegatronLLMEngine(LLMEngine):
         self._event_receiver: Optional[EngineEventReceiver] = None
         self._release_clients: dict[str, Any] = {}
         self._request_ids: dict[str, int] = {}
+        self.worker_id: Optional[int] = None
 
     @classmethod
     async def from_args(
@@ -124,7 +127,7 @@ class MegatronLLMEngine(LLMEngine):
         )
 
     async def start(self, worker_id: int) -> EngineConfig:
-        del worker_id
+        self.worker_id = int(worker_id)
         if not os.path.isdir(self.config.megatron_root):
             raise FileNotFoundError(
                 f"Megatron root does not exist: {self.config.megatron_root}"
@@ -175,6 +178,20 @@ class MegatronLLMEngine(LLMEngine):
         self._metadata = dict(readiness["engine"])
         self._metadata["coordinator_address"] = str(readiness["coordinator_address"])
         self._process_monitor = asyncio.create_task(self._monitor_process())
+        identity = {
+            "worker_id": self.worker_id,
+            "namespace": self.config.namespace,
+            "component": self.config.component,
+            "endpoint": self.config.endpoint,
+            "role": self.config.role,
+        }
+        logger.info("Dynamo worker identity: %s", json.dumps(identity, sort_keys=True))
+        if self.config.worker_id_file is not None:
+            path = Path(self.config.worker_id_file)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            temporary.write_text(json.dumps(identity, sort_keys=True) + "\n")
+            os.replace(temporary, path)
 
         return EngineConfig(
             model=self.config.model,
@@ -186,7 +203,7 @@ class MegatronLLMEngine(LLMEngine):
             max_num_batched_tokens=int(self._metadata["max_num_batched_tokens"]),
             data_parallel_size=1,
             data_parallel_start_rank=0,
-            runtime_data={"role": self.config.role},
+            runtime_data={"role": self.config.role, "worker_id": self.worker_id},
         )
 
     def _engine_command(self, parent_event_address: str) -> list[str]:
