@@ -22,7 +22,8 @@ from typing import Any
 
 
 BAD_EVENT_STATUSES = {"parent_block_not_found", "block_not_found", "invalid_block"}
-WORKER_LABEL_RE = re.compile(r'worker_id="(?P<worker>[0-9]+)"')
+WORKER_LABEL_RE = re.compile(r'(?:worker_id|instance_id)="(?P<worker>[0-9]+)"')
+INSTANCE_LIST_RE = re.compile(r"instance_ids=\[(?P<workers>[0-9, ]*)\]")
 CACHE_COUNTER_RE = re.compile(
     r"prefix cache \(cumul\):\s*(?P<hits>[0-9]+) hits,\s*(?P<blocks>[0-9]+) blocks matched"
 )
@@ -92,16 +93,43 @@ def discover_workers(metrics: str) -> list[int]:
     return sorted(workers)
 
 
-def wait_for_workers(url: str, expected: int, timeout: float = 180) -> list[int]:
+def discover_workers_from_log(path: Path) -> list[int]:
+    """Return the most recently logged active backend-instance set."""
+    if not path.is_file():
+        return []
+    matches = list(INSTANCE_LIST_RE.finditer(path.read_text(errors="replace")))
+    if not matches:
+        return []
+    return sorted(
+        int(worker)
+        for worker in matches[-1].group("workers").split(",")
+        if worker.strip()
+    )
+
+
+def wait_for_workers(
+    url: str,
+    expected: int,
+    log_dir: Path | None = None,
+    timeout: float = 180,
+) -> list[int]:
     """Wait until frontend metrics expose the expected worker count."""
     deadline = time.monotonic() + timeout
-    last: list[int] = []
+    last_metrics: list[int] = []
+    last_log: list[int] = []
     while time.monotonic() < deadline:
-        last = discover_workers(http_text(f"{url}/metrics"))
-        if len(last) == expected:
-            return last
+        last_metrics = discover_workers(http_text(f"{url}/metrics"))
+        if len(last_metrics) == expected:
+            return last_metrics
+        if log_dir is not None:
+            last_log = discover_workers_from_log(log_dir / "frontend.log")
+            if len(last_log) == expected:
+                return last_log
         time.sleep(2)
-    raise RuntimeError(f"expected {expected} workers in frontend metrics, found {len(last)}: {last}")
+    raise RuntimeError(
+        f"expected {expected} workers; frontend metrics found {len(last_metrics)}: "
+        f"{last_metrics}, frontend log found {len(last_log)}: {last_log}"
+    )
 
 
 def wait_for_stored_events(
@@ -255,7 +283,7 @@ def make_event_prompt(worker_index: int, prefix_repeat: int) -> str:
 
 def run_events(args: argparse.Namespace) -> None:
     """Validate event ingestion and repeated-prompt cache reuse on every worker."""
-    workers = wait_for_workers(args.url, args.expected_workers)
+    workers = wait_for_workers(args.url, args.expected_workers, args.log_dir)
     before = event_counters(http_text(f"{args.url}/metrics"))
     records: list[dict[str, Any]] = []
     prompts: dict[int, str] = {}
@@ -458,7 +486,7 @@ def workload_summary(
 
 def run_routing(args: argparse.Namespace) -> None:
     """Warm each family, then verify event-driven KV routing affinity."""
-    workers = wait_for_workers(args.url, args.expected_workers)
+    workers = wait_for_workers(args.url, args.expected_workers, args.log_dir)
     dataset = generate_dataset(args)
     all_records = execute_turns(args, dataset, args.event_settle_seconds)
     warm_records = [record for record in all_records if record["turn"] == 0]
