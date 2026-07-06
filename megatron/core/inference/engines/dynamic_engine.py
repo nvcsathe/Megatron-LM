@@ -492,7 +492,7 @@ class DynamicInferenceEngine(InferenceStateHandoffMixin, AbstractEngine):
                         mtp_seen_batch_sizes.add(n)
                         device = torch.cuda.current_device()
                         batch_dim = n // tp_size if sp_enabled else n
-                        # Use zeros; empty tensors can replay garbage token IDs.
+                        # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
                         for depth in mtp_warmup_depths:
                             unwrapped.compute_mtp_single_step(
                                 hidden_states=torch.zeros(
@@ -1452,7 +1452,7 @@ class DynamicInferenceEngine(InferenceStateHandoffMixin, AbstractEngine):
                     top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
 
             # Process log_probs if available (unified for both regular and chunked prefill)
-            # Skip requests finished by stop words; tokens are not
+            # Skip for requests being finished due to stop words — tokens are not
             # appended for these requests, so log probs must also be skipped to keep
             # the two lists in sync.
             if (
@@ -2635,8 +2635,8 @@ class DynamicInferenceEngine(InferenceStateHandoffMixin, AbstractEngine):
         """World-wide ZMQ all-reduce barrier for global rank consensus.
 
         Used for all state transitions that require global synchronization:
-        PAUSING to PAUSED, UNPAUSING to RUNNING, SUSPENDING to SUSPENDED,
-        RESUMING to PAUSED, and STOPPING to STOPPED.
+        PAUSING → PAUSED, UNPAUSING → RUNNING, SUSPENDING → SUSPENDED,
+        RESUMING → PAUSED, and STOPPING → STOPPED.
 
         No-op when world_size == 1 (communicator is not created).
         """
@@ -2748,7 +2748,9 @@ class DynamicInferenceEngine(InferenceStateHandoffMixin, AbstractEngine):
                     self.state = EngineState.RUNNING
                     self._state_events[EngineState.PAUSED].clear()
                     self._state_events[EngineState.RUNNING].set()
-                    # Clear stale pause consensus before returning to RUNNING.
+                    # The cache from the PAUSING phase still has all_pausing=True;
+                    # without this reset the next RUNNING iteration would skip
+                    # consensus, read the stale flag, and immediately re-pause.
                     self._last_ep_consensus = (0, False)
 
                 elif self.state == EngineState.SUSPENDING:

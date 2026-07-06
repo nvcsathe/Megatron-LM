@@ -47,7 +47,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from megatron.core.inference.disaggregation.shard_range_intersection import intersect
+from megatron.core.inference.disaggregation.utils import (
+    intersect,
+    transfers_for_dst,
+    transfers_for_src,
+)
 
 # ---------------------------------------------------------------------------
 # Topology descriptor

@@ -8,7 +8,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple
 
-from megatron.core.inference.disaggregation.shard_range_intersection import intersect
+from megatron.core.inference.disaggregation.utils import (
+    intersect,
+    transfers_for_dst,
+    transfers_for_src,
+)
 
 # Channel bands of a Mamba layer's state, in the order the conv state
 # concatenates them on its channel axis (x, B, C); ssm is the head axis.
