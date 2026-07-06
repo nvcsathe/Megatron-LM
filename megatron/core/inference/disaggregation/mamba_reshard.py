@@ -6,12 +6,16 @@ decode shard layouts (the Mamba analog of the attention KV reshard)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Any, List, Optional, Tuple
 
+from megatron.core.inference.disaggregation.kv_reshard import (
+    KVBufferGeometry,
+    TransferSegment,
+)
 from megatron.core.inference.disaggregation.utils import (
     intersect,
-    transfers_for_dst,
-    transfers_for_src,
+    representative_source_ranks,
+    transfer_peer_records,
 )
 
 # Channel bands of a Mamba layer's state, in the order the conv state
@@ -60,9 +64,13 @@ class MambaShardLayout:
         # TP shards heads and groups; both must divide evenly or the local
         # conv/ssm band sizes truncate to the wrong (or zero) width silently.
         if self.dims.nheads % self.tp_size != 0:
-            raise ValueError(f"nheads={self.dims.nheads} not divisible by tp_size={self.tp_size}")
+            raise ValueError(
+                f"nheads={self.dims.nheads} not divisible by tp_size={self.tp_size}"
+            )
         if self.dims.ngroups % self.tp_size != 0:
-            raise ValueError(f"ngroups={self.dims.ngroups} not divisible by tp_size={self.tp_size}")
+            raise ValueError(
+                f"ngroups={self.dims.ngroups} not divisible by tp_size={self.tp_size}"
+            )
 
     # Convenience proxies onto the dims so callers read ``layout.headdim`` etc.
     @property
@@ -90,10 +98,10 @@ class MambaShardLayout:
         """Convolution kernel width."""
         return self.dims.d_conv
 
-    def mamba_shard_key(self) -> Tuple[int, int]:
-        """The Mamba shard this rank holds: ``(tp_rank, layer_start)``. Ranks
-        sharing a key hold identical state (e.g. EP/DP replicas of it)."""
-        return (self.tp_rank, self.layer_start)
+    def mamba_shard_key(self) -> Tuple[int, int, int]:
+        """The Mamba shard this rank holds. Replica ranks share this key."""
+
+        return (self.tp_rank, self.layer_start, self.num_layers)
 
     @property
     def d_inner(self) -> int:
@@ -180,15 +188,17 @@ def plan_mamba_reshard(
     """Plan the conv/ssm sub-block moves from the prefill (src) layouts to the
     decode (dst) layouts. One transfer per (src rank, dst rank, global layer,
     band) where both the layer ranges and the channel ranges overlap."""
-    # Dedupe replica sources: ranks sharing (tp_rank, layer_start) hold identical
-    # Mamba state (e.g. EP/DP replicas), so source each shard from exactly one of
-    # them -- the smallest global_rank -- to avoid duplicate sends.
-    rep_rank: dict = {}
-    for s in src_layouts:
-        key = s.mamba_shard_key()
-        if key not in rep_rank or s.global_rank < rep_rank[key]:
-            rep_rank[key] = s.global_rank
-    source_ranks = set(rep_rank.values())
+    if src_layouts and dst_layouts:
+        expected_dims = dst_layouts[0].dims
+        if any(layout.dims != expected_dims for layout in src_layouts + dst_layouts):
+            raise ValueError("source and destination describe different Mamba models")
+
+    # Dedupe replica sources: ranks sharing TP ownership and the same layer
+    # window hold identical Mamba state (e.g. EP/DP replicas), so source each
+    # shard from exactly one of them.
+    source_ranks = representative_source_ranks(
+        src_layouts, lambda layout: layout.mamba_shard_key()
+    )
 
     out: List[MambaReshardTransfer] = []
     for s in src_layouts:
@@ -224,3 +234,123 @@ def plan_mamba_reshard(
                         )
                     )
     return out
+
+
+def build_mamba_reshard_plan(
+    peer_meta: Any,
+    src_block_ids: List[int],
+    dst_block_ids: List[int],
+    local_layout: Optional[MambaShardLayout],
+    local_geometry: KVBufferGeometry,
+    state_kind: str,
+) -> List[TransferSegment]:
+    """Adapt logical Mamba TP/PP slices into transport segments."""
+
+    if state_kind not in ("conv", "ssm"):
+        raise ValueError("state_kind must be 'conv' or 'ssm'")
+    if local_layout is None:
+        raise ValueError("local transfer agent is missing Mamba layout metadata")
+    width = (
+        local_layout.conv_dim_local
+        if state_kind == "conv"
+        else local_layout.nheads_local
+    )
+    if (
+        local_geometry.heads_per_partition != width
+        or local_geometry.num_outer != local_layout.num_layers
+        or local_geometry.blocks_axis != 1
+    ):
+        raise ValueError(f"local {state_kind} geometry does not match its Mamba layout")
+
+    records = transfer_peer_records(peer_meta, src_block_ids)
+    if not records:
+        raise ValueError("Mamba handoff contains no source peer metadata")
+
+    sources = []
+    by_rank = {}
+    for meta, blocks in records:
+        raw_layout = meta.get("mamba_layout")
+        if not isinstance(raw_layout, dict):
+            raise ValueError("peer metadata is missing mamba_layout")
+        layout = MambaShardLayout(**raw_layout)
+        geometry = KVBufferGeometry.from_meta(meta)
+        peer_width = (
+            layout.conv_dim_local if state_kind == "conv" else layout.nheads_local
+        )
+        local_geometry.validate_transfer_from(
+            geometry, blocks, dst_block_ids, peer_name=meta.get("agent_name")
+        )
+        if (
+            geometry.heads_per_partition != peer_width
+            or geometry.num_outer != layout.num_layers
+            or geometry.blocks_axis != 1
+        ):
+            raise ValueError(
+                f"peer {state_kind} geometry does not match its Mamba layout"
+            )
+        if layout.global_rank in by_rank:
+            raise ValueError(
+                f"duplicate source global_rank={layout.global_rank} in Mamba metadata"
+            )
+        sources.append(layout)
+        by_rank[layout.global_rank] = (meta, blocks, geometry)
+
+    for layout in sources:
+        if (
+            layout.tp_size == local_layout.tp_size
+            and layout.tp_rank == local_layout.tp_rank
+            and layout.layer_range() == local_layout.layer_range()
+            and layout.dims == local_layout.dims
+        ):
+            meta, blocks, geometry = by_rank[layout.global_rank]
+            local_geometry.validate_transfer_from(
+                geometry,
+                blocks,
+                dst_block_ids,
+                peer_name=meta.get("agent_name"),
+                require_matched_layout=True,
+            )
+            return [
+                TransferSegment(
+                    peer_meta=meta,
+                    src_block_ids=blocks,
+                    src_o_start=0,
+                    dst_o_start=0,
+                    n_outer=local_layout.num_layers,
+                )
+            ]
+
+    logical_plan = plan_mamba_reshard(sources, [local_layout])
+    relevant = [
+        transfer
+        for transfer in logical_plan
+        if transfer.is_conv == (state_kind == "conv")
+    ]
+    for layer in range(local_layout.num_layers):
+        intervals = sorted(
+            (transfer.dst_lo, transfer.dst_hi)
+            for transfer in relevant
+            if transfer.dst_layer == layer
+        )
+        if not intervals or intervals[0][0] != 0 or intervals[-1][1] != width:
+            raise ValueError(
+                f"incomplete Mamba {state_kind} coverage for layer {layer}"
+            )
+        if any(a[1] != b[0] for a, b in zip(intervals, intervals[1:])):
+            raise ValueError(
+                f"non-contiguous Mamba {state_kind} coverage for layer {layer}"
+            )
+
+    return [
+        TransferSegment(
+            peer_meta=by_rank[transfer.src_rank][0],
+            src_block_ids=by_rank[transfer.src_rank][1],
+            src_o_start=transfer.src_layer,
+            dst_o_start=transfer.dst_layer,
+            n_outer=1,
+            src_h0=transfer.src_lo,
+            dst_h0=transfer.dst_lo,
+            n_heads=transfer.src_hi - transfer.src_lo,
+        )
+        for transfer in relevant
+    ]

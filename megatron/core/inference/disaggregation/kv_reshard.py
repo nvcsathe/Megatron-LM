@@ -1,46 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""KV-cache reshard planning across heterogeneous parallelism.
-
-This module contains the transport-neutral shard-layout planner and the
-NIXL segment adapter used by the current KV transfer backend.
-
-No NIXL, no torch required. Functions here compute *what* to pull (which peer,
-which block ids, which outer-slice range, which head range); the transfer backend
-executes *how* (NIXL descriptor building and submission).
-
-Layout conventions
-------------------
-Megatron's paged KV buffer has two layouts:
-
-- K/V split:  ``[2, L, B, T, H, d]`` → blocks-axis = 2, num_outer = 2 × L
-- MLA:        ``[L, B, T, H, d]``    → blocks-axis = 1, num_outer = L
-
-where L = attention layers on this PP rank, B = total blocks in the pool,
-T = tokens per block, H = KV heads per partition, d = head dim.
-
-Within each (outer, block) slice the layout is ``[T, H, d]`` for K/V split or
-``[T, D]`` for MLA. Head re-sharding only applies to the K/V-split case (MLA
-concatenates K and Q projections; heads are not independently addressable in
-the same way — treat it as matched-only for now).
-
-Parallelism dimensions handled here
--------------------------------------
-TP (tensor parallelism)
-    Each TP rank owns a contiguous range of KV heads ``[r*Hpp, (r+1)*Hpp)``
-    where ``Hpp = num_kv_heads_global / tp_size``. Re-sharding computes which
-    peer head-ranges overlap with the local range.
-
-PP (pipeline parallelism)
-    Each PP rank owns a contiguous range of attention layers ``[layer_start,
-    layer_end)``. Re-sharding selects which outer-index slices (= layer × kv_factor)
-    to pull from each prefill PP rank.
-
-EP (expert parallelism) — *future*
-    Each EP rank owns a subset of MoE expert slots. A placeholder hook is
-    provided; add ``ep_reshard_plan`` here when needed.
-"""
+"""KV-cache shard planning and transfer-segment adaptation."""
 
 from __future__ import annotations
 
@@ -49,481 +10,22 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from megatron.core.inference.disaggregation.utils import (
     intersect,
+    representative_source_ranks,
+    transfer_peer_records,
     transfers_for_dst,
     transfers_for_src,
 )
 
-# ---------------------------------------------------------------------------
-# Topology descriptor
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class KvTopology:
-    """This rank's KV buffer topology — the source of truth for plan computations.
-
-    All fields that affect re-sharding are captured here so that plan functions
-    are pure (no side-effects, no NIXL, no torch) and therefore trivially
-    testable.
-
-    Optional fields are ``None`` when the corresponding parallelism dimension is
-    absent (PP=1, TP=1, etc.); plan functions gate their logic on non-None checks.
-
-    Future: add ``ep_rank``, ``expert_start``, ``expert_end`` for EP support.
-    """
-
-    # --- TP ---
-    tp_size: Optional[int] = None
-    tp_rank: Optional[int] = None
-    num_kv_heads_global: Optional[int] = None
-    heads_per_partition: Optional[int] = None  # num_kv_heads_global // tp_size
-    head_dim: Optional[int] = None
-    tokens_per_block: Optional[int] = None
-
-    # --- PP ---
-    pp_rank: Optional[int] = None
-    layer_start: Optional[int] = None  # inclusive global attention-layer index
-    layer_end: Optional[int] = None    # exclusive
-
-    # --- Buffer geometry (set by KvTransferAgent from the memory buffer shape) ---
-    num_outer: Optional[int] = None  # kv_factor × (layer_end − layer_start)
-
-    # ------------------------------------------------------------------ derived
-
-    @property
-    def n_layers(self) -> int:
-        if self.layer_start is None or self.layer_end is None:
-            raise ValueError("KvTopology.n_layers requires layer_start and layer_end")
-        return self.layer_end - self.layer_start
-
-    @property
-    def kv_factor(self) -> int:
-        """Outer slices per attention layer (2 for K/V split, 1 for MLA)."""
-        n = self.n_layers
-        if n == 0:
-            raise ValueError("KvTopology has zero layers")
-        if self.num_outer is None:
-            raise ValueError("KvTopology.kv_factor requires num_outer")
-        factor, rem = divmod(self.num_outer, n)
-        if rem != 0:
-            raise ValueError(
-                f"num_outer={self.num_outer} is not divisible by n_layers={n}; "
-                "unexpected KV buffer layout."
-            )
-        return factor
-
-    @property
-    def tp_capable(self) -> bool:
-        """True iff TP topology is fully specified and heads are partitioned (not replicated)."""
-        return (
-            None not in (self.tp_size, self.tp_rank, self.num_kv_heads_global,
-                         self.heads_per_partition, self.head_dim, self.tokens_per_block)
-            and self.heads_per_partition * self.tp_size == self.num_kv_heads_global  # type: ignore[operator]
-        )
-
-    @property
-    def pp_capable(self) -> bool:
-        """True iff PP topology is fully specified."""
-        return None not in (self.pp_rank, self.layer_start, self.layer_end, self.num_outer)
-
-
-# ---------------------------------------------------------------------------
-# Transfer segment
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class TransferSegment:
-    """One atomic NIXL pull: a (outer-range × head-range) fragment from one peer.
-
-    the transfer backend turns this into NIXL
-    descriptor lists and submits the transfer.
-
-    Outer range
-        ``src_o_start`` / ``dst_o_start`` / ``n_outer`` select which consecutive
-        outer slices (= layers × kv_factor) to copy. For PP=1 transfers
-        ``src_o_start = dst_o_start = 0`` and ``n_outer = local.num_outer``.
-
-    Head range (TP re-sharding)
-        ``n_heads == 0`` triggers the fast matched-layout path: one descriptor
-        per (block, outer) pair, copying a full ``bytes_per_slice``. No per-token
-        iteration is needed.
-
-        ``n_heads > 0`` triggers the head sub-range path: one descriptor per
-        (block, outer, token) triple, copying ``n_heads × head_dim × element_size``
-        bytes starting at ``src_h0`` / ``dst_h0`` within the ``[T, H, d]`` slice.
-    """
-
-    peer_meta: Dict[str, Any]    # export_meta() from the prefill peer
-    src_block_ids: List[int]     # block IDs on that prefill peer for this request
-    src_o_start: int             # first outer index to read from the peer buffer
-    dst_o_start: int             # first outer index to write into the local buffer
-    n_outer: int                 # number of consecutive outer slices to transfer
-    # Head range — both zero and n_heads=0 → full-slice matched path
-    src_h0: int = 0              # first head in the peer's per-token slice (head units)
-    dst_h0: int = 0              # first head in the local per-token slice (head units)
-    n_heads: int = 0             # 0 → full slice; >0 → head sub-range
-
-
-# ---------------------------------------------------------------------------
-# Top-level dispatcher
-# ---------------------------------------------------------------------------
-
-
-def build_reshard_plan(
-    kv_meta: Any,
-    src_block_ids: List[int],
-    local: KvTopology,
-) -> List[TransferSegment]:
-    """Produce the full list of NIXL transfer segments for one handoff request.
-
-    Parameters
-    ----------
-    kv_meta:
-        The ``kv_meta`` field from ``disaggregated_params``.
-
-        - ``{"pp_metas": [...]}``  — heterogeneous-PP: each entry is one prefill
-          PP rank's TP metas + per-rank block ids.
-        - list of dicts            — heterogeneous-TP (multiple prefill TP peers,
-          same layer range, same block ids for all).
-        - single dict              — matched or single-peer (PP=1, TP=1 or
-          TP-matched).
-
-    src_block_ids:
-        Block IDs on the prefill side. Used for PP=1 paths; PP>1 paths read
-        per-rank block ids from inside each ``pp_metas`` entry.
-
-    local:
-        This decode rank's :class:`KvTopology`.
-
-    Returns
-    -------
-    List of :class:`TransferSegment` ready for
-    the transfer backend.
-    """
-    if isinstance(kv_meta, dict) and "pp_metas" in kv_meta:
-        return _pp_to_segments(kv_meta["pp_metas"], local)
-
-    peer_metas = kv_meta if isinstance(kv_meta, list) else [kv_meta]
-    return _tp_to_segments(peer_metas, src_block_ids, local)
-
-
-# ---------------------------------------------------------------------------
-# TP re-sharding
-# ---------------------------------------------------------------------------
-
-
-def tp_reshard_plan(
-    peer_metas: List[Dict[str, Any]],
-    local: KvTopology,
-    *,
-    check_outer: bool = True,
-) -> List[Dict[str, Any]]:
-    """Compute head-range fragments for heterogeneous-TP KV re-sharding.
-
-    KV heads live in a global index space ``[0, num_kv_heads_global)`` (==
-    ``num_query_groups`` under GQA). Rank ``r`` at TP ``t`` owns
-    ``[r*Hpp, (r+1)*Hpp)`` where ``Hpp = num_kv_heads_global / t``. For each
-    prefill peer we intersect its head range with ours; the overlap is expressed
-    as offsets into the peer's slice (``src_h0``) and our slice (``dst_h0``).
-
-    Parameters
-    ----------
-    peer_metas:
-        List of ``export_meta()`` dicts, one per prefill TP rank.
-    local:
-        Decode rank's topology (must have TP fields set).
-    check_outer:
-        When True (default), raise if a peer's ``num_outer`` differs from
-        ``local.num_outer`` — indicates a PP mismatch in a TP-only context.
-        Set to False when called from :func:`pp_reshard_plan` where num_outer
-        legitimately differs across PP ranks.
-
-    Returns
-    -------
-    List of ``{peer, src_h0, dst_h0, n_heads}`` dicts.
-    """
-    if not local.tp_capable:
-        raise RuntimeError(
-            "KvTopology is not TP-capable (tp_size/heads_per_partition/etc. missing "
-            "or in head-replication regime). Heterogeneous-TP handoff requires "
-            "partitioned (not replicated) KV heads."
-        )
-    g = local.num_kv_heads_global
-    local_hpp = local.heads_per_partition
-    local_lo = local.tp_rank * local_hpp  # type: ignore[operator]
-    local_hi = local_lo + local_hpp       # type: ignore[operator]
-
-    plan: List[Dict[str, Any]] = []
-    for pm in peer_metas:
-        for key in ("tp_size", "tp_rank", "heads_per_partition", "head_dim",
-                    "tokens_per_block", "num_kv_heads_global"):
-            if pm.get(key) is None:
-                raise ValueError(
-                    f"peer_meta missing topology field {key!r}; prefill engine "
-                    "must be built with TP topology for heterogeneous-TP handoff."
-                )
-        if pm["num_kv_heads_global"] != g:
-            raise ValueError(
-                f"num_kv_heads_global mismatch peer={pm['num_kv_heads_global']} "
-                f"local={g} (different model?)."
-            )
-        if pm["head_dim"] != local.head_dim or pm["tokens_per_block"] != local.tokens_per_block:
-            raise ValueError(
-                "head_dim/tokens_per_block mismatch — only TP may differ between "
-                "prefill and decode, not head dim or block size."
-            )
-        if check_outer and pm["num_outer"] != local.num_outer:
-            raise ValueError(
-                f"num_outer mismatch peer={pm['num_outer']} local={local.num_outer} — "
-                "use build_reshard_plan with {\"pp_metas\": ...} for heterogeneous PP."
-            )
-        p_hpp = pm["heads_per_partition"]
-        p_lo = pm["tp_rank"] * p_hpp
-        p_hi = p_lo + p_hpp
-        lo = max(local_lo, p_lo)
-        hi = min(local_hi, p_hi)
-        if hi <= lo:
-            continue
-        plan.append({"peer": pm, "src_h0": lo - p_lo, "dst_h0": lo - local_lo, "n_heads": hi - lo})
-
-    covered = sum(item["n_heads"] for item in plan)
-    if covered != local_hpp:
-        raise ValueError(
-            f"TP re-shard plan covers {covered} of {local_hpp} local KV heads; "
-            f"prefill TP set {[pm.get('tp_size') for pm in peer_metas]} is not "
-            f"compatible with decode TP {local.tp_size} (one must divide the "
-            "other and both must divide num_kv_heads_global)."
-        )
-    return plan
-
-
-def _tp_to_segments(
-    peer_metas: List[Dict[str, Any]],
-    src_block_ids: List[int],
-    local: KvTopology,
-    *,
-    check_outer: bool = True,
-    src_o_start: int = 0,
-    dst_o_start: int = 0,
-    n_outer: Optional[int] = None,
-) -> List[TransferSegment]:
-    """Convert TP peer metas into TransferSegments.
-
-    ``src_o_start`` / ``dst_o_start`` / ``n_outer`` are filled in by the PP
-    layer when called from ``_pp_to_segments``; callers at the TP-only level
-    leave them at defaults (0 / local.num_outer).
-    """
-    effective_n_outer = local.num_outer if n_outer is None else n_outer
-
-    # Single peer with no TP topology block → matched layout, full-slice copy.
-    if len(peer_metas) == 1 and not _has_tp_topology(peer_metas[0]):
-        return [
-            TransferSegment(
-                peer_meta=peer_metas[0],
-                src_block_ids=src_block_ids,
-                src_o_start=src_o_start,
-                dst_o_start=dst_o_start,
-                n_outer=effective_n_outer,
-            )
-        ]
-
-    # TP-heterogeneous path.
-    fragments = tp_reshard_plan(peer_metas, local, check_outer=check_outer)
-
-    # Equal-TP shortcut: plan resolves to a single peer covering our full head
-    # range from offset 0, AND the peer's heads_per_partition equals ours so
-    # their bytes_per_slice equals ours. Only then is the full-slice matched
-    # copy correct — if the peer has more heads per slice (e.g. prefill TP=1
-    # vs decode TP=2), peer_bps > local_bps and NIXL rejects the size mismatch.
-    if (
-        len(fragments) == 1
-        and fragments[0]["src_h0"] == 0
-        and fragments[0]["dst_h0"] == 0
-        and fragments[0]["n_heads"] == local.heads_per_partition
-        and fragments[0]["peer"]["heads_per_partition"] == local.heads_per_partition
-    ):
-        return [
-            TransferSegment(
-                peer_meta=fragments[0]["peer"],
-                src_block_ids=src_block_ids,
-                src_o_start=src_o_start,
-                dst_o_start=dst_o_start,
-                n_outer=effective_n_outer,
-            )
-        ]
-
-    return [
-        TransferSegment(
-            peer_meta=frag["peer"],
-            src_block_ids=src_block_ids,
-            src_o_start=src_o_start,
-            dst_o_start=dst_o_start,
-            n_outer=effective_n_outer,
-            src_h0=frag["src_h0"],
-            dst_h0=frag["dst_h0"],
-            n_heads=frag["n_heads"],
-        )
-        for frag in fragments
-    ]
-
-
-# ---------------------------------------------------------------------------
-# PP re-sharding
-# ---------------------------------------------------------------------------
-
-
-def pp_reshard_plan(
-    pp_metas: List[Dict[str, Any]],
-    local: KvTopology,
-) -> List[Dict[str, Any]]:
-    """Compute outer-range fragments for heterogeneous-PP KV re-sharding.
-
-    Each element of ``pp_metas`` is a dict ``{"tp_metas": ..., "block_ids": [...]}``
-    produced by ``dynamic_engine._capture_handoff_meta`` when prefill PP > 1.
-    ``tp_metas`` is a single export_meta() dict (TP=1) or a list of such dicts (TP>1).
-
-    Outer indices map to layers via ``kv_factor`` (2 for K/V split, 1 for MLA).
-    For each prefill PP rank the overlapping layer range is computed; the outer-
-    index arithmetic converts that to byte-addressable slice indices.
-
-    Parameters
-    ----------
-    pp_metas:
-        List of per-prefill-PP-rank entries, as packed by ``_capture_handoff_meta``.
-    local:
-        Decode rank's topology (must have PP fields set).
-
-    Returns
-    -------
-    List of raw plan dicts::
-
-        {
-            "tp_metas":   list of export_meta() dicts for this prefill PP rank,
-            "block_ids":  src block ids on this prefill PP rank,
-            "src_o_start": first outer-index to read from the peer buffer,
-            "dst_o_start": first outer-index to write into the local buffer,
-            "n_outer":     number of consecutive outer slices,
-        }
-    """
-    if not local.pp_capable:
-        raise RuntimeError(
-            "KvTopology is not PP-capable (pp_rank/layer_start/layer_end/num_outer "
-            "missing). Build the decode agent with pp_rank, layer_start, layer_end."
-        )
-    local_kv_factor = local.kv_factor
-    plan: List[Dict[str, Any]] = []
-    total_n_outer = 0
-
-    for entry in pp_metas:
-        raw_tp = entry.get("tp_metas", entry)
-        tp_metas = raw_tp if isinstance(raw_tp, list) else [raw_tp]
-        ref = tp_metas[0]
-        p_lo = ref.get("layer_start")
-        p_hi = ref.get("layer_end")
-        if p_lo is None or p_hi is None:
-            raise ValueError(
-                "pp_metas entry is missing layer_start/layer_end in its tp_metas; "
-                "prefill engine must be built with pp_rank/layer_start/layer_end."
-            )
-        lo = max(local.layer_start, p_lo)  # type: ignore[type-var]
-        hi = min(local.layer_end, p_hi)    # type: ignore[type-var]
-        if hi <= lo:
-            continue
-
-        p_num_outer = ref["num_outer"]
-        p_n_layers = p_hi - p_lo
-        if p_n_layers <= 0:
-            raise ValueError(f"PP meta has zero-length layer range [{p_lo}, {p_hi})")
-        p_kv_factor, rem = divmod(p_num_outer, p_n_layers)
-        if rem != 0:
-            raise ValueError(
-                f"PP meta num_outer={p_num_outer} is not divisible by layer count "
-                f"{p_n_layers}; unexpected KV buffer layout."
-            )
-        if p_kv_factor != local_kv_factor:
-            raise ValueError(
-                f"kv_factor mismatch peer={p_kv_factor} local={local_kv_factor} "
-                "(K/V-split vs MLA layout mismatch between prefill and decode)."
-            )
-        n_outer = p_kv_factor * (hi - lo)
-        plan.append(
-            {
-                "tp_metas": tp_metas,
-                "block_ids": entry.get("block_ids", []),
-                "src_o_start": p_kv_factor * (lo - p_lo),
-                "dst_o_start": local_kv_factor * (lo - local.layer_start),  # type: ignore[operator]
-                "n_outer": n_outer,
-            }
-        )
-        total_n_outer += n_outer
-
-    if total_n_outer != local.num_outer:
-        raise ValueError(
-            f"PP reshard plan covers {total_n_outer} of {local.num_outer} local outer "
-            f"slices (decode layers [{local.layer_start}, {local.layer_end})). Ensure "
-            "all prefill PP ranks shipped layer_start/layer_end in their tp_metas."
-        )
-    return plan
-
-
-def _pp_to_segments(
-    pp_metas: List[Dict[str, Any]],
-    local: KvTopology,
-) -> List[TransferSegment]:
-    """Convert PP plan dicts into TransferSegments (including per-PP TP plans)."""
-    raw_plan = pp_reshard_plan(pp_metas, local)
-    segments: List[TransferSegment] = []
-    for item in raw_plan:
-        tp_metas = item["tp_metas"]
-        tp_segs = _tp_to_segments(
-            tp_metas,
-            item["block_ids"],
-            local,
-            check_outer=False,
-            src_o_start=item["src_o_start"],
-            dst_o_start=item["dst_o_start"],
-            n_outer=item["n_outer"],
-        )
-        segments.extend(tp_segs)
-    return segments
-
-
-# ---------------------------------------------------------------------------
-# EP re-sharding (future)
-# ---------------------------------------------------------------------------
-
-
-def ep_reshard_plan(
-    ep_metas: List[Dict[str, Any]],
-    local: KvTopology,
-) -> List[Dict[str, Any]]:
-    """Placeholder for expert-parallelism KV re-sharding.
-
-    EP shards MoE expert slots across ranks; the KV buffer layout for MoE
-    models differs from dense models (expert dim replaces or extends the head
-    dim). Implement here when needed; wire into ``build_reshard_plan`` analogously
-    to PP/TP.
-    """
-    raise NotImplementedError(
-        "EP KV re-sharding is not yet implemented. Add ep_reshard_plan logic here "
-        "and extend build_reshard_plan to dispatch on ep_metas."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-
-def _has_tp_topology(peer_meta: Dict[str, Any]) -> bool:
-    """True iff the peer shipped TP topology fields (tp_size, tp_rank, ...)."""
-    return peer_meta.get("tp_size") is not None
-
-
-# ---------------------------------------------------------------------------
-# Transport-neutral rank-layout planner
-# ---------------------------------------------------------------------------
+__all__ = [
+    "KVReshardTransfer",
+    "KVShardLayout",
+    "KVBufferGeometry",
+    "TransferSegment",
+    "build_reshard_plan",
+    "plan_kv_reshard",
+    "transfers_for_dst",
+    "transfers_for_src",
+]
 
 
 @dataclass(frozen=True)
@@ -561,7 +63,9 @@ class KVShardLayout:
     def __post_init__(self) -> None:
         # TP must divide heads (the head split is always even).
         if self.num_heads % self.tp_size != 0:
-            raise ValueError(f"num_heads={self.num_heads} not divisible by tp_size={self.tp_size}")
+            raise ValueError(
+                f"num_heads={self.num_heads} not divisible by tp_size={self.tp_size}"
+            )
         # layer_start and num_local_layers are an all-or-nothing explicit window:
         # setting only one would silently fall back to the even-split count and
         # defeat the purpose (uneven stage with an even count).
@@ -580,10 +84,12 @@ class KVShardLayout:
     def kv_shard_key(self) -> Tuple[int, int]:
         """The attention shard this rank holds: ``(tp_rank, pp_rank)``.
         Ranks sharing a key hold identical KV (EP/ETP replicas of it)."""
+
         return (self.tp_rank, self.pp_rank)
 
     def layer_range(self) -> Tuple[int, int]:
         """Global attention-layer range ``[lo, hi)`` owned by this rank."""
+
         # num_local_layers is guaranteed set whenever layer_start is (see __post_init__).
         if self.layer_start is not None:
             return (self.layer_start, self.layer_start + self.num_local_layers)
@@ -592,18 +98,56 @@ class KVShardLayout:
 
     def head_range(self) -> Tuple[int, int]:
         """Global KV-head range ``[lo, hi)`` owned by this rank."""
+
         per = self.num_heads // self.tp_size
         return (self.tp_rank * per, (self.tp_rank + 1) * per)
 
     def local_num_layers(self) -> int:
         """Number of attention layers held locally by this rank."""
+
         lo, hi = self.layer_range()
         return hi - lo
 
     def local_num_heads(self) -> int:
         """Number of KV heads held locally by this rank."""
+
         lo, hi = self.head_range()
         return hi - lo
+
+    def to_meta(self) -> Dict[str, int]:
+        """Serialize this layout into transfer metadata."""
+
+        layer_start, layer_end = self.layer_range()
+        return {
+            "global_rank": self.global_rank,
+            "tp_size": self.tp_size,
+            "tp_rank": self.tp_rank,
+            "pp_size": self.pp_size,
+            "pp_rank": self.pp_rank,
+            "num_layers_global": self.num_layers,
+            "num_kv_heads_global": self.num_heads,
+            "layer_start": layer_start,
+            "layer_end": layer_end,
+        }
+
+    @classmethod
+    def from_meta(cls, meta: Dict[str, Any]) -> "KVShardLayout":
+        """Deserialize a layout exported by :meth:`to_meta`."""
+
+        missing = [key for key in _LAYOUT_META_KEYS if meta.get(key) is None]
+        if missing:
+            raise ValueError(f"peer metadata missing KV layout fields: {missing}")
+        return cls(
+            num_layers=int(meta["num_layers_global"]),
+            num_heads=int(meta["num_kv_heads_global"]),
+            tp_size=int(meta["tp_size"]),
+            tp_rank=int(meta["tp_rank"]),
+            pp_size=int(meta["pp_size"]),
+            pp_rank=int(meta["pp_rank"]),
+            global_rank=int(meta["global_rank"]),
+            layer_start=int(meta["layer_start"]),
+            num_local_layers=int(meta["layer_end"]) - int(meta["layer_start"]),
+        )
 
 
 @dataclass(frozen=True)
@@ -625,24 +169,16 @@ class KVReshardTransfer:
     global_head_lo: int
     global_head_hi: int
 
-    def src_layer_slice(self, src: KVShardLayout) -> slice:
-        """Local layer slice on the source side for this transfer."""
-        off = src.layer_range()[0]
+    def layer_slice(self, layout: KVShardLayout) -> slice:
+        """Local layer slice for this transfer in ``layout``."""
+
+        off = layout.layer_range()[0]
         return slice(self.global_layer_lo - off, self.global_layer_hi - off)
 
-    def src_head_slice(self, src: KVShardLayout) -> slice:
-        """Local KV-head slice on the source side for this transfer."""
-        off = src.head_range()[0]
-        return slice(self.global_head_lo - off, self.global_head_hi - off)
+    def head_slice(self, layout: KVShardLayout) -> slice:
+        """Local KV-head slice for this transfer in ``layout``."""
 
-    def dst_layer_slice(self, dst: KVShardLayout) -> slice:
-        """Local layer slice on the destination side for this transfer."""
-        off = dst.layer_range()[0]
-        return slice(self.global_layer_lo - off, self.global_layer_hi - off)
-
-    def dst_head_slice(self, dst: KVShardLayout) -> slice:
-        """Local KV-head slice on the destination side for this transfer."""
-        off = dst.head_range()[0]
+        off = layout.head_range()[0]
         return slice(self.global_head_lo - off, self.global_head_hi - off)
 
 
@@ -661,17 +197,17 @@ def plan_kv_reshard(
     how EP/ETP map onto ranks.
     """
     if srcs and dsts:
-        if srcs[0].num_layers != dsts[0].num_layers or srcs[0].num_heads != dsts[0].num_heads:
+        if (
+            srcs[0].num_layers != dsts[0].num_layers
+            or srcs[0].num_heads != dsts[0].num_heads
+        ):
             raise ValueError("src and dst describe different global models")
 
     # One representative source rank per attention shard (dedupe EP/ETP
     # replicas that hold identical KV).
-    rep_rank: dict = {}
-    for s in srcs:
-        key = s.kv_shard_key()
-        if key not in rep_rank or s.global_rank < rep_rank[key]:
-            rep_rank[key] = s.global_rank
-    source_ranks = set(rep_rank.values())
+    source_ranks = representative_source_ranks(
+        srcs, lambda layout: layout.kv_shard_key()
+    )
 
     transfers: List[KVReshardTransfer] = []
     for d in dsts:
@@ -696,3 +232,273 @@ def plan_kv_reshard(
                 )
             )
     return transfers
+
+
+@dataclass(frozen=True)
+class KVBufferGeometry:
+    """Physical paged-KV geometry needed to realize a logical reshard plan."""
+
+    num_outer: int
+    bytes_per_slice: int
+    blocks_axis: int
+    num_blocks: int
+    heads_per_partition: Optional[int] = None
+    head_dim: Optional[int] = None
+    tokens_per_block: Optional[int] = None
+    element_size: Optional[int] = None
+
+    @classmethod
+    def from_meta(cls, meta: Dict[str, Any]) -> "KVBufferGeometry":
+        return cls(
+            num_outer=int(meta["num_outer"]),
+            bytes_per_slice=int(meta["bytes_per_slice"]),
+            blocks_axis=int(meta["blocks_axis"]),
+            num_blocks=int(meta["num_blocks"]),
+            heads_per_partition=meta.get("heads_per_partition"),
+            head_dim=meta.get("head_dim"),
+            tokens_per_block=meta.get("tokens_per_block"),
+            element_size=meta.get("element_size"),
+        )
+
+    def to_meta(self) -> Dict[str, Any]:
+        """Serialize physical geometry into transfer metadata."""
+
+        return {
+            "num_outer": self.num_outer,
+            "bytes_per_slice": self.bytes_per_slice,
+            "blocks_axis": self.blocks_axis,
+            "num_blocks": self.num_blocks,
+            "heads_per_partition": self.heads_per_partition,
+            "head_dim": self.head_dim,
+            "tokens_per_block": self.tokens_per_block,
+            "element_size": self.element_size,
+        }
+
+    def validate_transfer_from(
+        self,
+        peer: "KVBufferGeometry",
+        src_block_ids: List[int],
+        dst_block_ids: List[int],
+        *,
+        peer_name: Optional[str] = None,
+        require_matched_layout: bool = False,
+    ) -> None:
+        """Validate block mappings and physical transfer compatibility."""
+
+        if len(src_block_ids) != len(dst_block_ids):
+            source = f" for peer {peer_name!r}" if peer_name is not None else ""
+            raise ValueError(
+                f"source/destination block_id length mismatch{source}: "
+                f"{len(src_block_ids)} vs {len(dst_block_ids)}"
+            )
+        peer._validate_block_ids(src_block_ids, "source")
+        self._validate_block_ids(dst_block_ids, "destination")
+
+        common_fields = ("head_dim", "tokens_per_block", "element_size")
+        matched_fields = (
+            "num_outer",
+            "bytes_per_slice",
+            "blocks_axis",
+            "heads_per_partition",
+        )
+        fields = (
+            common_fields + matched_fields if require_matched_layout else common_fields
+        )
+        mismatches = [
+            f"{field}: peer={getattr(peer, field)} local={getattr(self, field)}"
+            for field in fields
+            if getattr(peer, field) is not None
+            and getattr(self, field) is not None
+            and getattr(peer, field) != getattr(self, field)
+        ]
+        if mismatches:
+            kind = "matched-layout" if require_matched_layout else "transfer"
+            raise ValueError(f"{kind} geometry mismatch: {', '.join(mismatches)}")
+
+    def _validate_block_ids(self, block_ids: List[int], side: str) -> None:
+        for block in block_ids:
+            if not 0 <= block < self.num_blocks:
+                raise ValueError(
+                    f"{side} block {block} is outside pool [0, {self.num_blocks})"
+                )
+
+
+@dataclass(frozen=True)
+class TransferSegment:
+    """One physical block/layer/head segment produced from a logical transfer."""
+
+    peer_meta: Dict[str, Any]
+    src_block_ids: List[int]
+    src_o_start: int
+    dst_o_start: int
+    n_outer: int
+    src_h0: int = 0
+    dst_h0: int = 0
+    n_heads: int = 0
+
+
+@dataclass(frozen=True)
+class _PeerRecord:
+    meta: Dict[str, Any]
+    block_ids: List[int]
+    layout: KVShardLayout
+    geometry: KVBufferGeometry
+
+
+_LAYOUT_META_KEYS = (
+    "global_rank",
+    "tp_size",
+    "tp_rank",
+    "pp_size",
+    "pp_rank",
+    "num_layers_global",
+    "num_kv_heads_global",
+    "layer_start",
+    "layer_end",
+)
+
+
+def _validate_peer_layout(
+    peer: _PeerRecord,
+    local: KVBufferGeometry,
+    dst_block_ids: List[int],
+) -> None:
+    local.validate_transfer_from(
+        peer.geometry,
+        peer.block_ids,
+        dst_block_ids,
+        peer_name=peer.meta.get("agent_name"),
+    )
+    if peer.geometry.heads_per_partition != peer.layout.local_num_heads():
+        raise ValueError(
+            "peer heads_per_partition does not match its KV layout: "
+            f"{peer.geometry.heads_per_partition} vs {peer.layout.local_num_heads()}"
+        )
+    if peer.geometry.num_outer % peer.layout.local_num_layers():
+        raise ValueError(
+            f"peer num_outer={peer.geometry.num_outer} is not divisible by "
+            f"local layers={peer.layout.local_num_layers()}"
+        )
+
+
+def build_reshard_plan(
+    peer_meta: Any,
+    src_block_ids: List[int],
+    dst_block_ids: List[int],
+    local_layout: Optional[KVShardLayout],
+    local_geometry: KVBufferGeometry,
+) -> List[TransferSegment]:
+    """Build physical transfer segments using :func:`plan_kv_reshard` slices."""
+
+    raw_records = transfer_peer_records(peer_meta, src_block_ids)
+    if not raw_records:
+        raise ValueError("KV handoff contains no source peer metadata")
+
+    have_layout = [
+        all(meta.get(key) is not None for key in _LAYOUT_META_KEYS)
+        for meta, _ in raw_records
+    ]
+    if not all(have_layout):
+        raise ValueError("KV resharding requires complete KV layout metadata")
+
+    if local_layout is None:
+        raise ValueError("local transfer agent is missing KV layout metadata")
+    if local_geometry.num_outer % local_layout.local_num_layers():
+        raise ValueError(
+            f"local num_outer={local_geometry.num_outer} is not divisible by "
+            f"local layers={local_layout.local_num_layers()}"
+        )
+
+    sources: List[_PeerRecord] = []
+    source_by_rank: Dict[int, _PeerRecord] = {}
+    for meta, blocks in raw_records:
+        source = _PeerRecord(
+            meta=meta,
+            block_ids=blocks,
+            layout=KVShardLayout.from_meta(meta),
+            geometry=KVBufferGeometry.from_meta(meta),
+        )
+        _validate_peer_layout(source, local_geometry, dst_block_ids)
+        if source.layout.global_rank in source_by_rank:
+            raise ValueError(
+                f"duplicate source global_rank={source.layout.global_rank} in KV metadata"
+            )
+        sources.append(source)
+        source_by_rank[source.layout.global_rank] = source
+
+    local_planes = local_geometry.num_outer // local_layout.local_num_layers()
+    logical_plan = plan_kv_reshard(
+        [source.layout for source in sources], [local_layout]
+    )
+    segments: List[TransferSegment] = []
+    for transfer in logical_plan:
+        source = source_by_rank[transfer.src_rank]
+        src_layout = source.layout
+        src_planes = source.geometry.num_outer // src_layout.local_num_layers()
+        if src_planes != local_planes:
+            raise ValueError(
+                f"outer-plane mismatch peer={src_planes} local={local_planes}"
+            )
+
+        src_layers = transfer.layer_slice(src_layout)
+        dst_layers = transfer.layer_slice(local_layout)
+        src_heads = transfer.head_slice(src_layout)
+        dst_heads = transfer.head_slice(local_layout)
+        assert src_layers.start is not None and src_layers.stop is not None
+        assert dst_layers.start is not None and dst_layers.stop is not None
+        assert src_heads.start is not None and src_heads.stop is not None
+        assert dst_heads.start is not None and dst_heads.stop is not None
+        layer_count = src_layers.stop - src_layers.start
+        head_count = src_heads.stop - src_heads.start
+        full_heads = (
+            src_heads.start == 0
+            and src_heads.stop == src_layout.local_num_heads()
+            and dst_heads.start == 0
+            and dst_heads.stop == local_layout.local_num_heads()
+            and source.geometry.bytes_per_slice == local_geometry.bytes_per_slice
+        )
+        full_layers = (
+            src_layers.start == 0
+            and src_layers.stop == src_layout.local_num_layers()
+            and dst_layers.start == 0
+            and dst_layers.stop == local_layout.local_num_layers()
+        )
+        if not full_heads and (
+            local_geometry.blocks_axis != 2 or source.geometry.blocks_axis != 2
+        ):
+            raise NotImplementedError(
+                "heterogeneous TP KV handoff requires the K/V-split "
+                "[2, L, B, T, H, d] layout; MLA head slicing is unsupported"
+            )
+        if full_heads and full_layers:
+            segments.append(
+                TransferSegment(
+                    peer_meta=source.meta,
+                    src_block_ids=source.block_ids,
+                    src_o_start=0,
+                    dst_o_start=0,
+                    n_outer=local_geometry.num_outer,
+                )
+            )
+            continue
+
+        # [2, L, B, ...] stores all K layers followed by all V layers, so a
+        # partial layer range requires one segment per outer plane.
+        for plane in range(local_planes):
+            segments.append(
+                TransferSegment(
+                    peer_meta=source.meta,
+                    src_block_ids=source.block_ids,
+                    src_o_start=(
+                        plane * src_layout.local_num_layers() + src_layers.start
+                    ),
+                    dst_o_start=(
+                        plane * local_layout.local_num_layers() + dst_layers.start
+                    ),
+                    n_outer=layer_count,
+                    src_h0=0 if full_heads else src_heads.start,
+                    dst_h0=0 if full_heads else dst_heads.start,
+                    n_heads=0 if full_heads else head_count,
+                )
+            )
+    return segments

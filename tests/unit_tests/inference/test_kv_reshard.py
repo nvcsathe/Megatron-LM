@@ -79,8 +79,10 @@ def _run_reshard(src_layouts, dst_layouts):
             transfer for transfer in plan if transfer.dst_rank == d.global_rank
         ):
             s = by_rank[t.src_rank]
-            block = src_buf[t.src_rank][:, :, t.src_layer_slice(s), :, t.src_head_slice(s), :]
-            dst[:, :, t.dst_layer_slice(d), :, t.dst_head_slice(d), :] = block
+            block = src_buf[t.src_rank][
+                :, :, t.layer_slice(s), :, t.head_slice(s), :
+            ]
+            dst[:, :, t.layer_slice(d), :, t.head_slice(d), :] = block
         out[d.global_rank] = dst
     return g, out
 

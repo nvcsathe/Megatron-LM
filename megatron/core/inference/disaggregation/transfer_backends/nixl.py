@@ -17,16 +17,22 @@ import base64
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
 import torch
 
 from megatron.core.inference.disaggregation.kv_reshard import (
-    KvTopology,
+    KVBufferGeometry,
+    KVShardLayout,
     TransferSegment,
     build_reshard_plan,
 )
+from megatron.core.inference.disaggregation.mamba_reshard import (
+    MambaShardLayout,
+    build_mamba_reshard_plan,
+)
+from megatron.core.inference.disaggregation.utils import transfer_peer_records
 
 logger = logging.getLogger(__name__)
 
@@ -81,8 +87,7 @@ class NixlPullHandle:
             return True
         if time.perf_counter() - self.submitted_at > self.timeout_s:
             raise TimeoutError(
-                f"NIXL transfer timed out after {self.timeout_s}s; "
-                f"pending={pending}"
+                f"NIXL transfer timed out after {self.timeout_s}s; pending={pending}"
             )
         return False
 
@@ -112,9 +117,14 @@ class NixlTransferBackend:
         heads_per_partition: Optional[int] = None,
         head_dim: Optional[int] = None,
         tokens_per_block: Optional[int] = None,
+        global_rank: Optional[int] = None,
+        pp_size: Optional[int] = None,
         pp_rank: Optional[int] = None,
+        num_layers_global: Optional[int] = None,
         layer_start: Optional[int] = None,
         layer_end: Optional[int] = None,
+        mamba_layout: Optional[MambaShardLayout] = None,
+        mamba_state_kind: Optional[str] = None,
     ):
         if not _HAVE_NIXL:
             raise RuntimeError(
@@ -125,27 +135,31 @@ class NixlTransferBackend:
         self.agent_name = agent_name
         self._memory_buffer = memory_buffer
 
-        # TP topology enables heterogeneous-TP KV re-sharding. If incomplete,
-        # only matched layouts are supported.
-        self._tp_size = tp_size
-        self._tp_rank = tp_rank
-        self._num_kv_heads_global = num_kv_heads_global
-        self._heads_per_partition = heads_per_partition
-        self._head_dim = head_dim
-        self._tokens_per_block = tokens_per_block
-        self._reshard_capable = None not in (
-            tp_size,
-            tp_rank,
-            num_kv_heads_global,
-            heads_per_partition,
-            head_dim,
-            tokens_per_block,
-        )
-        # PP topology enables layer subsetting across heterogeneous PP layouts.
-        self._pp_rank = pp_rank
-        self._layer_start = layer_start
-        self._layer_end = layer_end
+        if (mamba_layout is None) != (mamba_state_kind is None):
+            raise ValueError(
+                "mamba_layout and mamba_state_kind must be provided together"
+            )
+        if mamba_state_kind not in (None, "conv", "ssm"):
+            raise ValueError("mamba_state_kind must be 'conv' or 'ssm'")
 
+        layout_capable = (
+            None
+            not in (
+                global_rank,
+                tp_size,
+                tp_rank,
+                pp_size,
+                pp_rank,
+                num_layers_global,
+                num_kv_heads_global,
+                heads_per_partition,
+                head_dim,
+                tokens_per_block,
+                layer_start,
+                layer_end,
+            )
+            and heads_per_partition * tp_size == num_kv_heads_global
+        )  # type: ignore[operator]
         # Locate the blocks axis by allocator size instead of layout position.
         # Current layouts are MLA [L, B, T, D] and K/V split [2, L, B, T, H, d].
         shape = list(memory_buffer.shape)
@@ -162,42 +176,62 @@ class NixlTransferBackend:
                 f"(expected_num_blocks={expected_num_blocks} matches multiple "
                 f"axes {candidates}). Caller must pass a more distinctive value."
             )
-        self._blocks_axis = candidates[0]
-        self._num_blocks = expected_num_blocks
+        blocks_axis = candidates[0]
         self._buf_ptr = memory_buffer.data_ptr()
-        self._buf_numel = memory_buffer.numel()
         self._element_size = memory_buffer.element_size()
-        self._device_id = (
-            memory_buffer.device.index if memory_buffer.is_cuda else 0
-        )
+        self._device_id = memory_buffer.device.index if memory_buffer.is_cuda else 0
 
         # Each (outer, block) pair is one contiguous slice. The outer stride
         # skips over the full block pool for that outer index.
         shape = list(memory_buffer.shape)
         elements_per_slice = 1
-        for dim in shape[self._blocks_axis + 1 :]:
+        for dim in shape[blocks_axis + 1 :]:
             elements_per_slice *= dim
-        self._bytes_per_slice = self._element_size * elements_per_slice
+        bytes_per_slice = self._element_size * elements_per_slice
         num_outer = 1
-        for dim in shape[: self._blocks_axis]:
+        for dim in shape[:blocks_axis]:
             num_outer *= dim
-        self._num_outer = num_outer
-        self._outer_stride_bytes = self._num_blocks * self._bytes_per_slice
-        self._per_block_bytes = self._num_outer * self._bytes_per_slice
-
-        # Snapshot used by the KV reshard planner at transfer time.
-        self._topology = KvTopology(
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-            num_kv_heads_global=num_kv_heads_global,
+        self._outer_stride_bytes = expected_num_blocks * bytes_per_slice
+        self._geometry = KVBufferGeometry(
+            num_outer=num_outer,
+            bytes_per_slice=bytes_per_slice,
+            blocks_axis=blocks_axis,
+            num_blocks=expected_num_blocks,
             heads_per_partition=heads_per_partition,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
-            pp_rank=pp_rank,
-            layer_start=layer_start,
-            layer_end=layer_end,
-            num_outer=self._num_outer,
+            element_size=self._element_size,
         )
+
+        # Canonical KV layout. Mamba agents carry their separate typed layout.
+        self._layout = None
+        if layout_capable:
+            self._layout = KVShardLayout(
+                num_layers=int(num_layers_global),
+                num_heads=int(num_kv_heads_global),
+                tp_size=int(tp_size),
+                tp_rank=int(tp_rank),
+                pp_size=int(pp_size),
+                pp_rank=int(pp_rank),
+                global_rank=int(global_rank),
+                layer_start=int(layer_start),
+                num_local_layers=int(layer_end) - int(layer_start),
+            )
+            if self._layout.local_num_heads() != heads_per_partition:
+                raise ValueError(
+                    "heads_per_partition does not match the canonical KV layout: "
+                    f"{heads_per_partition} vs {self._layout.local_num_heads()}"
+                )
+            if self._geometry.num_outer % self._layout.local_num_layers() != 0:
+                raise ValueError(
+                    f"num_outer={self._geometry.num_outer} is not divisible by local layers="
+                    f"{self._layout.local_num_layers()}"
+                )
+
+        if self._layout is not None and mamba_layout is not None:
+            raise ValueError("a transfer backend cannot have both KV and Mamba layouts")
+        self._mamba_layout = mamba_layout
+        self._mamba_state_kind = mamba_state_kind
 
         # Configure UCX before agent construction. Avoid TCP for VRAM addresses;
         # operators may override this by setting UCX_TLS before launch.
@@ -220,11 +254,11 @@ class NixlTransferBackend:
             "(blocks_axis=%d, %d outer-slices/block × %d bytes/slice = "
             "%d bytes/block, device=%d, shape=%s)",
             agent_name,
-            self._num_blocks,
-            self._blocks_axis,
-            self._num_outer,
-            self._bytes_per_slice,
-            self._per_block_bytes,
+            self._geometry.num_blocks,
+            self._geometry.blocks_axis,
+            self._geometry.num_outer,
+            self._geometry.bytes_per_slice,
+            self._geometry.num_outer * self._geometry.bytes_per_slice,
             self._device_id,
             shape,
         )
@@ -241,34 +275,14 @@ class NixlTransferBackend:
                 "ascii"
             ),
             "base_addr": self._buf_ptr,
-            "bytes_per_slice": self._bytes_per_slice,
-            "num_outer": self._num_outer,
             "outer_stride_bytes": self._outer_stride_bytes,
-            "num_blocks": self._num_blocks,
             "device_id": self._device_id,
-            "blocks_axis": self._blocks_axis,
         }
-        # TP topology is included only when heterogeneous-TP transfer is possible.
-        if self._reshard_capable:
-            meta.update(
-                {
-                    "tp_size": self._tp_size,
-                    "tp_rank": self._tp_rank,
-                    "num_kv_heads_global": self._num_kv_heads_global,
-                    "heads_per_partition": self._heads_per_partition,
-                    "head_dim": self._head_dim,
-                    "tokens_per_block": self._tokens_per_block,
-                }
-            )
-        # PP topology lets decode select the layer slices it owns.
-        if self._layer_start is not None and self._layer_end is not None:
-            meta.update(
-                {
-                    "pp_rank": self._pp_rank,
-                    "layer_start": self._layer_start,
-                    "layer_end": self._layer_end,
-                }
-            )
+        meta.update(self._geometry.to_meta())
+        if self._layout is not None:
+            meta.update(self._layout.to_meta())
+        if self._mamba_layout is not None:
+            meta["mamba_layout"] = asdict(self._mamba_layout)
         return meta
 
     def _ensure_peer_registered(self, peer_meta: Dict[str, Any]) -> str:
@@ -289,6 +303,33 @@ class NixlTransferBackend:
             "NixlTransferBackend[%s] registered peer %s", self.agent_name, peer_name
         )
         return resolved
+
+    def _matched_segments(
+        self, peer_meta: Any, src_block_ids: List[int], dst_block_ids: List[int]
+    ) -> List[TransferSegment]:
+        """Build a whole-buffer copy for state with no resharding policy."""
+
+        records = transfer_peer_records(peer_meta, src_block_ids)
+        if len(records) != 1:
+            raise ValueError("matched-layout transfer requires exactly one source peer")
+        meta, blocks = records[0]
+        peer_geometry = KVBufferGeometry.from_meta(meta)
+        self._geometry.validate_transfer_from(
+            peer_geometry,
+            blocks,
+            dst_block_ids,
+            peer_name=meta.get("agent_name"),
+            require_matched_layout=True,
+        )
+        return [
+            TransferSegment(
+                peer_meta=meta,
+                src_block_ids=blocks,
+                src_o_start=0,
+                dst_o_start=0,
+                n_outer=self._geometry.num_outer,
+            )
+        ]
 
     def pull_blocks(
         self,
@@ -315,12 +356,7 @@ class NixlTransferBackend:
     ) -> NixlPullHandle:
         """Submit a pull and return a handle that can be polled later."""
         if not isinstance(peer_meta, dict) or "pp_metas" not in peer_meta:
-            if len(src_block_ids) != len(dst_block_ids):
-                raise ValueError(
-                    f"src/dst block_id length mismatch: "
-                    f"{len(src_block_ids)} vs {len(dst_block_ids)}"
-                )
-            if not src_block_ids:
+            if not src_block_ids and not dst_block_ids:
                 return NixlPullHandle(
                     agent=self._agent,
                     xfers=[],
@@ -329,7 +365,25 @@ class NixlTransferBackend:
                     done=True,
                 )
 
-        segments = build_reshard_plan(peer_meta, src_block_ids, self._topology)
+        if self._mamba_layout is not None:
+            segments = build_mamba_reshard_plan(
+                peer_meta,
+                src_block_ids,
+                dst_block_ids,
+                self._mamba_layout,
+                self._geometry,
+                self._mamba_state_kind,
+            )
+        elif self._layout is not None:
+            segments = build_reshard_plan(
+                peer_meta,
+                src_block_ids,
+                dst_block_ids,
+                self._layout,
+                self._geometry,
+            )
+        else:
+            segments = self._matched_segments(peer_meta, src_block_ids, dst_block_ids)
         xfers: List[Any] = []
         contexts: List[str] = []
         for seg in segments:
@@ -343,7 +397,9 @@ class NixlTransferBackend:
             submitted_at=time.perf_counter(),
         )
 
-    def _begin_segment(self, seg: TransferSegment, dst_block_ids: List[int]) -> tuple[Any, str]:
+    def _begin_segment(
+        self, seg: TransferSegment, dst_block_ids: List[int]
+    ) -> tuple[Any, str]:
         """Submit one full-slice or head-fragment transfer segment."""
         pm = seg.peer_meta
         peer_base = pm["base_addr"]
@@ -356,7 +412,7 @@ class NixlTransferBackend:
         src_o_start = seg.src_o_start
         dst_o_start = seg.dst_o_start
         n_outer = seg.n_outer
-        bps = self._bytes_per_slice
+        bps = self._geometry.bytes_per_slice
         local_os = self._outer_stride_bytes
 
         src_tuples: List[Any] = []
@@ -369,10 +425,18 @@ class NixlTransferBackend:
                     src_o = src_o_start + i
                     dst_o = dst_o_start + i
                     src_tuples.append(
-                        (peer_base + src_o * peer_os + src_b * peer_bps, peer_bps, peer_device_id)
+                        (
+                            peer_base + src_o * peer_os + src_b * peer_bps,
+                            peer_bps,
+                            peer_device_id,
+                        )
                     )
                     dst_tuples.append(
-                        (self._buf_ptr + dst_o * local_os + dst_b * bps, bps, self._device_id)
+                        (
+                            self._buf_ptr + dst_o * local_os + dst_b * bps,
+                            bps,
+                            self._device_id,
+                        )
                     )
             ctx = (
                 f"matched peer={peer_id} outer[{src_o_start}:+{n_outer}] "
@@ -380,11 +444,13 @@ class NixlTransferBackend:
             )
         else:
             # Head sub-range copy: one descriptor per token.
-            topo = self._topology
-            d_bytes = topo.head_dim * self._element_size  # type: ignore[operator]
-            local_token_stride = topo.heads_per_partition * d_bytes  # type: ignore[operator]
+            assert self._geometry.head_dim is not None
+            assert self._geometry.heads_per_partition is not None
+            assert self._geometry.tokens_per_block is not None
+            d_bytes = self._geometry.head_dim * self._element_size
+            local_token_stride = self._geometry.heads_per_partition * d_bytes
             peer_token_stride = pm["heads_per_partition"] * d_bytes
-            T = topo.tokens_per_block
+            T = self._geometry.tokens_per_block
             frag_bytes = seg.n_heads * d_bytes
             src_h_off = seg.src_h0 * d_bytes
             dst_h_off = seg.dst_h0 * d_bytes
@@ -393,14 +459,26 @@ class NixlTransferBackend:
                 for i in range(n_outer):
                     src_o = src_o_start + i
                     dst_o = dst_o_start + i
-                    src_slice = peer_base + src_o * peer_os + src_b * peer_bps + src_h_off
-                    dst_slice = self._buf_ptr + dst_o * local_os + dst_b * bps + dst_h_off
+                    src_slice = (
+                        peer_base + src_o * peer_os + src_b * peer_bps + src_h_off
+                    )
+                    dst_slice = (
+                        self._buf_ptr + dst_o * local_os + dst_b * bps + dst_h_off
+                    )
                     for t in range(T):
                         src_tuples.append(
-                            (src_slice + t * peer_token_stride, frag_bytes, peer_device_id)
+                            (
+                                src_slice + t * peer_token_stride,
+                                frag_bytes,
+                                peer_device_id,
+                            )
                         )
                         dst_tuples.append(
-                            (dst_slice + t * local_token_stride, frag_bytes, self._device_id)
+                            (
+                                dst_slice + t * local_token_stride,
+                                frag_bytes,
+                                self._device_id,
+                            )
                         )
             ctx = (
                 f"reshard peer={peer_id} outer[{src_o_start}:+{n_outer}] "
@@ -422,46 +500,6 @@ class NixlTransferBackend:
         except Exception:  # noqa: BLE001 - shutdown path
             logger.exception("NixlTransferBackend: deregister_memory failed")
         self._agent = None
-
-
-def make_agent(
-    role: str,
-    rank: int,
-    listen_addr: Optional[str],  # accepted but unused; NIXL does its own discovery
-    memory_buffer: torch.Tensor,
-    expected_num_blocks: int,
-    tp_size: Optional[int] = None,
-    tp_rank: Optional[int] = None,
-    num_kv_heads_global: Optional[int] = None,
-    heads_per_partition: Optional[int] = None,
-    head_dim: Optional[int] = None,
-    tokens_per_block: Optional[int] = None,
-    pp_rank: Optional[int] = None,
-    layer_start: Optional[int] = None,
-    layer_end: Optional[int] = None,
-) -> Optional[NixlTransferBackend]:
-    """Construct an agent, or return None when KV transfer is disabled.
-
-    ``listen_addr`` is kept for launcher compatibility; NIXL uses metadata-based
-    peer discovery. TP/PP arguments enable heterogeneous parallelism transfer.
-    """
-    if not listen_addr:
-        return None
-    agent_name = f"{role}-rank{rank}"
-    return NixlTransferBackend(
-        agent_name,
-        memory_buffer,
-        expected_num_blocks,
-        tp_size=tp_size,
-        tp_rank=tp_rank,
-        num_kv_heads_global=num_kv_heads_global,
-        heads_per_partition=heads_per_partition,
-        head_dim=head_dim,
-        tokens_per_block=tokens_per_block,
-        pp_rank=pp_rank,
-        layer_start=layer_start,
-        layer_end=layer_end,
-    )
 
 
 # Backward-compatible name for callers/tests that still import the old agent.
