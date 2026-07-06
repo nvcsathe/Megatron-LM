@@ -21,6 +21,7 @@ KV_BLOCK_SIZE="${KV_BLOCK_SIZE:-256}"
 MAMBA_GB="${MAMBA_GB:-4.0}"
 PREFIX_CACHE="${PREFIX_CACHE:-1}"
 PREFIX_CACHE_EVICTION_POLICY="${PREFIX_CACHE_EVICTION_POLICY:-lru}"
+ROUTER_KV_OVERLAP_SCORE="${ROUTER_KV_OVERLAP_SCORE:-10}"
 CUDA_GRAPH_IMPL="${CUDA_GRAPH_IMPL:-none}"
 if [[ "$CUDA_GRAPH_IMPL" != "none" && "$CUDA_GRAPH_IMPL" != "local" ]]; then
     echo "CUDA_GRAPH_IMPL must be none or local, got $CUDA_GRAPH_IMPL" >&2
@@ -248,12 +249,25 @@ if (( NODE_RANK == 0 )); then
     if [[ "$TEST_MODE" == "baseline" ]]; then
         FRONTEND_ARGS+=(--router-mode round-robin)
     else
+        frontend_help="$(python -m dynamo.frontend --help 2>&1)" || {
+            echo "$frontend_help" >&2
+            exit 1
+        }
+        if [[ "$frontend_help" == *"--router-kv-overlap-score-weight"* ]]; then
+            overlap_score_flag="--router-kv-overlap-score-weight"
+        elif [[ "$frontend_help" == *"--router-kv-overlap-score-credit"* ]]; then
+            overlap_score_flag="--router-kv-overlap-score-credit"
+        else
+            echo "Dynamo frontend does not expose a KV overlap score option" >&2
+            exit 1
+        fi
         FRONTEND_ARGS+=(
             --router-mode kv
             --router-kv-events
             --router-temperature 0
-            --router-kv-overlap-score-credit 1
+            "$overlap_score_flag" "$ROUTER_KV_OVERLAP_SCORE"
         )
+        log "using $overlap_score_flag=$ROUTER_KV_OVERLAP_SCORE"
     fi
     log "starting $TEST_MODE frontend"
     python -m dynamo.frontend "${FRONTEND_ARGS[@]}" > "$frontend_log" 2>&1 &

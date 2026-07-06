@@ -564,36 +564,109 @@ def workload_summary(
     }
 
 
-def run_routing(args: argparse.Namespace) -> None:
-    """Warm each family, then verify event-driven KV routing affinity."""
-    workers = wait_for_workers(args.worker_dir, args.expected_workers)
-    dataset = generate_dataset(args)
-    all_records = execute_turns(args, dataset, args.event_settle_seconds)
-    warm_records = [record for record in all_records if record["turn"] == 0]
-    measured_records = [record for record in all_records if record["turn"] > 0]
+def routing_affinity(
+    warm_records: list[dict[str, Any]], measured_records: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Measure routing to the warm worker and to any previously caching worker."""
     warm_worker = {int(record["family"]): record["worker_id"] for record in warm_records}
     if any(worker is None for worker in warm_worker.values()):
         raise AssertionError("routing warm-up responses did not include worker IDs")
 
-    matches = sum(record["worker_id"] == warm_worker[int(record["family"])] for record in measured_records)
-    affinity = matches / len(measured_records) if measured_records else 1.0
-    if affinity < args.min_affinity:
-        raise AssertionError(f"prefix-family affinity {affinity:.4f} is below {args.min_affinity:.4f}")
+    known_workers = {family: {worker} for family, worker in warm_worker.items()}
+    warm_matches = 0
+    known_cache_matches = 0
+    cold_spills: list[dict[str, Any]] = []
+    for record in sorted(
+        measured_records, key=lambda item: (int(item["turn"]), int(item["request_index"]))
+    ):
+        family = int(record["family"])
+        worker = record["worker_id"]
+        if worker is None:
+            raise AssertionError(f"routing response did not include a worker ID: {record}")
+        warm_matches += worker == warm_worker[family]
+        if worker in known_workers[family]:
+            known_cache_matches += 1
+        else:
+            cold_spills.append(
+                {
+                    "request_index": record["request_index"],
+                    "family": family,
+                    "turn": record["turn"],
+                    "worker_id": worker,
+                }
+            )
+        known_workers[family].add(worker)
+
+    count = len(measured_records)
+    return {
+        "warm_worker_affinity": warm_matches / count if count else 1.0,
+        "known_cache_affinity": known_cache_matches / count if count else 1.0,
+        "cold_spills": cold_spills,
+        "known_workers_by_family": {
+            str(family): sorted(workers) for family, workers in sorted(known_workers.items())
+        },
+    }
+
+
+def run_routing(args: argparse.Namespace) -> None:
+    """Warm each family, then verify event-driven routing to cached workers."""
+    workers = wait_for_workers(args.worker_dir, args.expected_workers)
+    dataset = generate_dataset(args)
+    warm_inputs = [record for record in dataset if int(record["turn"]) == 0]
+    measured_inputs = [record for record in dataset if int(record["turn"]) > 0]
+    warm_records = execute_records(args, warm_inputs)
+    time.sleep(args.event_settle_seconds)
+    cache_after_warmup = cache_counters(args.log_dir)
+    measured_records = execute_turns(args, measured_inputs, args.turn_settle_seconds)
+    all_records = sorted(warm_records + measured_records, key=lambda record: record["request_index"])
 
     time.sleep(args.log_settle_seconds)
     metrics = http_text(f"{args.url}/metrics")
+    final_cache = cache_counters(args.log_dir)
+    measured_cache_delta = cache_counter_deltas(cache_after_warmup, final_cache)
+    measured_hit_rate = (
+        measured_cache_delta["hits"] / len(measured_records) if measured_records else 1.0
+    )
+    affinity = routing_affinity(warm_records, measured_records)
     bad = {
         f"{event_type}:{status}": value
         for (event_type, status), value in event_counters(metrics).items()
         if status in BAD_EVENT_STATUSES and value > 0
     }
-    if bad:
-        raise AssertionError(f"router indexer reported invalid events: {bad}")
     warnings = {key: value for key, value in event_warning_counters(metrics).items() if value}
-    if warnings:
-        raise AssertionError(f"router indexer reported suspicious events: {warnings}")
 
     append_jsonl(args.run_dir / "records.jsonl", all_records)
+    diagnostics = {
+        "workers": workers,
+        "warm_requests": len(warm_records),
+        "measured_requests": len(measured_records),
+        "minimum_affinity": args.min_affinity,
+        **affinity,
+        "cache_counters_after_warmup": cache_after_warmup,
+        "cache_counters_final": final_cache,
+        "measured_cache_counter_delta": measured_cache_delta,
+        "measured_actual_request_hit_rate": measured_hit_rate,
+        "event_counters": serialize_event_counters(event_counters(metrics)),
+        "event_warning_counters": warnings,
+        "invalid_event_counters": bad,
+    }
+    write_json(args.run_dir / "routing-diagnostics.json", diagnostics)
+
+    if bad:
+        raise AssertionError(f"router indexer reported invalid events: {bad}")
+    if warnings:
+        raise AssertionError(f"router indexer reported suspicious events: {warnings}")
+    if affinity["known_cache_affinity"] < args.min_affinity:
+        raise AssertionError(
+            f"known-cache affinity {affinity['known_cache_affinity']:.4f} is below "
+            f"{args.min_affinity:.4f}; cold spills={len(affinity['cold_spills'])}"
+        )
+    if measured_hit_rate < args.min_affinity:
+        raise AssertionError(
+            f"actual post-warmup cache-hit rate {measured_hit_rate:.4f} is below "
+            f"{args.min_affinity:.4f}"
+        )
+
     summary = workload_summary(args, all_records, metrics)
     summary.update(
         {
@@ -601,7 +674,12 @@ def run_routing(args: argparse.Namespace) -> None:
             "workers": workers,
             "families": args.families,
             "turns": args.turns,
-            "post_warmup_affinity": affinity,
+            "warm_worker_affinity": affinity["warm_worker_affinity"],
+            "known_cache_affinity": affinity["known_cache_affinity"],
+            "cold_spills": len(affinity["cold_spills"]),
+            "cache_counters_after_warmup": cache_after_warmup,
+            "measured_cache_counter_delta": measured_cache_delta,
+            "measured_actual_request_hit_rate": measured_hit_rate,
             "minimum_affinity": args.min_affinity,
             "result": "PASS",
         }

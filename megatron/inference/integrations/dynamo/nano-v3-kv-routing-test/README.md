@@ -90,10 +90,11 @@ released and therefore cannot validate sequential cache reuse.
 - Warms one request from each prefix family.
 - Waits for KV events to settle, then replays later turns concurrently.
 - Records Dynamo worker IDs and router timing metadata for every request.
-- Requires the configured minimum affinity between each prefix family and its
-  warm-up worker.
-- Reports both Dynamo's predicted hit rate and Megatron's actual cumulative
-  prefix-cache block matches.
+- Requires the configured minimum affinity to a worker that previously cached
+  the family; affinity to the original warm-up worker remains informational
+  because a family may legitimately become replicated.
+- Requires the same minimum post-warmup cache-hit rate from Megatron's actual
+  cache counters and reports Dynamo's predicted hit rate separately.
 
 ### `launch-baseline.sh`
 
@@ -120,6 +121,7 @@ prefill/decode architecture comparison.
 | `INFER_MAX_REQUESTS` | `16` | Request slots; bounds Mamba extraction scratch |
 | `MAMBA_GB` | `4.0` | Mamba prefix-cache budget |
 | `PREFIX_CACHE_EVICTION_POLICY` | `lru` | Retain completed-request blocks for sequential reuse |
+| `ROUTER_KV_OVERLAP_SCORE` | `10` | Strong KV-overlap bias for deterministic routing validation |
 | `CUDA_GRAPH_IMPL` | `none` | Set to `local` to opt into CUDA-graph warmup |
 | `PREFIX_FAMILIES` | `32` | Shared-prefix families in the routing dataset |
 | `TURNS_PER_FAMILY` | `8` | Growing requests per family |
@@ -127,7 +129,7 @@ prefill/decode architecture comparison.
 | `ROUTING_CONCURRENCY` | `4` | Concurrent measured routing requests |
 | `BASELINE_CONCURRENCY` | `4` | Concurrent baseline requests |
 | `MAX_TOKENS` | `32` | Output tokens per workload request |
-| `MIN_AFFINITY` | `0.95` | Minimum post-warmup family affinity |
+| `MIN_AFFINITY` | `0.95` | Minimum known-cache affinity and actual measured hit rate |
 | `FRONTEND_SETTLE_SECONDS` | `5` | Registration propagation delay before the driver starts |
 | `EVENT_SETTLE_SECONDS` | `5` | Delay after warm-up before measured routing |
 | `TURN_SETTLE_SECONDS` | `1` | Delay between later conversation turns |
