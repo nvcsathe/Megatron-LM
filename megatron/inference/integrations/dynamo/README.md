@@ -123,6 +123,13 @@ prefill and decode workers:
 bash megatron/inference/integrations/dynamo/nano-v3-test/launch.sh
 ```
 
+The eight-GPU Nano v3 test scales that topology to two EP=2 prefill and two
+EP=2 decode workers across two four-GPU nodes:
+
+```bash
+bash megatron/inference/integrations/dynamo/nano-v3-2p2d-test/launch.sh
+```
+
 The multi-node Nano v3 harness validates aggregated KV events, event-driven
 routing, and an otherwise identical round-robin baseline in separate runs:
 

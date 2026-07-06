@@ -95,6 +95,11 @@ released and therefore cannot validate sequential cache reuse.
   because a family may legitimately become replicated.
 - Requires the same minimum post-warmup cache-hit rate from Megatron's actual
   cache counters and reports Dynamo's predicted hit rate separately.
+- Runs measured requests serially by default so the affinity assertion isolates
+  KV-index accuracy from Dynamo's intentional active-load balancing. Set
+  `ROUTING_CONCURRENCY` above one to exercise the combined cache/load policy;
+  such runs can legitimately spill to cold workers and should use a lower
+  workload-specific `MIN_AFFINITY`.
 
 ### `launch-baseline.sh`
 
@@ -121,13 +126,13 @@ prefill/decode architecture comparison.
 | `INFER_MAX_REQUESTS` | `16` | Request slots; bounds Mamba extraction scratch |
 | `MAMBA_GB` | `4.0` | Mamba prefix-cache budget |
 | `PREFIX_CACHE_EVICTION_POLICY` | `lru` | Retain completed-request blocks for sequential reuse |
-| `ROUTER_KV_OVERLAP_SCORE` | `10` | Strong KV-overlap bias for deterministic routing validation |
+| `ROUTER_KV_OVERLAP_SCORE` | `1` | KV overlap weight, or maximum legacy overlap credit |
 | `CUDA_GRAPH_IMPL` | `none` | Set to `local` to opt into CUDA-graph warmup |
 | `PREFIX_FAMILIES` | `32` | Shared-prefix families in the routing dataset |
 | `TURNS_PER_FAMILY` | `8` | Growing requests per family |
 | `PREFIX_REPEAT` | `3072` | Repeated words in each shared prefix |
-| `ROUTING_CONCURRENCY` | `4` | Concurrent measured routing requests |
-| `BASELINE_CONCURRENCY` | `4` | Concurrent baseline requests |
+| `ROUTING_CONCURRENCY` | `1` | Measured routing requests in flight; serial by default for deterministic affinity validation |
+| `BASELINE_CONCURRENCY` | `1` | Baseline requests in flight; matches the routing default |
 | `MAX_TOKENS` | `32` | Output tokens per workload request |
 | `MIN_AFFINITY` | `0.95` | Minimum known-cache affinity and actual measured hit rate |
 | `FRONTEND_SETTLE_SECONDS` | `5` | Registration propagation delay before the driver starts |
