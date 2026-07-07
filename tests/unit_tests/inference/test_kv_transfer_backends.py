@@ -51,7 +51,7 @@ def test_nixl_direct_backend_exports_metadata_with_fake_agent(monkeypatch):
     assert metadata["blocks_axis"] == 1
 
 
-def test_nixl_pull_blocks_uses_remote_metadata_with_fake_agent(monkeypatch):
+def test_nixl_begin_pull_blocks_uses_remote_metadata_with_fake_agent(monkeypatch):
     from megatron.core.inference.disaggregation.transfer_backends import nixl as nixl_mod
 
     class FakeAgent:
@@ -104,7 +104,7 @@ def test_nixl_pull_blocks_uses_remote_metadata_with_fake_agent(monkeypatch):
         "device_id": 0,
         "blocks_axis": 1,
     }
-    backend.pull_blocks(peer_meta, [1], [2])
+    backend.begin_pull_blocks(peer_meta, [1], [2]).wait()
 
     assert backend._agent.transferred is True
 

@@ -18,6 +18,8 @@ from megatron.core.inference.disaggregation.pending_handoff_imports import (
 from megatron.core.inference.disaggregation.utils import transfer_block_count
 from megatron.core.utils import get_pg_rank, get_pg_size
 
+_MAMBA_STATE_KINDS = ("conv", "ssm")
+
 
 class InferenceStateHandoffMixin:
     """Optional KV/Mamba handoff behavior composed into the dynamic engine."""
@@ -28,27 +30,15 @@ class InferenceStateHandoffMixin:
         self._pinned_handoff_blocks: Dict[int, list] = {}
         self._kv_transfer_agent = None
         self._kv_peer_metas = None
-        self._mamba_conv_agent = None
-        self._mamba_ssm_agent = None
+        self._mamba_transfer_agents = {}
+        self._mamba_peer_metas = {}
         self._pending_kv_imports = deque()
-
-    @property
-    def pinned_handoff_count(self) -> int:
-        """Number of completed requests whose source blocks remain pinned."""
-
-        return len(self._pinned_handoff_blocks)
 
     @property
     def pending_kv_import_count(self) -> int:
         """Number of decode requests waiting for state transfer completion."""
 
         return len(self._pending_kv_imports)
-
-    @property
-    def has_pending_kv_imports(self) -> bool:
-        """Whether any decode request is waiting for imported state."""
-
-        return bool(self._pending_kv_imports)
 
     def _reset_pending_kv_imports(self) -> None:
         """Drain and release pending imports before an engine reset."""
@@ -59,7 +49,7 @@ class InferenceStateHandoffMixin:
         unsafe = deque()
         while self._pending_kv_imports:
             pending = self._pending_kv_imports.popleft()
-            if self._wait_for_pending_kv_import(pending):
+            if self._wait_for_transfer_handles(*self._pending_transfer_handles(pending)):
                 self._release_pending_kv_import(pending)
                 if not pending.future.done():
                     pending.future.cancel()
@@ -132,24 +122,19 @@ class InferenceStateHandoffMixin:
             layer_end=layer_end,
         )
 
-        # Cache peer metadata for cross-TP pulls.
-        self._kv_peer_metas = None
-        if (
-            self._kv_transfer_agent is not None
-            and torch.distributed.is_initialized()
-            and tp_size > 1
-        ):
-            local_meta = self._kv_transfer_agent.export_meta()
+        # Cache static peer metadata for every request.
+        self._kv_peer_metas = self._kv_transfer_agent.export_meta()
+        if torch.distributed.is_initialized() and tp_size > 1:
             gathered: list = [None] * tp_size
             torch.distributed.all_gather_object(
-                gathered, local_meta, group=self.pg_collection.tp
+                gathered, self._kv_peer_metas, group=self.pg_collection.tp
             )
             self._kv_peer_metas = gathered
 
         # Mamba uses the same transport segments as KV, with conv channels or
         # SSM heads as the fragment axis.
-        self._mamba_conv_agent = None
-        self._mamba_ssm_agent = None
+        self._mamba_transfer_agents = {}
+        self._mamba_peer_metas = {}
         if getattr(self.context, "is_hybrid_model", False):
             from megatron.core.inference.disaggregation.mamba_reshard import (
                 MambaShardLayout,
@@ -194,26 +179,33 @@ class InferenceStateHandoffMixin:
                     "Mamba conv state shape does not match the model TP layout: "
                     f"{conv_shape[-2]} vs {mamba_layout.conv_dim_local}"
                 )
-            self._mamba_conv_agent = NixlTransferBackend(
-                agent_name=f"{role}-mamba-conv-rank{rank}",
-                memory_buffer=msa.conv_states,
-                expected_num_blocks=msa.max_slots,
-                heads_per_partition=msa.conv_states.shape[-2],
-                head_dim=msa.conv_states.shape[-1],
-                tokens_per_block=1,
-                mamba_layout=mamba_layout,
-                mamba_state_kind="conv",
-            )
-            self._mamba_ssm_agent = NixlTransferBackend(
-                agent_name=f"{role}-mamba-ssm-rank{rank}",
-                memory_buffer=msa.ssm_states,
-                expected_num_blocks=msa.max_slots,
-                heads_per_partition=msa.ssm_states.shape[-3],
-                head_dim=msa.ssm_states.shape[-2] * msa.ssm_states.shape[-1],
-                tokens_per_block=1,
-                mamba_layout=mamba_layout,
-                mamba_state_kind="ssm",
-            )
+            state_specs = {
+                "conv": (
+                    msa.conv_states,
+                    msa.conv_states.shape[-2],
+                    msa.conv_states.shape[-1],
+                ),
+                "ssm": (
+                    msa.ssm_states,
+                    msa.ssm_states.shape[-3],
+                    msa.ssm_states.shape[-2] * msa.ssm_states.shape[-1],
+                ),
+            }
+            for state_kind, (memory_buffer, width, state_dim) in state_specs.items():
+                self._mamba_transfer_agents[state_kind] = NixlTransferBackend(
+                    agent_name=f"{role}-mamba-{state_kind}-rank{rank}",
+                    memory_buffer=memory_buffer,
+                    expected_num_blocks=msa.max_slots,
+                    heads_per_partition=width,
+                    head_dim=state_dim,
+                    tokens_per_block=1,
+                    mamba_layout=mamba_layout,
+                    mamba_state_kind=state_kind,
+                )
+            self._mamba_peer_metas = {
+                state_kind: agent.export_meta()
+                for state_kind, agent in self._mamba_transfer_agents.items()
+            }
 
     def _capture_handoff_meta(
         self, request: "DynamicInferenceRequest", block_ids: list
@@ -230,14 +222,12 @@ class InferenceStateHandoffMixin:
 
         self._pinned_handoff_blocks[rid] = list(block_ids)
 
-        local_kv: Any = {}
-        if self._kv_peer_metas is not None:
-            local_kv = self._kv_peer_metas
-        elif self._kv_transfer_agent is not None:
-            local_kv = self._kv_transfer_agent.export_meta()
+        if self._kv_peer_metas is None:
+            raise RuntimeError("KV handoff requested before transfer setup")
+        local_kv: Any = self._kv_peer_metas
 
         local_mamba = None
-        if self._mamba_conv_agent is not None:
+        if self._mamba_transfer_agents:
             msa = self.context.mamba_slot_allocator
             positions = []
             slots = []
@@ -246,14 +236,12 @@ class InferenceStateHandoffMixin:
                 if slot >= 0:
                     positions.append(pos)
                     slots.append(int(slot))
-            conv_meta = self._mamba_conv_agent.export_meta()
-            ssm_meta = self._mamba_ssm_agent.export_meta()
-            conv_meta["block_ids"] = slots
-            ssm_meta["block_ids"] = slots
             local_mamba = {
                 "positions": positions,
-                "conv": conv_meta,
-                "ssm": ssm_meta,
+                **{
+                    state_kind: {**meta, "block_ids": slots}
+                    for state_kind, meta in self._mamba_peer_metas.items()
+                },
             }
 
         tp_size = get_pg_size(self.pg_collection.tp)
@@ -275,8 +263,10 @@ class InferenceStateHandoffMixin:
                     )
                 local_mamba = {
                     "positions": positions,
-                    "conv": [entry["conv"] for entry in present_mamba],
-                    "ssm": [entry["ssm"] for entry in present_mamba],
+                    **{
+                        state_kind: [entry[state_kind] for entry in present_mamba]
+                        for state_kind in _MAMBA_STATE_KINDS
+                    },
                 }
             else:
                 local_mamba = None
@@ -312,15 +302,13 @@ class InferenceStateHandoffMixin:
                     )
                 mamba_meta = {
                     "positions": positions,
-                    "conv": {
-                        "pp_metas": [
-                            {"tp_metas": stage["conv"]} for stage in mamba_stages
-                        ]
-                    },
-                    "ssm": {
-                        "pp_metas": [
-                            {"tp_metas": stage["ssm"]} for stage in mamba_stages
-                        ]
+                    **{
+                        state_kind: {
+                            "pp_metas": [
+                                {"tp_metas": stage[state_kind]} for stage in mamba_stages
+                            ]
+                        }
+                        for state_kind in _MAMBA_STATE_KINDS
                     },
                 }
             else:
@@ -385,9 +373,7 @@ class InferenceStateHandoffMixin:
             )
 
         mamba_meta = kv_meta.get("mamba") if isinstance(kv_meta, dict) else None
-        local_has_mamba = (
-            self._mamba_conv_agent is not None and self._mamba_ssm_agent is not None
-        )
+        local_has_mamba = bool(self._mamba_transfer_agents)
         if local_has_mamba and mamba_meta is None:
             raise RuntimeError(
                 "Decode has Mamba state transfer agents but the handoff contains no "
@@ -460,13 +446,14 @@ class InferenceStateHandoffMixin:
         return future
 
     def _kv_import_done(self, pending: PendingKvImport) -> bool:
-        if pending.handle is not None and not pending.handle.poll():
-            return False
+        return all(handle.poll() for handle in self._pending_transfer_handles(pending))
+
+    @staticmethod
+    def _pending_transfer_handles(pending: PendingKvImport) -> list:
+        handles = [pending.handle]
         if pending.mamba is not None:
-            for handle in (pending.mamba.conv_handle, pending.mamba.ssm_handle):
-                if not handle.poll():
-                    return False
-        return True
+            handles.extend(pending.mamba.handles.values())
+        return [handle for handle in handles if handle is not None]
 
     def _finalize_kv_handoff_import(self, pending: PendingKvImport) -> None:
         allocator = self.context.kv_block_allocator
@@ -544,12 +531,6 @@ class InferenceStateHandoffMixin:
                 pass
         return safe_to_release
 
-    def _wait_for_pending_kv_import(self, pending: PendingKvImport) -> bool:
-        handles = [pending.handle]
-        if pending.mamba is not None:
-            handles.extend((pending.mamba.conv_handle, pending.mamba.ssm_handle))
-        return self._wait_for_transfer_handles(*handles)
-
     def _poll_pending_kv_imports(self) -> int:
         if not self._pending_kv_imports:
             return 0
@@ -564,7 +545,9 @@ class InferenceStateHandoffMixin:
                 else:
                     remaining.append(pending)
             except Exception as exc:
-                safe_to_release = self._wait_for_pending_kv_import(pending)
+                safe_to_release = self._wait_for_transfer_handles(
+                    *self._pending_transfer_handles(pending)
+                )
                 if safe_to_release:
                     self._release_pending_kv_import(pending)
                 else:
@@ -596,15 +579,9 @@ class InferenceStateHandoffMixin:
         hashes: list,
     ) -> Optional[PendingMambaImport]:
         positions = [int(pos) for pos in mamba_meta.get("positions", [])]
-        src_slots: list = []
-        if not positions:
-            # Compatibility with the original matched-layout wire format.
-            pairs = mamba_meta.get("blocks") or []
-            positions = [int(pos) for pos, _ in pairs]
-            src_slots = [int(slot) for _, slot in pairs]
         if not positions:
             return None
-        if self._mamba_conv_agent is None or self._mamba_ssm_agent is None:
+        if not self._mamba_transfer_agents:
             raise RuntimeError(
                 "Received Mamba handoff state but this decode engine has no "
                 "Mamba transfer agents. Ensure it runs a hybrid model with "
@@ -627,18 +604,15 @@ class InferenceStateHandoffMixin:
             )
         target_blocks = [int(local_blocks[p]) for p in positions]
         local_slots = msa.allocate_slots_batch(target_blocks)
-        conv_handle = None
+        handles = {}
         try:
-            conv_handle = self._mamba_conv_agent.begin_pull_blocks(
-                mamba_meta["conv"], src_slots, local_slots
-            )
-            ssm_handle = self._mamba_ssm_agent.begin_pull_blocks(
-                mamba_meta["ssm"], src_slots, local_slots
-            )
+            for state_kind, agent in self._mamba_transfer_agents.items():
+                handles[state_kind] = agent.begin_pull_blocks(
+                    mamba_meta[state_kind], [], local_slots
+                )
         except Exception as exc:
             safe_to_release = getattr(exc, "transfer_destinations_safe", True)
-            if conv_handle is not None:
-                safe_to_release &= self._wait_for_transfer_handles(conv_handle)
+            safe_to_release &= self._wait_for_transfer_handles(*handles.values())
             if safe_to_release:
                 for block_id in target_blocks:
                     msa.invalidate_block(block_id)
@@ -654,8 +628,7 @@ class InferenceStateHandoffMixin:
             len(target_blocks),
         )
         return PendingMambaImport(
-            conv_handle=conv_handle,
-            ssm_handle=ssm_handle,
+            handles=handles,
             target_blocks=target_blocks,
             positions=positions,
         )

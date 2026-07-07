@@ -15,8 +15,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 class PendingMambaImport:
     """Mamba state transfers attached to a pending KV-cache import."""
 
-    conv_handle: Any
-    ssm_handle: Any
+    handles: dict[str, Any]
     target_blocks: List[int]
     positions: List[int]
 

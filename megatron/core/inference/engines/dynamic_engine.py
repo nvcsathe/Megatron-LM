@@ -2570,7 +2570,7 @@ class DynamicInferenceEngine(InferenceStateHandoffMixin, AbstractEngine):
                             and (
                                 self.context.get_active_request_count() > 0
                                 or self.waiting_request_ids
-                                or self.has_pending_kv_imports
+                                or self.pending_kv_import_count > 0
                             )
                         )
                     )

@@ -186,7 +186,6 @@ class NixlTransferBackend:
 
         # Each (outer, block) pair is one contiguous slice. The outer stride
         # skips over the full block pool for that outer index.
-        shape = list(memory_buffer.shape)
         elements_per_slice = 1
         for dim in shape[blocks_axis + 1 :]:
             elements_per_slice *= dim
@@ -408,23 +407,6 @@ class NixlTransferBackend:
             layer_start=int(meta["layer_start"]),
             num_local_layers=int(meta["layer_end"]) - int(meta["layer_start"]),
         )
-
-    def pull_blocks(
-        self,
-        peer_meta: Any,
-        src_block_ids: List[int],
-        dst_block_ids: List[int],
-    ) -> None:
-        """Synchronously pull blocks from one or more peer agents into local blocks.
-
-        Args:
-            peer_meta: an ``export_meta()`` dict from a single prefill peer, OR a
-                list of dicts for heterogeneous TP. Heterogeneous PP uses
-                ``{"pp_metas": [{"tp_metas": ..., "block_ids": [...]}, ...]}``.
-            src_block_ids: Source block ids unless carried by ``pp_metas``.
-            dst_block_ids: Local block ids to write into.
-        """
-        self.begin_pull_blocks(peer_meta, src_block_ids, dst_block_ids).wait()
 
     def begin_pull_blocks(
         self,
@@ -764,7 +746,3 @@ class NixlTransferBackend:
         except Exception:  # noqa: BLE001 - shutdown path
             logger.exception("NixlTransferBackend: deregister_memory failed")
         self._agent = None
-
-
-# Backward-compatible name for callers/tests that still import the old agent.
-KvTransferAgent = NixlTransferBackend
