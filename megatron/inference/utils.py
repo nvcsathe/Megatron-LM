@@ -3,7 +3,7 @@
 import logging
 import warnings
 from argparse import ArgumentParser, Namespace
-from typing import Literal, Optional
+from typing import Literal, Optional, Type
 
 import torch
 
@@ -372,8 +372,11 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
     )
 
 
-def get_dynamic_inference_engine(model: Optional[MegatronModule] = None) -> DynamicInferenceEngine:
-    """Builds a `DynamicInferenceEngine`."""
+def get_dynamic_inference_engine(
+    model: Optional[MegatronModule] = None,
+    engine_class: Type[DynamicInferenceEngine] = DynamicInferenceEngine,
+) -> DynamicInferenceEngine:
+    """Build a dynamic inference engine of the requested class."""
     args = get_args()
     if model is None:
         model = get_model_for_inference()
@@ -383,5 +386,5 @@ def get_dynamic_inference_engine(model: Optional[MegatronModule] = None) -> Dyna
     context = DynamicInferenceContext(model.config, inference_config)
     inference_wrapped_model = GPTInferenceWrapper(model, context)
     controller = TextGenerationController(inference_wrapped_model, tokenizer)
-    engine = DynamicInferenceEngine(controller, context)
+    engine = engine_class(controller, context)
     return engine

@@ -2,34 +2,30 @@
 
 from types import SimpleNamespace
 
-from megatron.inference.integrations.dynamo.protocol import (
-    build_ready_payload,
-    logical_replica_group,
-)
+from megatron.inference.integrations.dynamo.protocol import engine_metadata
 
 
-def test_logical_replica_group_uses_expert_dp_for_moe():
-    groups = SimpleNamespace(dp=object(), expt_dp=object())
-    assert (
-        logical_replica_group(
-            SimpleNamespace(expert_model_parallel_size=2), groups
-        )
-        is groups.expt_dp
-    )
-    assert (
-        logical_replica_group(
-            SimpleNamespace(expert_model_parallel_size=1), groups
-        )
-        is groups.dp
+def test_engine_metadata_contains_dynamo_configuration():
+    engine = SimpleNamespace(
+        context=SimpleNamespace(
+            kv_block_allocator=SimpleNamespace(total_count=17),
+            max_sequence_length=8192,
+            block_size_tokens=64,
+            max_requests=8,
+            max_tokens=1024,
+            enable_prefix_caching=True,
+        ),
+        controller=SimpleNamespace(tokenizer=SimpleNamespace(bos_token_id=1)),
     )
 
-
-def test_ready_payload_contains_startup_contract():
-    assert build_ready_payload(
-        "tcp://127.0.0.1:5555",
-        {"context_length": 8192},
-    ) == {
-        "version": 3,
-        "coordinator_address": "tcp://127.0.0.1:5555",
-        "engine": {"context_length": 8192},
+    assert engine_metadata(engine, "decode") == {
+        "context_length": 8192,
+        "kv_cache_block_size": 64,
+        "total_kv_blocks": 16,
+        "max_num_seqs": 8,
+        "max_num_batched_tokens": 1024,
+        "role": "decode",
+        "bos_token_id": 1,
+        "enable_prefix_caching": True,
+        "logical_data_parallel_size": 1,
     }

@@ -26,6 +26,32 @@ def _argv():
     ]
 
 
+def _slurm_argv():
+    return [
+        "--role",
+        "aggregated",
+        "--model",
+        "model-meta",
+        "--launcher",
+        "slurm",
+        "--nnodes",
+        "2",
+        "--nproc-per-node",
+        "4",
+        "--master-addr",
+        "node-0",
+        "--master-port",
+        "29500",
+        "--slurm-nodelist",
+        "node-[0-1]",
+        "--parent-event-host",
+        "10.0.0.10",
+        "--",
+        "--load",
+        "/checkpoints/model path",
+    ]
+
+
 def test_parse_args_splits_dynamo_and_megatron_arguments():
     config = parse_args(_argv())
     assert config.component == "backend"
@@ -36,6 +62,44 @@ def test_parse_args_splits_dynamo_and_megatron_arguments():
         "--tensor-model-parallel-size",
         "2",
     ]
+
+
+def test_parse_args_accepts_multi_node_slurm_launcher():
+    config = parse_args(_slurm_argv())
+
+    assert config.launcher == "slurm"
+    assert config.nnodes == 2
+    assert config.master_addr == "node-0"
+    assert config.master_port == 29500
+    assert config.slurm_nodelist == "node-[0-1]"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        _argv()[:-6] + ["--nnodes", "2", "--", "--load", "/checkpoint"],
+        [
+            "--model",
+            "model-meta",
+            "--launcher",
+            "slurm",
+            "--nnodes",
+            "2",
+            "--nproc-per-node",
+            "4",
+            "--master-addr",
+            "node-0",
+            "--master-port",
+            "29500",
+            "--",
+            "--load",
+            "/checkpoint",
+        ],
+    ],
+)
+def test_multi_node_launcher_configuration_is_validated(argv):
+    with pytest.raises(SystemExit):
+        parse_args(argv)
 
 
 def test_disaggregated_role_requires_coordinator_address():
@@ -79,6 +143,30 @@ def test_owned_engine_command_targets_megatron_only_service():
         "--tensor-model-parallel-size",
         "2",
     ]
+
+
+def test_slurm_engine_command_launches_one_torchrun_agent_per_node():
+    engine = MegatronLLMEngine(parse_args(_slurm_argv()))
+    command = engine._engine_command("tcp://10.0.0.10:5556")
+
+    assert command[:5] == [
+        "srun",
+        "--nodes=2",
+        "--ntasks=2",
+        "--ntasks-per-node=1",
+        "--gpus-per-node=4",
+    ]
+    assert "--kill-on-bad-exit=1" in command
+    assert "--nodelist=node-[0-1]" in command
+    assert command[-3:-1] == ["bash", "-c"]
+    payload = command[-1]
+    assert "--nnodes=2" in payload
+    assert "--nproc-per-node=4" in payload
+    assert '--node-rank="${SLURM_NODEID}"' in payload
+    assert "--master-addr=node-0" in payload
+    assert "--master-port=29500" in payload
+    assert "megatron.inference.integrations.dynamo.engine_service" in payload
+    assert "'/checkpoints/model path'" in payload
 
 
 @pytest.mark.asyncio

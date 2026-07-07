@@ -20,7 +20,12 @@ class Config:
     request_plane: str
     event_plane: str | None
     role: str
+    launcher: str
+    nnodes: int
     nproc_per_node: int
+    master_addr: str | None
+    master_port: int | None
+    slurm_nodelist: str | None
     coordinator_host: str | None
     coordinator_port: int | None
     worker_id_file: str | None
@@ -67,7 +72,21 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser.add_argument("--request-plane", default="nats")
     parser.add_argument("--event-plane", default="nats")
     add_engine_service_args(parser)
+    parser.add_argument(
+        "--launcher",
+        choices=["local", "slurm"],
+        default="local",
+        help="Launch the owned Megatron rank group locally or through a SLURM job step.",
+    )
+    parser.add_argument("--nnodes", type=int, default=1)
     parser.add_argument("--nproc-per-node", type=int, required=True)
+    parser.add_argument("--master-addr", default=None)
+    parser.add_argument("--master-port", type=int, default=None)
+    parser.add_argument(
+        "--slurm-nodelist",
+        default=None,
+        help="Optional SLURM node list reserved for this complete Megatron replica.",
+    )
     parser.add_argument(
         "--worker-id-file",
         default=None,
@@ -86,6 +105,23 @@ def parse_args(argv: list[str] | None = None) -> Config:
 
     if args.nproc_per_node < 1:
         parser.error("--nproc-per-node must be at least 1")
+    if args.nnodes < 1:
+        parser.error("--nnodes must be at least 1")
+    if args.launcher == "local" and args.nnodes != 1:
+        parser.error("--launcher local only supports --nnodes 1")
+    if args.launcher == "slurm" and (not args.master_addr or args.master_port is None):
+        parser.error("--launcher slurm requires --master-addr and --master-port")
+    if args.master_port is not None and not 1 <= args.master_port <= 65535:
+        parser.error("--master-port must be between 1 and 65535")
+    if args.launcher == "slurm" and args.nnodes > 1 and args.parent_event_host in {
+        "127.0.0.1",
+        "::1",
+        "localhost",
+    }:
+        parser.error(
+            "multi-node --launcher slurm requires --parent-event-host to be a routable "
+            "address on the Dynamo parent host"
+        )
     if args.engine_start_timeout <= 0:
         parser.error("--engine-start-timeout must be positive")
     if args.engine_shutdown_timeout <= 0:
@@ -108,7 +144,12 @@ def parse_args(argv: list[str] | None = None) -> Config:
         request_plane=args.request_plane,
         event_plane=args.event_plane,
         role=args.role,
+        launcher=args.launcher,
+        nnodes=args.nnodes,
         nproc_per_node=args.nproc_per_node,
+        master_addr=args.master_addr,
+        master_port=args.master_port,
+        slurm_nodelist=args.slurm_nodelist,
         coordinator_host=args.coordinator_host,
         coordinator_port=args.coordinator_port,
         worker_id_file=args.worker_id_file,

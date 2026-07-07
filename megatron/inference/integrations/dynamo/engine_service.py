@@ -17,11 +17,8 @@ import torch.distributed as dist
 
 from megatron.core.utils import get_pg_size
 from megatron.inference.integrations.dynamo.args import add_engine_service_args
-from megatron.inference.integrations.dynamo.protocol import (
-    build_ready_payload,
-    build_engine_metadata,
-    logical_replica_group,
-)
+from megatron.inference.integrations.dynamo.dynamic_engine import DynamoDynamicInferenceEngine
+from megatron.inference.integrations.dynamo.protocol import engine_metadata
 from megatron.inference.integrations.dynamo.telemetry import EngineEventReporter
 from megatron.inference.utils import (
     add_inference_args,
@@ -43,9 +40,13 @@ def _extra_args(parser):
 async def _serve() -> None:
     args = get_args()
     args.return_log_probs = True
-    engine = get_dynamic_inference_engine()
+    engine = get_dynamic_inference_engine(engine_class=DynamoDynamicInferenceEngine)
 
-    replica_group = logical_replica_group(args, engine.pg_collection)
+    replica_group = (
+        engine.pg_collection.expt_dp
+        if args.expert_model_parallel_size > 1
+        else engine.pg_collection.dp
+    )
     replica_count = get_pg_size(replica_group)
     if replica_count != 1:
         raw_dp_size = get_pg_size(engine.pg_collection.dp)
@@ -61,13 +62,12 @@ async def _serve() -> None:
     reporter = EngineEventReporter(engine, args.dynamo_parent_event_address)
     reporter.start()
 
+    metadata = engine_metadata(engine, args.role)
+
     def ready(coordinator_address):
         reporter.observe(
             "ready",
-            build_ready_payload(
-                coordinator_address,
-                build_engine_metadata(engine, args),
-            ),
+            {"coordinator_address": coordinator_address, "engine": metadata},
         )
 
     try:

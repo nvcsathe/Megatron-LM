@@ -36,9 +36,6 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
 from megatron.core.inference.disaggregation.handoff_wire_protocol import (
     parse_submit_request_with_kv_fields,
 )
-from megatron.core.inference.disaggregation.inference_state_handoff import (
-    InferenceStateHandoffMixin,
-)
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
@@ -188,7 +185,7 @@ class RequestEntry:
 
 # pylint: disable=line-too-long
 @experimental_api
-class DynamicInferenceEngine(InferenceStateHandoffMixin, AbstractEngine):
+class DynamicInferenceEngine(AbstractEngine):
     """The dynamic inference engine.
 
     This engine allows requests of varying length to be dynamically added and
@@ -312,6 +309,43 @@ class DynamicInferenceEngine(InferenceStateHandoffMixin, AbstractEngine):
 
     def add_kv_event_listener(self, listener) -> None:
         self.context.add_kv_event_listener(listener)
+
+    def _initialize_disaggregation_state(self) -> None:
+        """Hook overridden by the Dynamo KV-handoff engine."""
+
+    def _reset_pending_kv_imports(self) -> None:
+        """Hook overridden by the Dynamo KV-handoff engine."""
+
+    @property
+    def pending_kv_import_count(self) -> int:
+        return 0
+
+    def _poll_pending_kv_imports(self) -> int:
+        return 0
+
+    def _capture_handoff_meta(self, request, block_ids: list) -> None:
+        self._raise_kv_handoff_not_enabled("KV handoff completion")
+
+    def _release_pinned_handoff_blocks(self, block_ids: list) -> int:
+        return 0
+
+    def setup_kv_transfer(self, role: str) -> None:
+        self._raise_kv_handoff_not_enabled("KV transfer setup")
+
+    def add_request_with_kv_handoff(
+        self, request_id, prompt, sampling_params, kv_meta, src_block_ids
+    ) -> None:
+        self._raise_kv_handoff_not_enabled("SUBMIT_REQUEST_WITH_KV")
+
+    def release_handoff_blocks(self, request_id: int) -> None:
+        self._raise_kv_handoff_not_enabled("RELEASE_KV")
+
+    @staticmethod
+    def _raise_kv_handoff_not_enabled(operation: str) -> None:
+        raise RuntimeError(
+            f"{operation} requires KV handoff, but it is not enabled. "
+            "Use DynamoDynamicInferenceEngine with KV transfer configured."
+        )
 
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""

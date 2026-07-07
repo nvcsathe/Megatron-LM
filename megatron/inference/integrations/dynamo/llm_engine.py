@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import queue
+import shlex
 import signal
 import sys
 import threading
@@ -160,14 +161,6 @@ class MegatronLLMEngine(LLMEngine):
         ]
 
         readiness = await self._wait_for_readiness()
-        from megatron.inference.integrations.dynamo.protocol import PROTOCOL_VERSION
-
-        protocol_version = int(readiness.get("version", 0))
-        if protocol_version != PROTOCOL_VERSION:
-            raise RuntimeError(
-                "Megatron engine-service protocol mismatch: "
-                f"expected {PROTOCOL_VERSION}, got {protocol_version}"
-            )
         self.client = InferenceClient(
             str(readiness["coordinator_address"]), deserialize=False
         )
@@ -211,15 +204,31 @@ class MegatronLLMEngine(LLMEngine):
             sys.executable,
             "-m",
             "torch.distributed.run",
-            "--standalone",
-            f"--nproc-per-node={self.config.nproc_per_node}",
-            "--module",
-            "megatron.inference.integrations.dynamo.engine_service",
-            "--dynamo-parent-event-address",
-            parent_event_address,
-            "--role",
-            self.config.role,
         ]
+        if self.config.launcher == "local":
+            command.append("--standalone")
+        else:
+            command.extend(
+                [
+                    f"--nnodes={self.config.nnodes}",
+                    f"--nproc-per-node={self.config.nproc_per_node}",
+                    "--node-rank=__SLURM_NODE_RANK__",
+                    f"--master-addr={self.config.master_addr}",
+                    f"--master-port={self.config.master_port}",
+                ]
+            )
+        if self.config.launcher == "local":
+            command.append(f"--nproc-per-node={self.config.nproc_per_node}")
+        command.extend(
+            [
+                "--module",
+                "megatron.inference.integrations.dynamo.engine_service",
+                "--dynamo-parent-event-address",
+                parent_event_address,
+                "--role",
+                self.config.role,
+            ]
+        )
         if self.config.coordinator_host is not None:
             command.extend(
                 ["--coordinator-host", self.config.coordinator_host]
@@ -229,6 +238,21 @@ class MegatronLLMEngine(LLMEngine):
                 ["--coordinator-port", str(self.config.coordinator_port)]
             )
         command.extend(self.config.megatron_argv)
+        if self.config.launcher == "slurm":
+            shell_command = shlex.join(command).replace(
+                "__SLURM_NODE_RANK__", '"${SLURM_NODEID}"'
+            )
+            srun_command = [
+                "srun",
+                f"--nodes={self.config.nnodes}",
+                f"--ntasks={self.config.nnodes}",
+                "--ntasks-per-node=1",
+                f"--gpus-per-node={self.config.nproc_per_node}",
+                "--kill-on-bad-exit=1",
+            ]
+            if self.config.slurm_nodelist is not None:
+                srun_command.append(f"--nodelist={self.config.slurm_nodelist}")
+            return srun_command + ["bash", "-c", f"exec {shell_command}"]
         return command
 
     async def _forward_logs(

@@ -1775,6 +1775,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             cu_seqlens=cu_seqlens_q,
             cp_group=cp_group,
             mscale=mscale,
+            mla_rotary_interleaved=config.multi_latent_attention,
         )
         return query
 
@@ -1814,6 +1815,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 config=config,
                 cp_group=cp_group,
                 mscale=mscale,
+                mla_rotary_interleaved=config.multi_latent_attention,
             )
         else:
             key[:n] = apply_rotary_pos_emb(
@@ -1822,6 +1824,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 config=config,
                 cp_group=cp_group,
                 mscale=mscale,
+                mla_rotary_interleaved=config.multi_latent_attention,
             )
         return key
 

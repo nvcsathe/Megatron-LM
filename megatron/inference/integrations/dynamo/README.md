@@ -110,9 +110,38 @@ python -m dynamo.frontend \
   --event-plane nats
 ```
 
-The parent event socket binds to `127.0.0.1` by default. A future launcher that
-places global rank zero on another host can pass `--parent-event-host` with a
-routable local interface; only global rank zero connects to this endpoint.
+The parent event socket binds to `127.0.0.1` by default. A multi-node launcher
+must pass `--parent-event-host` with a routable address on the Dynamo parent
+host; only global rank zero connects to this endpoint.
+
+### Multi-node SLURM replica
+
+The default `local` launcher starts one complete replica on one node. To run a
+single complete TP/PP/EP replica across SLURM nodes, launch the Dynamo parent
+once from the batch script (not once per node) and let it create one `srun`
+task per node. The worktree and model paths must be visible on every node.
+
+```bash
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
+export MASTER_PORT=29500
+export PARENT_EVENT_HOST=$(hostname -I | awk '{print $1}')
+
+python -m megatron.inference.integrations.dynamo \
+  --launcher slurm \
+  --nnodes "$SLURM_NNODES" \
+  --nproc-per-node 8 \
+  --master-addr "$MASTER_ADDR" \
+  --master-port "$MASTER_PORT" \
+  --parent-event-host "$PARENT_EVENT_HOST" \
+  --slurm-nodelist "$SLURM_JOB_NODELIST" \
+  --role aggregated \
+  --model Qwen/Qwen3-8B \
+  -- <Megatron arguments>
+```
+
+This starts one `torch.distributed.run` agent per node, with `SLURM_NODEID` as
+the node rank. Reserve the selected nodes exclusively for this Dynamo worker;
+individual Megatron ranks are not separate Dynamo workers.
 
 The Nano v3 Slurm test starts etcd, NATS, the frontend, and matched TP=1/PP=1
 prefill and decode workers:
@@ -166,5 +195,6 @@ pytest -q tests/unit_tests/inference/test_kv_transfer_backends.py
 - Cancellation targets the exact Megatron request; shutdown unregisters the
   endpoint, drains active requests, and then stops all ranks.
 
-The current launcher supports one node per engine. Scale horizontally by
-adding complete Dynamo component replicas.
+The default launcher supports one node per engine. The SLURM launcher can run
+one engine across multiple nodes; scale horizontally by adding complete Dynamo
+component replicas on separate node sets.

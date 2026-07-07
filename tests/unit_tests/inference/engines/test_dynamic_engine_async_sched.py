@@ -6,8 +6,12 @@ from unittest import mock
 import pytest
 
 from megatron.core.inference.config import AsyncScheduleMode
+from megatron.core.inference.disaggregation.inference_state_handoff import (
+    InferenceStateHandoffMixin,
+)
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.inference.integrations.dynamo.dynamic_engine import DynamoDynamicInferenceEngine
 
 
 def _make_engine(async_sched_mode=AsyncScheduleMode.SERIAL, **overrides):
@@ -98,3 +102,26 @@ def test_add_request_runs_async_sched_request_validation():
         engine._add_request(request)
 
     engine._validate_async_sched_support_for_request.assert_called_once_with(request)
+
+
+def test_base_engine_rejects_kv_handoff_commands():
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+
+    assert InferenceStateHandoffMixin not in DynamicInferenceEngine.mro()
+    assert engine.pending_kv_import_count == 0
+    with pytest.raises(RuntimeError, match="SUBMIT_REQUEST_WITH_KV"):
+        engine.add_request_with_kv_handoff(1, [], SamplingParams(), {}, [])
+    with pytest.raises(RuntimeError, match="RELEASE_KV"):
+        engine.release_handoff_blocks(1)
+
+
+def test_dynamo_engine_resolves_handoff_methods_from_mixin():
+    assert DynamoDynamicInferenceEngine.mro()[:3] == [
+        DynamoDynamicInferenceEngine,
+        InferenceStateHandoffMixin,
+        DynamicInferenceEngine,
+    ]
+    assert (
+        DynamoDynamicInferenceEngine.add_request_with_kv_handoff
+        is InferenceStateHandoffMixin.add_request_with_kv_handoff
+    )
