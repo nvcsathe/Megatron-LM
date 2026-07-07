@@ -91,14 +91,12 @@ python -m megatron.inference.integrations.dynamo \
   --role prefill --component prefill \
   --model Qwen/Qwen3-8B --nproc-per-node 4 \
   --coordinator-host 10.0.0.12 \
-  --kv-transfer-listen-addr 10.0.0.12:7000 \
   -- <Megatron arguments>
 
 python -m megatron.inference.integrations.dynamo \
   --role decode --component backend \
   --model Qwen/Qwen3-8B --nproc-per-node 4 \
   --coordinator-host 10.0.0.13 \
-  --kv-transfer-listen-addr 10.0.0.13:7000 \
   -- <Megatron arguments>
 ```
 

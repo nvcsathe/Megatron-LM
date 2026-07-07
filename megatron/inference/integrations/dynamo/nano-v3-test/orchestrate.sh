@@ -39,8 +39,6 @@ HTTP_PORT_AGG="${HTTP_PORT_AGG:-8101}"
 COORD_PORT_PREFILL="${COORD_PORT_PREFILL:-5555}"
 COORD_PORT_DECODE="${COORD_PORT_DECODE:-5556}"
 COORD_PORT_AGG="${COORD_PORT_AGG:-5557}"
-NIXL_PORT_PREFILL="${NIXL_PORT_PREFILL:-7000}"
-NIXL_PORT_DECODE="${NIXL_PORT_DECODE:-7001}"
 MASTER_PORT_PREFILL="${MASTER_PORT_PREFILL:-29500}"
 MASTER_PORT_DECODE="${MASTER_PORT_DECODE:-29501}"
 MASTER_PORT_AGG="${MASTER_PORT_AGG:-29502}"
@@ -187,14 +185,10 @@ fi
 TOKENIZER_ARGS=()
 TOKENIZER_ARGS=(--tokenizer-model "$TOKENIZER_MODEL")
 
-# Args: role, GPUs, coordinator port, NIXL port, log, extra Megatron args.
+# Args: role, GPUs, coordinator port, log, extra Megatron args.
 launch_engine() {
-    local role="$1" gpus="$2" coord_port="$3" nixl_port="$4" logf="$5"; shift 5
+    local role="$1" gpus="$2" coord_port="$3" logf="$4"; shift 4
     local nproc="$ROLE_EP_SIZE"
-    local transfer_args=()
-    if [[ "$role" != "aggregated" ]]; then
-        transfer_args=(--kv-transfer-listen-addr "127.0.0.1:$nixl_port")
-    fi
     log "starting owned Megatron $role engine (GPUs=$gpus, TP=1 PP=1 EP=$ROLE_EP_SIZE)..."
     (
         CUDA_VISIBLE_DEVICES="$gpus" exec python -m megatron.inference.integrations.dynamo \
@@ -204,7 +198,6 @@ launch_engine() {
                 --nproc-per-node "$nproc" \
                 --coordinator-host 127.0.0.1 \
                 --coordinator-port "$coord_port" \
-                "${transfer_args[@]}" \
                 --megatron-root /opt/megatron-lm \
                 -- \
                 --tensor-model-parallel-size 1 \
@@ -232,11 +225,11 @@ wait_for "nats /healthz"  30 curl -sf http://127.0.0.1:8222/healthz || die "nats
 wait_for "etcd /health"   30 curl -sf http://127.0.0.1:2379/health  || die "etcd never healthy"
 
 # Start both workers concurrently; model loading may take several minutes.
-launch_engine prefill "$GPU_PREFILL" "$COORD_PORT_PREFILL" "$NIXL_PORT_PREFILL" \
+launch_engine prefill "$GPU_PREFILL" "$COORD_PORT_PREFILL" \
     "$LOG_DIR/worker-prefill.log" \
     "${PREFIX_ARGS[@]}"
 
-launch_engine decode "$GPU_DECODE" "$COORD_PORT_DECODE" "$NIXL_PORT_DECODE" \
+launch_engine decode "$GPU_DECODE" "$COORD_PORT_DECODE" \
     "$LOG_DIR/worker-decode.log" \
     "${PREFIX_ARGS[@]}"
 
@@ -260,7 +253,7 @@ wait_for "frontend exposes $SERVED_MODEL_NAME" 60 \
 # Optional aggregated reference.
 BASELINE_URL=""
 if [[ "$WITH_BASELINE" == "1" ]]; then
-    DYN_NAMESPACE=baseline launch_engine aggregated "$GPU_BASELINE" "$COORD_PORT_AGG" "" \
+    DYN_NAMESPACE=baseline launch_engine aggregated "$GPU_BASELINE" "$COORD_PORT_AGG" \
         "$LOG_DIR/worker-agg.log"
     wait_for "agg worker registered" 900 \
         grep -Eq "Registered base model|Starting NATS push endpoint listener" \

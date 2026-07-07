@@ -91,8 +91,8 @@ class MegatronLLMEngine(LLMEngine):
         self._metadata: dict[str, Any] = {}
         self._ready_messages: queue.Queue[dict] = queue.Queue(maxsize=1)
         self._kv_queue: queue.Queue[tuple[str, dict]] = queue.Queue()
-        self._publisher_stop = threading.Event()
-        self._publisher_thread: Optional[threading.Thread] = None
+        self._publisher: Optional[KvEventPublisher] = None
+        self._publisher_lock = threading.Lock()
         self._event_receiver: Optional[EngineEventReceiver] = None
         self._release_clients: dict[str, Any] = {}
         self._request_ids: dict[str, int] = {}
@@ -217,23 +217,16 @@ class MegatronLLMEngine(LLMEngine):
             "megatron.inference.integrations.dynamo.engine_service",
             "--dynamo-parent-event-address",
             parent_event_address,
-            "--dynamo-role",
+            "--role",
             self.config.role,
         ]
         if self.config.coordinator_host is not None:
             command.extend(
-                ["--dynamo-coordinator-host", self.config.coordinator_host]
+                ["--coordinator-host", self.config.coordinator_host]
             )
         if self.config.coordinator_port is not None:
             command.extend(
-                ["--dynamo-coordinator-port", str(self.config.coordinator_port)]
-            )
-        if self.config.kv_transfer_listen_addr is not None:
-            command.extend(
-                [
-                    "--dynamo-kv-transfer-listen-addr",
-                    self.config.kv_transfer_listen_addr,
-                ]
+                ["--coordinator-port", str(self.config.coordinator_port)]
             )
         command.extend(self.config.megatron_argv)
         return command
@@ -342,14 +335,15 @@ class MegatronLLMEngine(LLMEngine):
         try:
             async for chunk in self._stream_chunks(stream, token_ids, params):
                 if not released and self.config.role == "decode":
-                    address = release.get("coordinator_addr")
-                    request_id = release.get("request_id")
-                    if address is not None and request_id is not None:
-                        self._release_remote_handoff(str(address), int(request_id))
-                        released = True
+                    released = self._release_handoff_from_meta(release)
                 yield chunk
         finally:
             self._request_ids.pop(context_id, None)
+            if not released and self.config.role == "decode":
+                try:
+                    self._release_handoff_from_meta(release)
+                except Exception:
+                    logger.exception("Failed to release Megatron handoff")
 
     async def _stream_chunks(
         self, stream, prompt_token_ids: list[int], params: SamplingParams
@@ -403,6 +397,14 @@ class MegatronLLMEngine(LLMEngine):
             self._release_clients[address] = client
         client.release_handoff(request_id)
 
+    def _release_handoff_from_meta(self, release: dict[str, Any]) -> bool:
+        address = release.get("coordinator_addr")
+        request_id = release.get("request_id")
+        if address is None or request_id is None:
+            return False
+        self._release_remote_handoff(str(address), int(request_id))
+        return True
+
     async def abort(self, context: Context) -> None:
         request_id = self._request_ids.pop(str(context.id()), None)
         if request_id is not None and self.client is not None:
@@ -447,10 +449,8 @@ class MegatronLLMEngine(LLMEngine):
         if self._event_receiver is not None:
             self._event_receiver.stop()
             self._event_receiver = None
-        self._publisher_stop.set()
-        if self._publisher_thread is not None:
-            self._publisher_thread.join(timeout=2)
-            self._publisher_thread = None
+        with self._publisher_lock:
+            self._publisher = None
         if self._log_tasks:
             await asyncio.gather(*self._log_tasks, return_exceptions=True)
             self._log_tasks.clear()
@@ -491,7 +491,7 @@ class MegatronLLMEngine(LLMEngine):
             return []
         if not self._metadata.get("enable_prefix_caching", False):
             return []
-        return [PushSource(on_ready=self._start_publisher_thread, dp_rank=0)]
+        return [PushSource(on_ready=self._set_publisher, dp_rank=0)]
 
     def _on_engine_event(self, kind: str, payload: dict) -> None:
         if kind == "ready":
@@ -501,31 +501,32 @@ class MegatronLLMEngine(LLMEngine):
                 logger.warning("Ignoring duplicate Megatron readiness message")
             return
         if kind in ("stored", "removed", "cleared"):
-            self._kv_queue.put((kind, payload))
+            with self._publisher_lock:
+                if self._publisher is None:
+                    self._kv_queue.put((kind, payload))
+                else:
+                    self._publish_event(self._publisher, kind, payload)
             return
         logger.warning("Ignoring unknown Megatron engine event %s", kind)
 
-    def _start_publisher_thread(self, publisher: KvEventPublisher) -> None:
-        self._publisher_thread = threading.Thread(
-            target=self._publish_loop,
-            args=(publisher,),
-            daemon=True,
-            name="megatron-kv-publisher",
-        )
-        self._publisher_thread.start()
-
-    def _publish_loop(self, publisher: KvEventPublisher) -> None:
-        while not self._publisher_stop.is_set():
+    def _set_publisher(self, publisher: KvEventPublisher) -> None:
+        with self._publisher_lock:
+            self._publisher = publisher
             try:
-                kind, payload = self._kv_queue.get(timeout=0.1)
+                while True:
+                    kind, payload = self._kv_queue.get_nowait()
+                    self._publish_event(publisher, kind, payload)
             except queue.Empty:
-                continue
-            try:
-                if kind == "stored":
-                    publisher.publish_stored(**payload)
-                elif kind == "removed":
-                    publisher.publish_removed(**payload)
-                elif kind == "cleared":
-                    publisher.publish_all_cleared()
-            except Exception:
-                logger.exception("Failed to publish Megatron KV event %s", kind)
+                pass
+
+    @staticmethod
+    def _publish_event(publisher: KvEventPublisher, kind: str, payload: dict) -> None:
+        try:
+            if kind == "stored":
+                publisher.publish_stored(**payload)
+            elif kind == "removed":
+                publisher.publish_removed(**payload)
+            else:
+                publisher.publish_all_cleared()
+        except Exception:
+            logger.exception("Failed to publish Megatron KV event %s", kind)

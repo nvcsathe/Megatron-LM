@@ -35,7 +35,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
     get_layer_maps_from_layer_type_list,
 )
 from megatron.core.package_info import __version__ as mcore_version
-from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceAllGatherDispatcherBase,
@@ -88,9 +88,6 @@ DEPRECATED_ARGS = [
     "tensor_model_parallel_size",
     "pipeline_model_parallel_size",
     "pg_collection",
-    "cache_mla_latent",
-    "kv_lora_rank",
-    "qk_pos_emb_head_dim",
     "num_cuda_graphs",
     "materialize_only_last_token_logits",
     "mamba_inference_state_config",
@@ -262,6 +259,14 @@ class DynamicInferenceContext(BaseInferenceContext):
     def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
         super().__init__(inference_config=inference_config)
 
+        if (
+            model_config.multi_latent_attention
+            and model_config.experimental_attention_variant != "dsa"
+        ):
+            raise NotImplementedError(
+                "Multi-latent attention is not supported by Megatron inference."
+            )
+
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
         self.prefix_caching_eviction_policy = inference_config.prefix_caching_eviction_policy
@@ -283,14 +288,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.step_count = 0
         self.async_sched_step_count = 0
         self.async_sched_compaction_step_count = 0
-
-        self.cache_mla_latent = (
-            isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
-        )
-        if self.cache_mla_latent:
-            assert (
-                inference_config.block_size_tokens == 64
-            ), "Flash MLA requires a block size of 64. Set --inference-dynamic-batching-block-size 64 to fix this assert"
 
         # Per partition num heads and hidden size.
         num_attention_heads = model_config.num_query_groups or model_config.num_attention_heads
@@ -397,24 +394,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Block size tokens, bytes.
         kv_dtype_size_bytes = model_config.params_dtype.itemsize
         self.block_size_tokens = inference_config.block_size_tokens
-        if self.cache_mla_latent:
-            #   one vector  c_t  (rank)  +  optional RoPE phase slice
-            self.kv_reduced_dim = model_config.kv_lora_rank + model_config.qk_pos_emb_head_dim
-            self.block_size_bytes = (
-                kv_dtype_size_bytes
-                * self.num_attention_layers
-                * self.block_size_tokens
-                * self.kv_reduced_dim
-            )
-        else:
-            self.block_size_bytes = (
-                kv_dtype_size_bytes
-                * 2  # key, value
-                * self.num_attention_layers
-                * self.block_size_tokens
-                * self.num_attention_heads_per_partition
-                * self.hidden_size_per_attention_head
-            )
+        self.block_size_bytes = (
+            kv_dtype_size_bytes
+            * 2  # key, value
+            * self.num_attention_layers
+            * self.block_size_tokens
+            * self.num_attention_heads_per_partition
+            * self.hidden_size_per_attention_head
+        )
         assert self.block_size_bytes > 0
 
         mamba_states_memory_per_request = 0
@@ -803,30 +790,18 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def _allocate_memory_buffer(self):
         """Allocate the KV cache memory buffer."""
-        if self.cache_mla_latent:
-            self.memory_buffer = torch.empty(
-                (
-                    self.num_attention_layers,
-                    self.kv_block_allocator.total_count,
-                    self.block_size_tokens,
-                    self.kv_reduced_dim,
-                ),
-                dtype=self.params_dtype,
-                device=torch.cuda.current_device(),
-            )
-        else:
-            self.memory_buffer = torch.empty(
-                (
-                    2,  # key and value
-                    self.num_attention_layers,
-                    self.kv_block_allocator.total_count,
-                    self.block_size_tokens,
-                    self.num_attention_heads_per_partition,
-                    self.hidden_size_per_attention_head,
-                ),
-                dtype=self.params_dtype,
-                device=torch.cuda.current_device(),
-            )
+        self.memory_buffer = torch.empty(
+            (
+                2,  # key and value
+                self.num_attention_layers,
+                self.kv_block_allocator.total_count,
+                self.block_size_tokens,
+                self.num_attention_heads_per_partition,
+                self.hidden_size_per_attention_head,
+            ),
+            dtype=self.params_dtype,
+            device=torch.cuda.current_device(),
+        )
         if (
             self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
             and not self._uses_torch_memory_saver
@@ -1560,8 +1535,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         attention_layer_number = self.layer_map[layer_number - 1]
 
-        if triton_append_key_value_cache is not None and not self.cache_mla_latent:
-            # currently does not support MLA latent cache
+        if triton_append_key_value_cache is not None:
             return triton_append_key_value_cache(
                 layer_number=attention_layer_number,
                 key=key,
@@ -1577,29 +1551,19 @@ class DynamicInferenceContext(BaseInferenceContext):
             : self.padded_active_token_count
         ]
 
-        if not self.cache_mla_latent:
-            assert key.size(1) == 1 and value.size(1) == 1
+        assert key.size(1) == 1 and value.size(1) == 1
 
         key = key.squeeze(1)
-        # There is no value cache in FlashMLA/absorption
-        if not self.cache_mla_latent:
-            value = value.squeeze(1)
+        value = value.squeeze(1)
 
-        if self.cache_mla_latent:
-            # We pass the kv_concat as the key in cache_mla_latent
-            kv_concat = key
-            self.memory_buffer[attention_layer_number, block_idx, local_kv_seq_idx] = kv_concat[
-                : self.padded_active_token_count
-            ]
-        else:
-            self.memory_buffer[0, attention_layer_number, block_idx, local_kv_seq_idx] = key[
-                : self.padded_active_token_count
-            ]
-            self.memory_buffer[1, attention_layer_number, block_idx, local_kv_seq_idx] = value[
-                : self.padded_active_token_count
-            ]
+        self.memory_buffer[0, attention_layer_number, block_idx, local_kv_seq_idx] = key[
+            : self.padded_active_token_count
+        ]
+        self.memory_buffer[1, attention_layer_number, block_idx, local_kv_seq_idx] = value[
+            : self.padded_active_token_count
+        ]
 
-    def key_value_cache(self, layer_number: int) -> Tuple[Tensor, Optional[Tensor], Tensor]:
+    def key_value_cache(self, layer_number: int) -> Tuple[Tensor, Tensor, Tensor]:
         """Read from KV cache.
 
         Args:
@@ -1613,18 +1577,11 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         assert self.active_attn_metadata is not None
 
-        if self.cache_mla_latent:
-            return (
-                self.memory_buffer[attention_layer_number],
-                None,
-                self.active_attn_metadata["mha_metadata"].state_data["block_table"],
-            )
-        else:
-            return (
-                self.memory_buffer[0, attention_layer_number],
-                self.memory_buffer[1, attention_layer_number],
-                self.active_attn_metadata["mha_metadata"].state_data["block_table"],
-            )
+        return (
+            self.memory_buffer[0, attention_layer_number],
+            self.memory_buffer[1, attention_layer_number],
+            self.active_attn_metadata["mha_metadata"].state_data["block_table"],
+        )
 
     def mamba_states_cache(
         self, layer_number: int, intermediate: bool = False
@@ -1775,7 +1732,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             cu_seqlens=cu_seqlens_q,
             cp_group=cp_group,
             mscale=mscale,
-            mla_rotary_interleaved=config.multi_latent_attention,
+            mla_rotary_interleaved=config.experimental_attention_variant == "dsa",
         )
         return query
 
@@ -1815,7 +1772,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 config=config,
                 cp_group=cp_group,
                 mscale=mscale,
-                mla_rotary_interleaved=config.multi_latent_attention,
+                mla_rotary_interleaved=config.experimental_attention_variant == "dsa",
             )
         else:
             key[:n] = apply_rotary_pos_emb(
@@ -1824,7 +1781,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 config=config,
                 cp_group=cp_group,
                 mscale=mscale,
-                mla_rotary_interleaved=config.multi_latent_attention,
+                mla_rotary_interleaved=config.experimental_attention_variant == "dsa",
             )
         return key
 

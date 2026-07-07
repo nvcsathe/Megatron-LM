@@ -23,7 +23,6 @@ class Config:
     nproc_per_node: int
     coordinator_host: str | None
     coordinator_port: int | None
-    kv_transfer_listen_addr: str | None
     worker_id_file: str | None
     megatron_root: str
     drain_timeout: float
@@ -38,6 +37,17 @@ def _split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
         return argv, []
     separator = argv.index("--")
     return argv[:separator], argv[separator + 1 :]
+
+
+def add_engine_service_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Add arguments shared by the Dynamo parent and Megatron child service."""
+
+    parser.add_argument(
+        "--role", choices=["aggregated", "prefill", "decode"], default="aggregated"
+    )
+    parser.add_argument("--coordinator-host", default=None)
+    parser.add_argument("--coordinator-port", type=int, default=None)
+    return parser
 
 
 def parse_args(argv: list[str] | None = None) -> Config:
@@ -56,13 +66,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser.add_argument("--discovery-backend", default="etcd")
     parser.add_argument("--request-plane", default="nats")
     parser.add_argument("--event-plane", default="nats")
-    parser.add_argument(
-        "--role", choices=["aggregated", "prefill", "decode"], default="aggregated"
-    )
+    add_engine_service_args(parser)
     parser.add_argument("--nproc-per-node", type=int, required=True)
-    parser.add_argument("--coordinator-host", default=None)
-    parser.add_argument("--coordinator-port", type=int, default=None)
-    parser.add_argument("--kv-transfer-listen-addr", default=None)
     parser.add_argument(
         "--worker-id-file",
         default=None,
@@ -87,8 +92,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
         parser.error("--engine-shutdown-timeout must be positive")
     if not megatron_argv:
         parser.error("Megatron arguments are required after '--'")
-    if args.role in ("prefill", "decode") and not args.kv_transfer_listen_addr:
-        parser.error("disaggregated roles require --kv-transfer-listen-addr")
     if args.role in ("prefill", "decode") and not args.coordinator_host:
         parser.error("disaggregated roles require a routable --coordinator-host")
 
@@ -108,7 +111,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
         nproc_per_node=args.nproc_per_node,
         coordinator_host=args.coordinator_host,
         coordinator_port=args.coordinator_port,
-        kv_transfer_listen_addr=args.kv_transfer_listen_addr,
         worker_id_file=args.worker_id_file,
         megatron_root=args.megatron_root,
         drain_timeout=args.drain_timeout,

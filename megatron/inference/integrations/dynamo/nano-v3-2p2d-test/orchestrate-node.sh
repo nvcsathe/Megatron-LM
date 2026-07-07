@@ -26,7 +26,6 @@ NATS_PORT="${NATS_PORT:-4222}"
 NATS_MONITOR_PORT="${NATS_MONITOR_PORT:-8222}"
 ETCD_PORT="${ETCD_PORT:-2379}"
 COORD_PORT_BASE="${COORD_PORT_BASE:-5555}"
-NIXL_PORT_BASE="${NIXL_PORT_BASE:-7000}"
 WORKER_START_TIMEOUT="${WORKER_START_TIMEOUT:-1800}"
 TEST_TIMEOUT_SECONDS="${TEST_TIMEOUT_SECONDS:-3600}"
 
@@ -189,7 +188,6 @@ for ((local_worker = 0; local_worker < WORKERS_PER_NODE; local_worker++)); do
             --nproc-per-node "$ROLE_EP_SIZE" \
             --coordinator-host "$NODE_HOST" \
             --coordinator-port "$((COORD_PORT_BASE + local_worker))" \
-            --kv-transfer-listen-addr "$NODE_HOST:$((NIXL_PORT_BASE + local_worker))" \
             --worker-id-file "$worker_id_file" \
             --engine-start-timeout "$WORKER_START_TIMEOUT" \
             --megatron-root /opt/megatron-lm \
@@ -256,4 +254,3 @@ else
 fi
 
 exit "$TEST_RC"
-

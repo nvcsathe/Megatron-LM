@@ -468,7 +468,7 @@ def build_reshard_plan(
         ):
             raise NotImplementedError(
                 "heterogeneous TP KV handoff requires the K/V-split "
-                "[2, L, B, T, H, d] layout; MLA head slicing is unsupported"
+                "[2, L, B, T, H, d] layout"
             )
         if full_heads and full_layers:
             segments.append(

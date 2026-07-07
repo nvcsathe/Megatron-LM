@@ -27,7 +27,7 @@ def _config(role="aggregated"):
         nproc_per_node=1,
         coordinator_host=None,
         coordinator_port=None,
-        kv_transfer_listen_addr="127.0.0.1:7000" if role != "aggregated" else None,
+        worker_id_file=None,
         megatron_root="/opt/megatron-lm",
         drain_timeout=0.1,
         megatron_argv=["--load", "/checkpoint"],

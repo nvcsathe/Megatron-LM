@@ -65,25 +65,33 @@ class NixlPullHandle:
     submitted_at: float
     timeout_s: float = _POLL_TIMEOUT_S
     done: bool = False
+    error: Optional[str] = None
 
     def poll(self) -> bool:
         if self.done:
+            if self.error is not None:
+                raise RuntimeError(self.error)
             return True
         if not self.xfers:
             self.done = True
             return True
 
+        errors: List[str] = []
         pending: List[str] = []
         for xfer, ctx in zip(self.xfers, self.contexts):
             state = self.agent.check_xfer_state(xfer)
             if state == "DONE":
                 continue
             if state == "ERR":
-                raise RuntimeError(f"NIXL transfer failed ({ctx})")
+                errors.append(ctx)
+                continue
             pending.append(f"{ctx}: {state}")
 
         if not pending:
             self.done = True
+            if errors:
+                self.error = f"NIXL transfer failed ({', '.join(errors)})"
+                raise RuntimeError(self.error)
             return True
         if time.perf_counter() - self.submitted_at > self.timeout_s:
             raise TimeoutError(
@@ -161,7 +169,7 @@ class NixlTransferBackend:
             and heads_per_partition * tp_size == num_kv_heads_global
         )  # type: ignore[operator]
         # Locate the blocks axis by allocator size instead of layout position.
-        # Current layouts are MLA [L, B, T, D] and K/V split [2, L, B, T, H, d].
+        # The inference KV layout is [2, L, B, T, H, d].
         shape = list(memory_buffer.shape)
         candidates = [i for i, dim in enumerate(shape) if dim == expected_num_blocks]
         if not candidates:
@@ -217,6 +225,10 @@ class NixlTransferBackend:
                 layer_start=int(layer_start),
                 num_local_layers=int(layer_end) - int(layer_start),
             )
+            if self._geometry.blocks_axis != 2:
+                raise ValueError(
+                    "inference KV transfers require the [2, L, B, T, H, d] layout"
+                )
             if self._layout.local_num_heads() != heads_per_partition:
                 raise ValueError(
                     "heads_per_partition does not match the canonical KV layout: "
@@ -386,15 +398,36 @@ class NixlTransferBackend:
             segments = self._matched_segments(peer_meta, src_block_ids, dst_block_ids)
         xfers: List[Any] = []
         contexts: List[str] = []
-        for seg in segments:
-            xfer, ctx = self._begin_segment(seg, dst_block_ids)
-            xfers.append(xfer)
-            contexts.append(ctx)
+        submitted_at = time.perf_counter()
+        try:
+            for seg in segments:
+                xfer, ctx = self._begin_segment(seg, dst_block_ids)
+                xfers.append(xfer)
+                contexts.append(ctx)
+        except Exception as exc:
+            if xfers:
+                cleanup = NixlPullHandle(
+                    agent=self._agent,
+                    xfers=xfers,
+                    contexts=contexts,
+                    submitted_at=submitted_at,
+                )
+                try:
+                    cleanup.wait()
+                except TimeoutError:
+                    # Tell the owner not to recycle the destination storage while
+                    # an already-submitted transfer may still write to it.
+                    setattr(exc, "transfer_destinations_safe", False)
+                except Exception:
+                    # Transfer errors are reported only after every submitted
+                    # segment has reached a terminal state.
+                    pass
+            raise
         return NixlPullHandle(
             agent=self._agent,
             xfers=xfers,
             contexts=contexts,
-            submitted_at=time.perf_counter(),
+            submitted_at=submitted_at,
         )
 
     def _begin_segment(
@@ -489,7 +522,13 @@ class NixlTransferBackend:
         dst_descs = self._agent.get_xfer_descs(dst_tuples, mem_type="VRAM")
         # READ pulls remote -> local. Signature is (op, local, remote, peer).
         xfer = self._agent.initialize_xfer("READ", dst_descs, src_descs, peer_id)
-        self._agent.transfer(xfer)
+        try:
+            self._agent.transfer(xfer)
+        except Exception as exc:
+            # The transport may have accepted the operation before surfacing an
+            # error, so its destination cannot be proven safe for immediate reuse.
+            setattr(exc, "transfer_destinations_safe", False)
+            raise
         return xfer, ctx
 
     def close(self) -> None:

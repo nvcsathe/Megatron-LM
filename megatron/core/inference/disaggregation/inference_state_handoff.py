@@ -51,20 +51,32 @@ class InferenceStateHandoffMixin:
         return bool(self._pending_kv_imports)
 
     def _reset_pending_kv_imports(self) -> None:
-        """Clear pending import bookkeeping during an engine reset."""
+        """Drain and release pending imports before an engine reset."""
 
-        self._pending_kv_imports = deque()
+        if not hasattr(self, "_pending_kv_imports"):
+            self._pending_kv_imports = deque()
+            return
+        unsafe = deque()
+        while self._pending_kv_imports:
+            pending = self._pending_kv_imports.popleft()
+            if self._wait_for_pending_kv_import(pending):
+                self._release_pending_kv_import(pending)
+                if not pending.future.done():
+                    pending.future.cancel()
+            else:
+                unsafe.append(pending)
+        self._pending_kv_imports = unsafe
+        if unsafe:
+            raise RuntimeError(
+                "Cannot reset while KV handoff transfers may still write to cache storage"
+            )
 
-    def setup_kv_transfer(self, role: str, listen_addr: Optional[str]) -> None:
-        """Bring up the NIXL transfer agent for this engine, if configured.
+    def setup_kv_transfer(self, role: str) -> None:
+        """Bring up the NIXL transfer agents for this engine.
 
         Args:
             role: "prefill" or "decode"; used to name the local NIXL agent.
-            listen_addr: ``host:port`` for the NIXL agent. ``None`` disables
-                KV transfer.
         """
-        if not listen_addr:
-            return
         from megatron.core.inference.disaggregation.transfer_backends.nixl import (
             NixlTransferBackend,
         )
@@ -397,6 +409,7 @@ class InferenceStateHandoffMixin:
             )
         local_blocks = [int(b) for b in local_blocks_tensor.tolist()]
 
+        handle = None
         try:
             handle = self._kv_transfer_agent.begin_pull_blocks(
                 kv_meta, src_block_ids, local_blocks
@@ -408,8 +421,17 @@ class InferenceStateHandoffMixin:
                 if mamba_meta and local_has_mamba
                 else None
             )
-        except Exception:
-            allocator.release_memory_blocks(local_blocks_tensor)
+        except Exception as exc:
+            safe_to_release = getattr(exc, "transfer_destinations_safe", True)
+            if handle is not None:
+                safe_to_release &= self._wait_for_transfer_handles(handle)
+            if safe_to_release:
+                allocator.release_memory_blocks(local_blocks_tensor)
+            else:
+                logging.error(
+                    "Quarantining KV blocks after a timed-out handoff submission: %s",
+                    local_blocks,
+                )
             raise
 
         future = self._loop.create_future()
@@ -504,6 +526,30 @@ class InferenceStateHandoffMixin:
                 for block_id in pending.mamba.target_blocks:
                     msa.invalidate_block(int(block_id))
 
+    @staticmethod
+    def _wait_for_transfer_handles(*handles) -> bool:
+        """Wait for known handles; return false if any may still be active."""
+
+        safe_to_release = True
+        for handle in handles:
+            if handle is None:
+                continue
+            try:
+                handle.wait()
+            except TimeoutError:
+                safe_to_release = False
+            except Exception:
+                # NIXL reports transfer errors only after all segments belonging
+                # to the handle have reached a terminal state.
+                pass
+        return safe_to_release
+
+    def _wait_for_pending_kv_import(self, pending: PendingKvImport) -> bool:
+        handles = [pending.handle]
+        if pending.mamba is not None:
+            handles.extend((pending.mamba.conv_handle, pending.mamba.ssm_handle))
+        return self._wait_for_transfer_handles(*handles)
+
     def _poll_pending_kv_imports(self) -> int:
         if not self._pending_kv_imports:
             return 0
@@ -518,7 +564,15 @@ class InferenceStateHandoffMixin:
                 else:
                     remaining.append(pending)
             except Exception as exc:
-                self._release_pending_kv_import(pending)
+                safe_to_release = self._wait_for_pending_kv_import(pending)
+                if safe_to_release:
+                    self._release_pending_kv_import(pending)
+                else:
+                    remaining.append(pending)
+                    logging.error(
+                        "Quarantining request %d cache storage after transfer timeout",
+                        pending.request_id,
+                    )
                 if not pending.future.done():
                     pending.future.set_exception(exc)
                 logging.exception(
@@ -573,6 +627,7 @@ class InferenceStateHandoffMixin:
             )
         target_blocks = [int(local_blocks[p]) for p in positions]
         local_slots = msa.allocate_slots_batch(target_blocks)
+        conv_handle = None
         try:
             conv_handle = self._mamba_conv_agent.begin_pull_blocks(
                 mamba_meta["conv"], src_slots, local_slots
@@ -580,9 +635,18 @@ class InferenceStateHandoffMixin:
             ssm_handle = self._mamba_ssm_agent.begin_pull_blocks(
                 mamba_meta["ssm"], src_slots, local_slots
             )
-        except Exception:
-            for block_id in target_blocks:
-                msa.invalidate_block(block_id)
+        except Exception as exc:
+            safe_to_release = getattr(exc, "transfer_destinations_safe", True)
+            if conv_handle is not None:
+                safe_to_release &= self._wait_for_transfer_handles(conv_handle)
+            if safe_to_release:
+                for block_id in target_blocks:
+                    msa.invalidate_block(block_id)
+            else:
+                logging.error(
+                    "Quarantining Mamba slots after a timed-out handoff submission: %s",
+                    local_slots,
+                )
             raise
         logging.info(
             "DISAGG_DECODE_MAMBA_IMPORT_SUBMIT request_id=%d mamba_blocks=%d",

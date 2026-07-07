@@ -10,38 +10,34 @@ parent-owned engine event socket.
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 
 import torch
 import torch.distributed as dist
 
 from megatron.core.utils import get_pg_size
+from megatron.inference.integrations.dynamo.args import add_engine_service_args
 from megatron.inference.integrations.dynamo.protocol import (
     build_ready_payload,
     build_engine_metadata,
     logical_replica_group,
 )
 from megatron.inference.integrations.dynamo.telemetry import EngineEventReporter
-from megatron.inference.utils import add_inference_args, get_dynamic_inference_engine
+from megatron.inference.utils import (
+    add_inference_args,
+    get_dynamic_inference_engine,
+    serve_dynamic_inference_engine,
+)
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.initialize import initialize_megatron
 
 
-def _extra_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+def _extra_args(parser):
     parser = add_inference_args(add_modelopt_args(parser))
     parser.add_argument("--dynamo-parent-event-address", required=True)
-    parser.add_argument(
-        "--dynamo-role",
-        choices=["aggregated", "prefill", "decode"],
-        default="aggregated",
-    )
-    parser.add_argument("--dynamo-coordinator-host", default=None)
-    parser.add_argument("--dynamo-coordinator-port", type=int, default=None)
-    parser.add_argument("--dynamo-kv-transfer-listen-addr", default=None)
-    return parser
+    return add_engine_service_args(parser)
 
 
 async def _serve() -> None:
@@ -59,20 +55,13 @@ async def _serve() -> None:
             f"EP={args.expert_model_parallel_size}"
         )
 
-    if args.dynamo_role in ("prefill", "decode"):
-        engine.setup_kv_transfer(
-            role=args.dynamo_role,
-            listen_addr=args.dynamo_kv_transfer_listen_addr,
-        )
+    if args.role in ("prefill", "decode"):
+        engine.setup_kv_transfer(role=args.role)
 
-    coordinator_address = await engine.start_listening_to_data_parallel_coordinator(
-        inference_coordinator_port=args.dynamo_coordinator_port,
-        hostname=args.dynamo_coordinator_host,
-    )
     reporter = EngineEventReporter(engine, args.dynamo_parent_event_address)
     reporter.start()
 
-    if dist.get_rank() == 0:
+    def ready(coordinator_address):
         reporter.observe(
             "ready",
             build_ready_payload(
@@ -82,7 +71,12 @@ async def _serve() -> None:
         )
 
     try:
-        await engine.engine_loop_task
+        await serve_dynamic_inference_engine(
+            engine,
+            coordinator_host=args.coordinator_host,
+            coordinator_port=args.coordinator_port,
+            on_ready=ready,
+        )
     finally:
         reporter.stop()
 

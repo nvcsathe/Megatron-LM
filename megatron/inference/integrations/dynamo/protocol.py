@@ -33,7 +33,7 @@ def build_engine_metadata(engine, args) -> dict:
         "total_kv_blocks": max(0, int(allocator.total_count) - 1),
         "max_num_seqs": int(engine.context.max_requests),
         "max_num_batched_tokens": int(engine.context.max_tokens),
-        "role": str(args.dynamo_role),
+        "role": str(args.role),
         "bos_token_id": _bos_token_id(engine.controller.tokenizer),
         "enable_prefix_caching": bool(engine.context.enable_prefix_caching),
         "logical_data_parallel_size": 1,

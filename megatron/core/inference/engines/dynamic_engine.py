@@ -316,6 +316,7 @@ class DynamicInferenceEngine(InferenceStateHandoffMixin, AbstractEngine):
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
 
+        self._reset_pending_kv_imports()
         self.context.reset()
 
         # Request state.
@@ -327,7 +328,6 @@ class DynamicInferenceEngine(InferenceStateHandoffMixin, AbstractEngine):
         self.waiting_request_ids = deque()
         if hasattr(self, "_pinned_handoff_blocks"):
             self._pinned_handoff_blocks.clear()
-        self._reset_pending_kv_imports()
         self.failed_request_ids = []
         # Generated token count already streamed for each request.
         self._partial_emit_lengths: Dict[int, int] = {}

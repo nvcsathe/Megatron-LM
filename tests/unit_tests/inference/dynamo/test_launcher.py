@@ -38,7 +38,7 @@ def test_parse_args_splits_dynamo_and_megatron_arguments():
     ]
 
 
-def test_disaggregated_role_requires_transfer_and_coordinator_addresses():
+def test_disaggregated_role_requires_coordinator_address():
     with pytest.raises(SystemExit):
         parse_args(
             [
