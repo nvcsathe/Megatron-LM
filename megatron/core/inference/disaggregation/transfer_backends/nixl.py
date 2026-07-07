@@ -22,15 +22,10 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-from megatron.core.inference.disaggregation.kv_reshard import (
-    KVBufferGeometry,
-    KVShardLayout,
-    TransferSegment,
-    build_reshard_plan,
-)
+from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout, plan_kv_reshard
 from megatron.core.inference.disaggregation.mamba_reshard import (
     MambaShardLayout,
-    build_mamba_reshard_plan,
+    plan_mamba_reshard,
 )
 from megatron.core.inference.disaggregation.utils import transfer_peer_records
 
@@ -200,16 +195,13 @@ class NixlTransferBackend:
         for dim in shape[:blocks_axis]:
             num_outer *= dim
         self._outer_stride_bytes = expected_num_blocks * bytes_per_slice
-        self._geometry = KVBufferGeometry(
-            num_outer=num_outer,
-            bytes_per_slice=bytes_per_slice,
-            blocks_axis=blocks_axis,
-            num_blocks=expected_num_blocks,
-            heads_per_partition=heads_per_partition,
-            head_dim=head_dim,
-            tokens_per_block=tokens_per_block,
-            element_size=self._element_size,
-        )
+        self._num_outer = num_outer
+        self._bytes_per_slice = bytes_per_slice
+        self._blocks_axis = blocks_axis
+        self._num_blocks = expected_num_blocks
+        self._heads_per_partition = heads_per_partition
+        self._head_dim = head_dim
+        self._tokens_per_block = tokens_per_block
 
         # Canonical KV layout. Mamba agents carry their separate typed layout.
         self._layout = None
@@ -225,7 +217,7 @@ class NixlTransferBackend:
                 layer_start=int(layer_start),
                 num_local_layers=int(layer_end) - int(layer_start),
             )
-            if self._geometry.blocks_axis != 2:
+            if self._blocks_axis != 2:
                 raise ValueError(
                     "inference KV transfers require the [2, L, B, T, H, d] layout"
                 )
@@ -234,9 +226,9 @@ class NixlTransferBackend:
                     "heads_per_partition does not match the canonical KV layout: "
                     f"{heads_per_partition} vs {self._layout.local_num_heads()}"
                 )
-            if self._geometry.num_outer % self._layout.local_num_layers() != 0:
+            if self._num_outer % self._layout.local_num_layers() != 0:
                 raise ValueError(
-                    f"num_outer={self._geometry.num_outer} is not divisible by local layers="
+                    f"num_outer={self._num_outer} is not divisible by local layers="
                     f"{self._layout.local_num_layers()}"
                 )
 
@@ -266,11 +258,11 @@ class NixlTransferBackend:
             "(blocks_axis=%d, %d outer-slices/block × %d bytes/slice = "
             "%d bytes/block, device=%d, shape=%s)",
             agent_name,
-            self._geometry.num_blocks,
-            self._geometry.blocks_axis,
-            self._geometry.num_outer,
-            self._geometry.bytes_per_slice,
-            self._geometry.num_outer * self._geometry.bytes_per_slice,
+            self._num_blocks,
+            self._blocks_axis,
+            self._num_outer,
+            self._bytes_per_slice,
+            self._num_outer * self._bytes_per_slice,
             self._device_id,
             shape,
         )
@@ -289,10 +281,30 @@ class NixlTransferBackend:
             "base_addr": self._buf_ptr,
             "outer_stride_bytes": self._outer_stride_bytes,
             "device_id": self._device_id,
+            "num_outer": self._num_outer,
+            "bytes_per_slice": self._bytes_per_slice,
+            "blocks_axis": self._blocks_axis,
+            "num_blocks": self._num_blocks,
+            "heads_per_partition": self._heads_per_partition,
+            "head_dim": self._head_dim,
+            "tokens_per_block": self._tokens_per_block,
+            "element_size": self._element_size,
         }
-        meta.update(self._geometry.to_meta())
         if self._layout is not None:
-            meta.update(self._layout.to_meta())
+            layer_start, layer_end = self._layout.layer_range()
+            meta.update(
+                {
+                    "global_rank": self._layout.global_rank,
+                    "tp_size": self._layout.tp_size,
+                    "tp_rank": self._layout.tp_rank,
+                    "pp_size": self._layout.pp_size,
+                    "pp_rank": self._layout.pp_rank,
+                    "num_layers_global": self._layout.num_layers,
+                    "num_kv_heads_global": self._layout.num_heads,
+                    "layer_start": layer_start,
+                    "layer_end": layer_end,
+                }
+            )
         if self._mamba_layout is not None:
             meta["mamba_layout"] = asdict(self._mamba_layout)
         return meta
@@ -316,32 +328,86 @@ class NixlTransferBackend:
         )
         return resolved
 
-    def _matched_segments(
-        self, peer_meta: Any, src_block_ids: List[int], dst_block_ids: List[int]
-    ) -> List[TransferSegment]:
-        """Build a whole-buffer copy for state with no resharding policy."""
+    def _validate_peer(
+        self,
+        meta: Dict[str, Any],
+        src_block_ids: List[int],
+        dst_block_ids: List[int],
+        *,
+        matched_layout: bool = False,
+    ) -> None:
+        """Validate block mappings and physical transfer compatibility."""
 
-        records = transfer_peer_records(peer_meta, src_block_ids)
-        if len(records) != 1:
-            raise ValueError("matched-layout transfer requires exactly one source peer")
-        meta, blocks = records[0]
-        peer_geometry = KVBufferGeometry.from_meta(meta)
-        self._geometry.validate_transfer_from(
-            peer_geometry,
-            blocks,
-            dst_block_ids,
-            peer_name=meta.get("agent_name"),
-            require_matched_layout=True,
-        )
-        return [
-            TransferSegment(
-                peer_meta=meta,
-                src_block_ids=blocks,
-                src_o_start=0,
-                dst_o_start=0,
-                n_outer=self._geometry.num_outer,
+        if len(src_block_ids) != len(dst_block_ids):
+            raise ValueError(
+                f"source/destination block_id length mismatch for peer "
+                f"{meta.get('agent_name')!r}: {len(src_block_ids)} vs {len(dst_block_ids)}"
             )
+        for block in src_block_ids:
+            if not 0 <= block < int(meta["num_blocks"]):
+                raise ValueError(
+                    f"source block {block} is outside pool [0, {meta['num_blocks']})"
+                )
+        for block in dst_block_ids:
+            if not 0 <= block < self._num_blocks:
+                raise ValueError(
+                    f"destination block {block} is outside pool [0, {self._num_blocks})"
+                )
+
+        local = {
+            "head_dim": self._head_dim,
+            "tokens_per_block": self._tokens_per_block,
+            "element_size": self._element_size,
+            "num_outer": self._num_outer,
+            "bytes_per_slice": self._bytes_per_slice,
+            "blocks_axis": self._blocks_axis,
+            "heads_per_partition": self._heads_per_partition,
+        }
+        fields = ["head_dim", "tokens_per_block", "element_size"]
+        if matched_layout:
+            fields.extend(
+                ["num_outer", "bytes_per_slice", "blocks_axis", "heads_per_partition"]
+            )
+        mismatches = [
+            f"{field}: peer={meta.get(field)} local={local[field]}"
+            for field in fields
+            if meta.get(field) is not None
+            and local[field] is not None
+            and meta.get(field) != local[field]
         ]
+        if mismatches:
+            kind = "matched-layout" if matched_layout else "transfer"
+            raise ValueError(f"{kind} geometry mismatch: {', '.join(mismatches)}")
+
+    @staticmethod
+    def _kv_layout_from_meta(meta: Dict[str, Any]) -> KVShardLayout:
+        """Reconstruct a main-planner KV layout from peer wire metadata."""
+
+        keys = (
+            "global_rank",
+            "tp_size",
+            "tp_rank",
+            "pp_size",
+            "pp_rank",
+            "num_layers_global",
+            "num_kv_heads_global",
+            "layer_start",
+            "layer_end",
+        )
+        missing = [key for key in keys if meta.get(key) is None]
+        if missing:
+            raise ValueError(f"peer metadata missing KV layout fields: {missing}")
+        return KVShardLayout(
+            num_layers=int(meta["num_layers_global"]),
+            num_heads=int(meta["num_kv_heads_global"]),
+            tp_size=int(meta["tp_size"]),
+            tp_rank=int(meta["tp_rank"]),
+            pp_size=int(meta["pp_size"]),
+            pp_rank=int(meta["pp_rank"]),
+            global_rank=int(meta["global_rank"]),
+            layer_start=int(meta["layer_start"]),
+            num_local_layers=int(meta["layer_end"]) - int(meta["layer_start"]),
+        )
 
     def pull_blocks(
         self,
@@ -377,31 +443,185 @@ class NixlTransferBackend:
                     done=True,
                 )
 
-        if self._mamba_layout is not None:
-            segments = build_mamba_reshard_plan(
-                peer_meta,
-                src_block_ids,
-                dst_block_ids,
-                self._mamba_layout,
-                self._geometry,
-                self._mamba_state_kind,
-            )
-        elif self._layout is not None:
-            segments = build_reshard_plan(
-                peer_meta,
-                src_block_ids,
-                dst_block_ids,
-                self._layout,
-                self._geometry,
-            )
-        else:
-            segments = self._matched_segments(peer_meta, src_block_ids, dst_block_ids)
         xfers: List[Any] = []
         contexts: List[str] = []
         submitted_at = time.perf_counter()
         try:
-            for seg in segments:
-                xfer, ctx = self._begin_segment(seg, dst_block_ids)
+            if self._mamba_layout is not None:
+                state_kind = self._mamba_state_kind
+                assert state_kind is not None
+                width = (
+                    self._mamba_layout.conv_dim_local
+                    if state_kind == "conv"
+                    else self._mamba_layout.nheads_local
+                )
+                if (
+                    self._heads_per_partition != width
+                    or self._num_outer != self._mamba_layout.num_layers
+                    or self._blocks_axis != 1
+                ):
+                    raise ValueError(
+                        f"local {state_kind} geometry does not match its Mamba layout"
+                    )
+
+                sources = []
+                peers_by_rank = {}
+                for meta, blocks in transfer_peer_records(peer_meta, src_block_ids):
+                    raw_layout = meta.get("mamba_layout")
+                    if not isinstance(raw_layout, dict):
+                        raise ValueError("peer metadata is missing mamba_layout")
+                    layout = MambaShardLayout(**raw_layout)
+                    self._validate_peer(meta, blocks, dst_block_ids)
+                    peer_width = (
+                        layout.conv_dim_local
+                        if state_kind == "conv"
+                        else layout.nheads_local
+                    )
+                    if (
+                        meta.get("heads_per_partition") != peer_width
+                        or int(meta["num_outer"]) != layout.num_layers
+                        or int(meta["blocks_axis"]) != 1
+                    ):
+                        raise ValueError(
+                            f"peer {state_kind} geometry does not match its Mamba layout"
+                        )
+                    if layout.global_rank in peers_by_rank:
+                        raise ValueError(
+                            f"duplicate source global_rank={layout.global_rank} "
+                            "in Mamba metadata"
+                        )
+                    sources.append(layout)
+                    peers_by_rank[layout.global_rank] = (meta, blocks)
+                if not sources:
+                    raise ValueError("Mamba handoff contains no source peer metadata")
+
+                transfers = [
+                    transfer
+                    for transfer in plan_mamba_reshard(sources, [self._mamba_layout])
+                    if transfer.is_conv == (state_kind == "conv")
+                ]
+                for layer in range(self._mamba_layout.num_layers):
+                    intervals = sorted(
+                        (transfer.dst_lo, transfer.dst_hi)
+                        for transfer in transfers
+                        if transfer.dst_layer == layer
+                    )
+                    if not intervals or intervals[0][0] != 0 or intervals[-1][1] != width:
+                        raise ValueError(
+                            f"incomplete Mamba {state_kind} coverage for layer {layer}"
+                        )
+                    if any(a[1] != b[0] for a, b in zip(intervals, intervals[1:])):
+                        raise ValueError(
+                            f"non-contiguous Mamba {state_kind} coverage for layer {layer}"
+                        )
+
+                for transfer in transfers:
+                    meta, blocks = peers_by_rank[transfer.src_rank]
+                    xfer, ctx = self._begin_transfer(
+                        meta,
+                        blocks,
+                        dst_block_ids,
+                        transfer.src_layer,
+                        transfer.dst_layer,
+                        1,
+                        transfer.src_lo,
+                        transfer.dst_lo,
+                        transfer.src_hi - transfer.src_lo,
+                    )
+                    xfers.append(xfer)
+                    contexts.append(ctx)
+            elif self._layout is not None:
+                sources = []
+                peers_by_rank = {}
+                for meta, blocks in transfer_peer_records(peer_meta, src_block_ids):
+                    layout = self._kv_layout_from_meta(meta)
+                    self._validate_peer(meta, blocks, dst_block_ids)
+                    if meta.get("heads_per_partition") != layout.local_num_heads():
+                        raise ValueError(
+                            "peer heads_per_partition does not match its KV layout"
+                        )
+                    if int(meta["num_outer"]) % layout.local_num_layers():
+                        raise ValueError(
+                            "peer num_outer is not divisible by its local layer count"
+                        )
+                    if layout.global_rank in peers_by_rank:
+                        raise ValueError(
+                            f"duplicate source global_rank={layout.global_rank} in KV metadata"
+                        )
+                    sources.append(layout)
+                    peers_by_rank[layout.global_rank] = (meta, blocks, layout)
+                if not sources:
+                    raise ValueError("KV handoff contains no source peer metadata")
+
+                local_planes = self._num_outer // self._layout.local_num_layers()
+                for transfer in plan_kv_reshard(sources, [self._layout]):
+                    meta, blocks, source_layout = peers_by_rank[transfer.src_rank]
+                    source_planes = int(meta["num_outer"]) // source_layout.local_num_layers()
+                    if source_planes != local_planes:
+                        raise ValueError(
+                            f"outer-plane mismatch peer={source_planes} local={local_planes}"
+                        )
+
+                    src_layers = transfer.src_layer_slice(source_layout)
+                    dst_layers = transfer.dst_layer_slice(self._layout)
+                    src_heads = transfer.src_head_slice(source_layout)
+                    dst_heads = transfer.dst_head_slice(self._layout)
+                    layer_count = src_layers.stop - src_layers.start
+                    head_count = src_heads.stop - src_heads.start
+                    full_heads = (
+                        src_heads.start == 0
+                        and src_heads.stop == source_layout.local_num_heads()
+                        and dst_heads.start == 0
+                        and dst_heads.stop == self._layout.local_num_heads()
+                        and int(meta["bytes_per_slice"]) == self._bytes_per_slice
+                    )
+                    full_layers = (
+                        src_layers.start == 0
+                        and src_layers.stop == source_layout.local_num_layers()
+                        and dst_layers.start == 0
+                        and dst_layers.stop == self._layout.local_num_layers()
+                    )
+                    if full_heads and full_layers:
+                        xfer, ctx = self._begin_transfer(
+                            meta, blocks, dst_block_ids, 0, 0, self._num_outer
+                        )
+                        xfers.append(xfer)
+                        contexts.append(ctx)
+                        continue
+                    if not full_heads and (
+                        int(meta["blocks_axis"]) != 2 or self._blocks_axis != 2
+                    ):
+                        raise NotImplementedError(
+                            "KV head resharding requires the [2, L, B, T, H, d] layout"
+                        )
+
+                    for plane in range(local_planes):
+                        xfer, ctx = self._begin_transfer(
+                            meta,
+                            blocks,
+                            dst_block_ids,
+                            plane * source_layout.local_num_layers() + src_layers.start,
+                            plane * self._layout.local_num_layers() + dst_layers.start,
+                            layer_count,
+                            0 if full_heads else src_heads.start,
+                            0 if full_heads else dst_heads.start,
+                            0 if full_heads else head_count,
+                        )
+                        xfers.append(xfer)
+                        contexts.append(ctx)
+            else:
+                records = transfer_peer_records(peer_meta, src_block_ids)
+                if len(records) != 1:
+                    raise ValueError(
+                        "matched-layout transfer requires exactly one source peer"
+                    )
+                meta, blocks = records[0]
+                self._validate_peer(
+                    meta, blocks, dst_block_ids, matched_layout=True
+                )
+                xfer, ctx = self._begin_transfer(
+                    meta, blocks, dst_block_ids, 0, 0, self._num_outer
+                )
                 xfers.append(xfer)
                 contexts.append(ctx)
         except Exception as exc:
@@ -420,7 +640,7 @@ class NixlTransferBackend:
                     setattr(exc, "transfer_destinations_safe", False)
                 except Exception:
                     # Transfer errors are reported only after every submitted
-                    # segment has reached a terminal state.
+                    # transfer has reached a terminal state.
                     pass
             raise
         return NixlPullHandle(
@@ -430,28 +650,33 @@ class NixlTransferBackend:
             submitted_at=submitted_at,
         )
 
-    def _begin_segment(
-        self, seg: TransferSegment, dst_block_ids: List[int]
+    def _begin_transfer(
+        self,
+        peer_meta: Dict[str, Any],
+        src_block_ids: List[int],
+        dst_block_ids: List[int],
+        src_o_start: int,
+        dst_o_start: int,
+        n_outer: int,
+        src_h0: int = 0,
+        dst_h0: int = 0,
+        n_heads: int = 0,
     ) -> tuple[Any, str]:
-        """Submit one full-slice or head-fragment transfer segment."""
-        pm = seg.peer_meta
+        """Submit one full-slice or head-fragment NIXL transfer."""
+        pm = peer_meta
         peer_base = pm["base_addr"]
         peer_device_id = pm.get("device_id", 0)
         peer_bps = pm["bytes_per_slice"]
         peer_os = pm["outer_stride_bytes"]
         peer_id = self._ensure_peer_registered(pm)
 
-        src_block_ids = seg.src_block_ids
-        src_o_start = seg.src_o_start
-        dst_o_start = seg.dst_o_start
-        n_outer = seg.n_outer
-        bps = self._geometry.bytes_per_slice
+        bps = self._bytes_per_slice
         local_os = self._outer_stride_bytes
 
         src_tuples: List[Any] = []
         dst_tuples: List[Any] = []
 
-        if seg.n_heads == 0:
+        if n_heads == 0:
             # One descriptor per block and outer slice.
             for src_b, dst_b in zip(src_block_ids, dst_block_ids):
                 for i in range(n_outer):
@@ -477,16 +702,16 @@ class NixlTransferBackend:
             )
         else:
             # Head sub-range copy: one descriptor per token.
-            assert self._geometry.head_dim is not None
-            assert self._geometry.heads_per_partition is not None
-            assert self._geometry.tokens_per_block is not None
-            d_bytes = self._geometry.head_dim * self._element_size
-            local_token_stride = self._geometry.heads_per_partition * d_bytes
+            assert self._head_dim is not None
+            assert self._heads_per_partition is not None
+            assert self._tokens_per_block is not None
+            d_bytes = self._head_dim * self._element_size
+            local_token_stride = self._heads_per_partition * d_bytes
             peer_token_stride = pm["heads_per_partition"] * d_bytes
-            T = self._geometry.tokens_per_block
-            frag_bytes = seg.n_heads * d_bytes
-            src_h_off = seg.src_h0 * d_bytes
-            dst_h_off = seg.dst_h0 * d_bytes
+            T = self._tokens_per_block
+            frag_bytes = n_heads * d_bytes
+            src_h_off = src_h0 * d_bytes
+            dst_h_off = dst_h0 * d_bytes
 
             for src_b, dst_b in zip(src_block_ids, dst_block_ids):
                 for i in range(n_outer):
@@ -515,7 +740,7 @@ class NixlTransferBackend:
                         )
             ctx = (
                 f"reshard peer={peer_id} outer[{src_o_start}:+{n_outer}] "
-                f"heads[{seg.src_h0}:+{seg.n_heads}] blocks={len(src_block_ids)}"
+                f"heads[{src_h0}:+{n_heads}] blocks={len(src_block_ids)}"
             )
 
         src_descs = self._agent.get_xfer_descs(src_tuples, mem_type="VRAM")
