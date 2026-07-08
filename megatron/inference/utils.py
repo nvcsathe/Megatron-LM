@@ -3,7 +3,7 @@
 import logging
 import warnings
 from argparse import ArgumentParser, Namespace
-from typing import Literal, Optional
+from typing import Literal, Optional, Type
 
 import torch
 
@@ -36,6 +36,24 @@ except ImportError:
     HAS_NVIDIA_MODELOPT = False
 
 logger = logging.getLogger(__name__)
+
+
+async def serve_dynamic_inference_engine(
+    engine: DynamicInferenceEngine,
+    *,
+    coordinator_host: Optional[str] = None,
+    coordinator_port: Optional[int] = None,
+    on_ready=None,
+) -> None:
+    """Run a dynamic engine coordinator until the engine stops."""
+
+    address = await engine.start_listening_to_data_parallel_coordinator(
+        inference_coordinator_port=coordinator_port,
+        hostname=coordinator_host,
+    )
+    if on_ready is not None and torch.distributed.get_rank() == 0:
+        on_ready(address)
+    await engine.engine_loop_task
 
 
 def get_model_builder(
@@ -363,8 +381,11 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
     )
 
 
-def get_dynamic_inference_engine(model: Optional[MegatronModule] = None) -> DynamicInferenceEngine:
-    """Builds a `DynamicInferenceEngine`."""
+def get_dynamic_inference_engine(
+    model: Optional[MegatronModule] = None,
+    engine_class: Type[DynamicInferenceEngine] = DynamicInferenceEngine,
+) -> DynamicInferenceEngine:
+    """Build a dynamic inference engine of the requested class."""
     args = get_args()
     if model is None:
         model = get_model_for_inference()
@@ -374,5 +395,5 @@ def get_dynamic_inference_engine(model: Optional[MegatronModule] = None) -> Dyna
     context = DynamicInferenceContext(model.config, inference_config)
     inference_wrapped_model = GPTInferenceWrapper(model, context)
     controller = TextGenerationController(inference_wrapped_model, tokenizer)
-    engine = DynamicInferenceEngine(controller, context)
+    engine = engine_class(controller, context)
     return engine
