@@ -41,6 +41,7 @@ class SamplingParams:
     # the whole prompt-token list across engine->coordinator->frontend is
     # O(prompt_len) waste otherwise.
     return_prompt_tokens: bool = False
+    streaming: bool = False  # Dynamo-only today: emit ENGINE_REPLY_PARTIAL per step.
 
     def __post_init__(self):
         """Ensure backward compatibility for return_prompt_top_n_logprobs.
