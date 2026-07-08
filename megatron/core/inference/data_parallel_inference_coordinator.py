@@ -187,6 +187,7 @@ class DataParallelInferenceCoordinator:
         self.request_id_to_client_id = {}
         self.request_id_to_client_request_id = {}
         self.request_id_to_rank = {}  # Maps request_id → rank identity for pending count tracking
+        self.client_request_to_request_id = {}
 
         self.next_request_id = 0
         self.tokenizer = tokenizer
@@ -431,6 +432,7 @@ class DataParallelInferenceCoordinator:
                 self.next_request_id += 1
                 self.request_id_to_client_id[request_id] = sender_identity
                 self.request_id_to_client_request_id[request_id] = client_request_id
+                self.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
 
                 # Serialize prompt.
                 if isinstance(prompt, (str, list)):
@@ -462,6 +464,9 @@ class DataParallelInferenceCoordinator:
                     logging.error("Coordinator: no reachable engines for request %d", request_id)
                     del self.request_id_to_client_id[request_id]
                     del self.request_id_to_client_request_id[request_id]
+                    self.client_request_to_request_id.pop(
+                        (sender_identity, client_request_id), None
+                    )
                     return
 
                 self.request_id_to_rank[request_id] = next_identity
@@ -533,6 +538,26 @@ class DataParallelInferenceCoordinator:
                 if header == Headers.STOP:
                     self.state = self.CoordinatorState.RUNNING
 
+            elif header == Headers.ENGINE_REPLY_PARTIAL:
+                # Preserve routing until the final ENGINE_REPLY.
+                assert sender_identity in self.identities_of_data_parallel_ranks
+                partials = deserialized_payload[1]
+                for partial in partials:
+                    fid = partial["request_id"]
+                    client_identity = self.request_id_to_client_id.get(fid)
+                    if client_identity is None:
+                        continue
+                    client_request_identity = self.request_id_to_client_request_id[fid]
+                    self.router_socket.send_multipart(
+                        [
+                            client_identity,
+                            msgpack.packb(
+                                [header.value, client_request_identity, partial],
+                                use_bin_type=True,
+                            ),
+                        ]
+                    )
+
             elif header == Headers.ENGINE_REPLY:
                 # This is the output of a single engine step on some data parallel rank.
                 assert sender_identity in self.identities_of_data_parallel_ranks
@@ -544,7 +569,10 @@ class DataParallelInferenceCoordinator:
                     client_identity = self.request_id_to_client_id[fid]
                     client_request_identity = self.request_id_to_client_request_id[fid]
                     del self.request_id_to_client_id[fid]
-                    del self.request_id_to_client_request_id[fid]
+                    original_request_id = self.request_id_to_client_request_id.pop(fid)
+                    self.client_request_to_request_id.pop(
+                        (client_identity, original_request_id), None
+                    )
                     assigned_rank = self.request_id_to_rank.pop(fid, None)
                     if assigned_rank is not None:
                         idx = self.identity_to_rank_index.get(assigned_rank)
@@ -560,6 +588,23 @@ class DataParallelInferenceCoordinator:
                                 use_bin_type=True,
                             ),
                         ]
+                    )
+
+            elif header == Headers.ABORT_REQUEST:
+                if sender_identity not in known_clients:
+                    logging.warning("Coordinator: ignoring abort from unknown client.")
+                    continue
+                client_request_id = int(deserialized_payload[1])
+                request_id = self.client_request_to_request_id.get(
+                    (sender_identity, client_request_id)
+                )
+                if request_id is None:
+                    continue
+                assigned_rank = self.request_id_to_rank.get(request_id)
+                if assigned_rank is not None:
+                    self._send_to_engine(
+                        assigned_rank,
+                        msgpack.packb([Headers.ABORT_REQUEST.value, request_id], use_bin_type=True),
                     )
 
             elif header == Headers.SHUTDOWN:

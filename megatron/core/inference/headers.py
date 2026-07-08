@@ -12,6 +12,7 @@ class Headers(Enum):
     CONNECT_ACK = auto()
     SUBMIT_REQUEST = auto()
     ENGINE_REPLY = auto()
+    ENGINE_REPLY_PARTIAL = auto()  # Currently used only by the Dynamo frontend.
     PAUSE = auto()
     UNPAUSE = auto()
     SUSPEND = auto()
@@ -21,6 +22,7 @@ class Headers(Enum):
     DISCONNECT = auto()
     SHUTDOWN = auto()
     TP_BROADCAST = auto()
+    ABORT_REQUEST = auto()  # Cancel one in-flight request.
 
 
 class UnknownHeaderError(Exception):
