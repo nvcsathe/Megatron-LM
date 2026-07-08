@@ -42,6 +42,13 @@ class KVBlockAllocator:
         self.on_blocks_deregistered: Optional[Callable] = None
         self._blocks_deregistered_observers: list[Callable] = []
 
+        # Handoff blocks remain pinned until decode finishes pulling them.
+        # Pinning at request finish only happens on engines with KV transfer
+        # configured (setup_kv_transfer flips this on); other engines have no
+        # release path for the pins.
+        self.enable_handoff_pinning = False
+        self.pinned_blocks: Dict[int, int] = {}
+
         self.total_count = total_count
         self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
         self.paused_count = paused_count
@@ -205,6 +212,51 @@ class KVBlockAllocator:
         if blocks.numel() == 0:
             return
 
+        # Handoff blocks are released separately after the remote pull.
+        if self.pinned_blocks and not self.enable_prefix_caching:
+            pinned = self.pinned_blocks
+            keep_mask = torch.tensor(
+                [int(b) not in pinned for b in blocks.tolist()], dtype=torch.bool
+            )
+            if not keep_mask.all():
+                blocks = blocks[keep_mask]
+                if blocks.numel() == 0:
+                    return
+
+        self._release_memory_blocks(blocks)
+
+    def pin_memory_blocks(self, block_ids: list[int]) -> None:
+        """Retain one reference to each block for a pending KV handoff."""
+        for block_id in block_ids:
+            block_id = int(block_id)
+            self.pinned_blocks[block_id] = self.pinned_blocks.get(block_id, 0) + 1
+        if self.enable_prefix_caching and block_ids:
+            blocks = torch.tensor(block_ids, dtype=torch.int64, device='cpu')
+            self.block_ref_counts[blocks] += 1
+
+    def release_pinned_memory_blocks(self, block_ids: list[int]) -> int:
+        """Release one handoff-owned reference to each block."""
+        releasable = []
+        for block_id in block_ids:
+            block_id = int(block_id)
+            pin_count = self.pinned_blocks.get(block_id, 0)
+            if pin_count == 0:
+                continue
+            final_pin = pin_count == 1
+            if final_pin:
+                del self.pinned_blocks[block_id]
+            else:
+                self.pinned_blocks[block_id] = pin_count - 1
+            if self.enable_prefix_caching or final_pin:
+                releasable.append(block_id)
+
+        if not releasable:
+            return 0
+        self._release_memory_blocks(torch.tensor(releasable, dtype=torch.int32, device='cpu'))
+        return len(releasable)
+
+    def _release_memory_blocks(self, blocks: Tensor) -> None:
+        """Release blocks after pin ownership has been resolved."""
         if self.enable_prefix_caching:
             self.block_ref_counts[blocks] -= 1
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
@@ -247,6 +299,7 @@ class KVBlockAllocator:
         self.block_bag = torch.arange(self.total_count, dtype=torch.int32, device='cpu')
 
         self.total_avail = self.total_count - 1
+        self.pinned_blocks.clear()
 
         if self.enable_prefix_caching:
             # Reset all block hashes
