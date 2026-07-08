@@ -1777,6 +1777,17 @@ class TextGenerationController:
                 if valid:
                     finished_routing_block_ids[req_id] = valid
 
+        finished_handoff_block_ids = {}
+        allocator = context.kv_block_allocator
+        if allocator.enable_handoff_pinning and finished_idxs.numel() > 0:
+            for fidx in finished_idxs.tolist():
+                req_id = int(context.request_ids[fidx].item())
+                blocks = context.request_to_kv_block_ids[fidx]
+                valid = [int(b) for b in blocks.tolist() if b != -1]
+                if valid:
+                    finished_handoff_block_ids[req_id] = valid
+                    allocator.pin_memory_blocks(valid)
+
         # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
         # which would corrupt the reused buffer.
         new_sample_copy = sampled_tokens_cpu.clone()
@@ -1797,6 +1808,7 @@ class TextGenerationController:
             # D2H sync when the engine later calls sample.tolist().
             "sample": sampled_tokens_cpu,
             "finished_routing_block_ids": finished_routing_block_ids,
+            "finished_handoff_block_ids": finished_handoff_block_ids,
             **(update_result or {}),
         }
 
