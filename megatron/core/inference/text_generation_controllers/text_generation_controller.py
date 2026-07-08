@@ -1623,8 +1623,10 @@ class TextGenerationController:
         # collectives to avoid a hang.
         self._dummy_serial_mtp_forward()
 
-        # clear the context of any temporary state from the dummy forward
-        context.reset()
+        # Clear temporary dummy-forward state without destroying prefixes cached
+        # by real requests. EP workers execute this path while idle between
+        # requests, so a full reset would make sequential reuse impossible.
+        context.reset(preserve_prefix_cache=True)
 
     @torch.inference_mode()
     def _dummy_serial_mtp_forward(self):
