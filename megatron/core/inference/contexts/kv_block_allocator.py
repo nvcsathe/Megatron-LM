@@ -41,6 +41,7 @@ class KVBlockAllocator:
         self.enable_prefix_caching = enable_prefix_caching
         self.prefix_caching_eviction_policy = prefix_caching_eviction_policy
         self.on_blocks_deregistered: Optional[Callable] = None
+        self._blocks_deregistered_observers: list[Callable] = []
 
         self.total_count = total_count
         self.total_avail = total_count - 1  # -1 for dummy_block_idx (see below)
@@ -340,6 +341,13 @@ class KVBlockAllocator:
                     torch.ones(int(has_parent.sum()), dtype=torch.int64),
                 )
 
+    def add_blocks_deregistered_observer(self, observer: Callable) -> None:
+        """Register a callback invoked when cached blocks are deregistered.
+
+        Currently used only by the Dynamo frontend.
+        """
+        self._blocks_deregistered_observers.append(observer)
+
     def _deregister_blocks(self, block_ids: Tensor) -> None:
         """Remove blocks from prefix caching state and return to free pool.
 
@@ -366,6 +374,8 @@ class KVBlockAllocator:
         # Notify Mamba slot allocator (if wired) to clean up its state
         if self.on_blocks_deregistered is not None:
             self.on_blocks_deregistered(block_ids.tolist(), keys_to_delete)
+        for observer in tuple(self._blocks_deregistered_observers):
+            observer(block_ids.tolist(), keys_to_delete)
 
         # Reset block state (batched tensor ops)
         if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
