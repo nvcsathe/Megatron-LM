@@ -24,7 +24,11 @@ class Headers(Enum):
     TP_BROADCAST = auto()
     START_CUDA_PROFILER = auto()
     STOP_CUDA_PROFILER = auto()
+    SUBMIT_REQUEST_WITH_KV = auto()  # Decode-side KV import.
+    RELEASE_KV = auto()  # Free pinned handoff blocks.
     ABORT_REQUEST = auto()  # Cancel one in-flight request.
+    KV_READ_DONE = auto()  # Decode finished importing a hand-off's KV.
+    SEND_KV = auto()  # Push transport: tell the prefill to send a hand-off's KV.
 
 
 class UnknownHeaderError(Exception):

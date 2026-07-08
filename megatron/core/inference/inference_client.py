@@ -6,6 +6,10 @@ import os
 import time
 from typing import List, Optional, Union
 
+from megatron.core.inference.disaggregation.handoff_wire_protocol import (
+    make_release_kv_message,
+    make_submit_request_with_kv_message,
+)
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
@@ -164,6 +168,43 @@ class InferenceClient:
         self.completion_futures[request_id] = asyncio.get_running_loop().create_future()
         self.request_submission_times[request_id] = time.perf_counter()
         return self.completion_futures[request_id]
+
+    def add_request_with_kv_handoff(
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        kv_meta: dict,
+        src_block_ids: List[int],
+    ) -> InferenceStream:
+        """Submit a streaming request with remote KV metadata.
+
+        The decode engine allocates local blocks, pulls the KV from the
+        prefill peer described by ``kv_meta``, then begins generation.
+
+        Returns the same per-step partial/final iterator as
+        :meth:`add_request_streaming`.
+        """
+        sampling_params.streaming = True
+        request_id = self.next_request_id
+        self.next_request_id += 1
+        payload = make_submit_request_with_kv_message(
+            Headers.SUBMIT_REQUEST_WITH_KV.value,
+            request_id,
+            prompt,
+            sampling_params.serialize(),
+            kv_meta,
+            src_block_ids,
+        )
+        return self._submit_stream(payload, request_id)
+
+    def release_handoff(self, request_id: int) -> None:
+        """Tell the coordinator to release the KV blocks pinned for `request_id`.
+
+        Fire-and-forget. The coordinator broadcasts RELEASE_KV to every engine;
+        engines without that request_id ignore the message.
+        """
+        payload = make_release_kv_message(Headers.RELEASE_KV.value, request_id)
+        self.socket.send(msgpack.packb(payload, use_bin_type=True))
 
     def abort_request(self, request_id: int) -> None:
         """Cancel an in-flight request and close its local response stream."""

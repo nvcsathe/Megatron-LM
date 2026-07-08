@@ -42,6 +42,7 @@ class SamplingParams:
     # O(prompt_len) waste otherwise.
     return_prompt_tokens: bool = False
     streaming: bool = False  # Dynamo-only today: emit ENGINE_REPLY_PARTIAL per step.
+    do_kv_handoff: bool = False  # Pin KV blocks and expose metadata for peer pull
 
     def __post_init__(self):
         """Ensure backward compatibility for return_prompt_top_n_logprobs.
