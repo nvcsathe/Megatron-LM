@@ -33,6 +33,7 @@ class Request(IntEnum):
     RELEASE_KV = 25  # Free pinned handoff blocks.
     KV_READ_DONE = 26  # Decode finished importing a handoff's KV.
     SEND_KV = 27  # Tell the prefill engine to send a handoff's KV.
+    REGISTER_ROLE = 28  # Engine announces its disaggregated role.
 
 
 class Control(IntEnum):

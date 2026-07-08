@@ -14,6 +14,10 @@ import numpy as np
 import torch
 
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+from megatron.core.inference.disaggregation.coordinator_routing import make_disagg_router
+from megatron.core.inference.disaggregation.handoff_wire_protocol import (
+    make_submit_request_with_kv_message,
+)
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import compute_block_hashes_batched
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -101,6 +105,8 @@ class DataParallelInferenceCoordinator:
         prefix_caching_routing_alpha: float = 0.5,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
+        disaggregated: bool = False,
+        disagg_router: str = "round_robin",
     ):
         """
         Initializes the inference coordinator.
@@ -185,6 +191,27 @@ class DataParallelInferenceCoordinator:
                 sorted(self.identities_of_data_parallel_ranks)
             )
 
+        # Disaggregated prefill/decode mode: engines register dynamically via
+        # REGISTER_ROLE (spawned with data_parallel_size=0), and requests take
+        # two hops: SUBMIT to a prefill engine (with do_kv_handoff set), then
+        # the prefill's reply carries the hand-off metadata and the request is
+        # re-submitted to a decode engine as SUBMIT_REQUEST_WITH_KV. _disagg is
+        # the routing policy; _req_meta stashes each request's prompt and
+        # original sampling params for the second hop.
+        self.disaggregated = disaggregated
+        self._disagg = make_disagg_router(disagg_router) if disaggregated else None
+        self._req_meta: dict = {}
+        self._disagg_hop1: set = set()
+        # Flow control: cap the hand-offs a prefill can have outstanding
+        # (submitted but not yet imported by a decode) so its pinned KV cannot
+        # grow without bound. Released by the decode's KV_READ_DONE.
+        self._disagg_prefill_of: dict = {}  # request_id -> prefill identity
+        self._disagg_outstanding: dict = {}  # prefill identity -> outstanding count
+        self._disagg_submit_queue: dict = {}  # prefill identity -> deque of pending submits
+        self._disagg_max_outstanding = 32  # TODO: tune.
+        self._engine_transport: dict = {}  # identity -> transfer backend name
+        self._engine_metas: dict = {}  # identity -> instance per-rank transfer metas
+
         self.request_id_to_client_id = {}
         self.request_id_to_client_request_id = {}
         self.request_id_to_rank = {}  # Maps request_id → rank identity for pending count tracking
@@ -264,42 +291,164 @@ class DataParallelInferenceCoordinator:
         )
 
     def _remove_engine(self, identity):
-        """Remove a disconnected engine from all routing bookkeeping.
-        Called both during shutdown and when an engine becomes unreachable mid-operation
-        (e.g. zmq.EHOSTUNREACH in _send_to_engine). The O(n) index-shifting and hash-table
-        rebuild are acceptable because the number of connected engines is small; optimize
-        only if dynamic registration/deregistration at high engine counts becomes a use case.
-        """
-        self.identities_of_data_parallel_ranks.remove(identity)
-        idx = self.identity_to_rank_index.pop(identity, None)
-        if idx is None:
+        """Remove a disconnected engine from the routing pool. Idempotent: the
+        cleanup below can itself hit a failed send and re-enter here."""
+        if identity not in self.identities_of_data_parallel_ranks:
             return
-        self._identities_list.pop(idx)
-        self._pending_counts = np.delete(self._pending_counts, idx)
-        # Shift indices for engines that came after the removed slot.
-        for ident in self.identity_to_rank_index:
-            if self.identity_to_rank_index[ident] > idx:
-                self.identity_to_rank_index[ident] -= 1
-        # Drop hash-table entries for the removed rank; shift indices above it.
-        new_hash_table = {}
-        for h, rank_ts in self._hash_table.items():
-            # h is hash index
-            # rank_ts is a dict mapping rank_idx → timestamp
-            new_row = {}
-            for r, ts in rank_ts.items():
-                if r == idx:
-                    # skip this rank as it is removed
-                    continue
-                new_r = r - 1 if r > idx else r
-                new_row[new_r] = ts
-            if new_row:
-                new_hash_table[h] = new_row
-        self._hash_table = new_hash_table
+        self.identities_of_data_parallel_ranks.remove(identity)
+        if self.disaggregated:
+            self._disagg.remove(identity)
+            # Drain the submit queue before the in-flight sweep: the sweep's
+            # slot releases would otherwise resubmit queued requests to the
+            # engine being removed.
+            for rid, _, _ in self._disagg_submit_queue.pop(identity, ()):
+                self._drop_disagg_request(rid, f"queued on removed prefill engine {identity!r}")
+            for rid in self._disagg.requests_involving(identity):
+                self._drop_disagg_request(rid, f"engine {identity!r} removed")
+            self._disagg_outstanding.pop(identity, None)
+            self._engine_transport.pop(identity, None)
+            self._engine_metas.pop(identity, None)
+        identity_to_rank_index = getattr(self, "identity_to_rank_index", {})
+        idx = identity_to_rank_index.pop(identity, None)
+        if idx is not None:
+            self._identities_list.pop(idx)
+            self._pending_counts = np.delete(self._pending_counts, idx)
+            # Shift indices for engines that came after the removed slot.
+            for ident in identity_to_rank_index:
+                if identity_to_rank_index[ident] > idx:
+                    identity_to_rank_index[ident] -= 1
+            # Drop hash-table entries for the removed rank; shift indices above it.
+            new_hash_table = {}
+            for block_hash, rank_timestamps in self._hash_table.items():
+                new_row = {}
+                for rank_idx, timestamp in rank_timestamps.items():
+                    if rank_idx == idx:
+                        continue
+                    new_idx = rank_idx - 1 if rank_idx > idx else rank_idx
+                    new_row[new_idx] = timestamp
+                if new_row:
+                    new_hash_table[block_hash] = new_row
+            self._hash_table = new_hash_table
         logging.warning(
             "Coordinator: removed engine %s (now %d engines)",
             identity,
             len(self.identities_of_data_parallel_ranks),
         )
+
+    # --- disaggregated 2-hop routing -------------------------------------
+    def _disagg_send(self, identity, header, *parts):
+        """msgpack [header, *parts] to one engine."""
+        return self._send_to_engine(
+            identity, msgpack.packb([header.value, *parts], use_bin_type=True)
+        )
+
+    def _route_submit_disagg(self, request_id, prompt, sampling_params):
+        """Hop 1: forward a new request to a prefill engine with do_kv_handoff
+        set, stashing its prompt and original sampling params for hop 2.
+
+        Once a prefill has _disagg_max_outstanding hand-offs outstanding,
+        further requests queue until a decode KV_READ_DONE frees a slot; this
+        bounds the prefill's pinned KV."""
+        self._req_meta[request_id] = (prompt, sampling_params)
+        try:
+            prefill_id = self._disagg.route_submit(request_id)
+        except RuntimeError as e:
+            self._drop_disagg_request(request_id, f"cannot route to prefill: {e}")
+            return
+        if self._disagg_outstanding.get(prefill_id, 0) >= self._disagg_max_outstanding:
+            self._disagg_submit_queue.setdefault(prefill_id, deque()).append(
+                (request_id, prompt, sampling_params)
+            )
+            return
+        self._disagg_do_submit(prefill_id, request_id, prompt, sampling_params)
+
+    def _disagg_do_submit(self, prefill_id, request_id, prompt, sampling_params):
+        """Submit a (possibly previously queued) request to `prefill_id` and
+        count it against the flow-control window until read-done."""
+        self._disagg_prefill_of[request_id] = prefill_id
+        self._disagg_outstanding[prefill_id] = self._disagg_outstanding.get(prefill_id, 0) + 1
+        self._disagg_hop1.add(request_id)
+        # The prefill stops after the prompt KV is populated and pins it for
+        # the hand-off; the decode regenerates from the prompt, so the prefill
+        # copy needs no log probs and generates no tokens.
+        prefill_params = dict(sampling_params)
+        prefill_params["do_kv_handoff"] = True
+        prefill_params["num_tokens_to_generate"] = 0
+        prefill_params["return_log_probs"] = False
+        if "num_tokens_total" in prefill_params:
+            prefill_params["num_tokens_total"] = None
+        self._disagg_send(prefill_id, Headers.SUBMIT_REQUEST, request_id, prompt, prefill_params)
+
+    def _handle_prefill_done(self, request_id, finished_request):
+        """Hop 2: a prefill engine finished a request and its reply carries
+        the hand-off metadata. Pick a decode engine and re-submit the request
+        as SUBMIT_REQUEST_WITH_KV; the decode pulls the KV and admits it via a
+        prefix-cache hit. Drops the request rather than raising if its state
+        is missing; the coordinator is shared across the job."""
+        self._disagg_hop1.discard(request_id)
+        meta = self._req_meta.get(request_id)
+        handoff = finished_request.get("disaggregated_params")
+        if meta is None or not handoff:
+            self._drop_disagg_request(request_id, "prefill reply carried no hand-off metadata")
+            return
+        prompt, sampling_params = meta
+        try:
+            _, decode_id = self._disagg.route_prefill_done(request_id)
+        except RuntimeError as e:
+            self._drop_disagg_request(request_id, f"cannot route to decode: {e}")
+            return
+        payload = msgpack.packb(
+            make_submit_request_with_kv_message(
+                Headers.SUBMIT_REQUEST_WITH_KV.value,
+                request_id,
+                prompt,
+                sampling_params,
+                handoff["kv_meta"],
+                handoff["block_ids"],
+            ),
+            use_bin_type=True,
+        )
+        if not self._send_to_engine(decode_id, payload):
+            # _remove_engine's sweep already dropped this request.
+            return
+        prefill_id = self._disagg_prefill_of.get(request_id)
+        if prefill_id is not None and self._engine_transport.get(prefill_id) == "nccl":
+            # Two-sided transport: the decode posted its receives above; tell
+            # the prefill to post the matching sends toward that instance.
+            self._disagg_send(
+                prefill_id, Headers.SEND_KV, request_id, self._engine_metas[decode_id]
+            )
+
+    def _handle_kv_read_done(self, request_id):
+        """Hop 3: the decode imported the hand-off's KV. Release the prefill's
+        pinned blocks and the flow-control slot, submitting the next queued
+        request for that prefill if any. A missing mapping (late or duplicate
+        ack, already-dropped request) is a no-op."""
+        prefill_id = self._disagg_prefill_of.pop(request_id, None)
+        if prefill_id is None:
+            return
+        self._disagg_send(prefill_id, Headers.RELEASE_KV, request_id)
+        self._disagg_outstanding[prefill_id] -= 1
+        q = self._disagg_submit_queue.get(prefill_id)
+        if q:
+            rid, prompt, sp = q.popleft()
+            self._disagg_do_submit(prefill_id, rid, prompt, sp)
+
+    def _drop_disagg_request(self, request_id, reason):
+        """Drop an unroutable disagg request and clear its coordinator state.
+        The submitting client's future is not resolved (the client protocol
+        has no failure reply), so the caller times out."""
+        logging.error("Coordinator: dropping disagg request %s: %s", request_id, reason)
+        self._disagg.forget(request_id)
+        self._req_meta.pop(request_id, None)
+        self._disagg_hop1.discard(request_id)
+        self._handle_kv_read_done(request_id)
+        self.request_id_to_client_id.pop(request_id, None)
+        client_request_id = self.request_id_to_client_request_id.pop(request_id, None)
+        if client_request_id is not None:
+            for key in list(self.client_request_to_request_id):
+                if self.client_request_to_request_id[key] == request_id:
+                    self.client_request_to_request_id.pop(key)
 
     def _send_to_engine(self, identity, payload):
         """Send payload to an engine, removing it from the pool if unreachable.
@@ -489,6 +638,8 @@ class DataParallelInferenceCoordinator:
         prefix_caching_routing_alpha: float = 0.5,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
+        disaggregated: bool = False,
+        disagg_router: str = "round_robin",
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -523,6 +674,8 @@ class DataParallelInferenceCoordinator:
             prefix_caching_routing_alpha=prefix_caching_routing_alpha,
             schedule_output_path=schedule_output_path,
             hostname=hostname,
+            disaggregated=disaggregated,
+            disagg_router=disagg_router,
         )
         ready_event.set()
         try:
