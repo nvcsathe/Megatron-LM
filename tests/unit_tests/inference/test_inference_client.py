@@ -45,6 +45,8 @@ async def test_inference_client_lifecycle():
     assert opts[zmq.SNDHWM] == 0 and opts[zmq.RCVHWM] == 0
     assert client.next_request_id == 0
     assert client.completion_futures == {}
+    assert not hasattr(client, "get_status")
+    assert not hasattr(client, "subscribe_telemetry")
 
     # start(): handshake sends CONNECT, expects CONNECT_ACK, spawns listener task.
     # We stage two recv() replies: the CONNECT_ACK during handshake, and an
