@@ -1311,9 +1311,22 @@ class DynamicInferenceEngine(AbstractEngine):
                             request.prompt_top_n_logprobs,
                             request.generated_top_n_logprobs,
                         )
+                # Trim the output at the first terminating token: the per-request
+                # termination_id OR any model-level eos token (generation_config eos
+                # list), mirroring the finished-request check. Skipped for ignore_eos
+                # (termination_id < 0).
                 termination_id = request.sampling_params.termination_id
-                if termination_id is not None and termination_id >= 0 and termination_id in tokens:
-                    keep = tokens.index(termination_id) + 1
+                first_stop = None
+                if termination_id is not None and termination_id >= 0:
+                    stop_ids = {termination_id}
+                    eos_set = getattr(self.controller, "_eos_token_ids", None)
+                    if eos_set is not None:
+                        stop_ids.update(eos_set.tolist())
+                    first_stop = next(
+                        (i for i, t in enumerate(tokens) if t in stop_ids), None
+                    )
+                if first_stop is not None:
+                    keep = first_stop + 1
                     step_generated_count = len(tokens)
                     tokens = tokens[:keep]
                     request_log_probs = _trim_step_entries_to_generated_keep(

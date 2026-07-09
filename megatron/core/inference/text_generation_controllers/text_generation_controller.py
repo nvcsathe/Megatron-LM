@@ -4,6 +4,7 @@ import asyncio
 import concurrent
 import copy
 import functools
+import logging
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
@@ -112,6 +113,13 @@ class TextGenerationController:
         self.model_config = self.inference_wrapped_model.model.config
         inference_config = self.inference_wrapped_model.inference_context.config
         self.tokenizer = tokenizer
+        # Model-level EOS token set. HF models declare `generation_config.eos_token_id`
+        # which may be a LIST (e.g. [2, 11] = [</s>, <|im_end|>]); the per-request
+        # `termination_id` only holds one. Yank the generation_config off the tokenizer
+        # (HF tokenizers attach it; others won't) and honor every declared eos token, so
+        # generation stops like vLLM does. None => only the per-request termination_id is
+        # used (unchanged behavior). Stored on CPU to match `sampled_tokens_cpu`.
+        self._eos_token_ids = self._build_eos_token_ids(tokenizer)
         self.num_speculative_tokens = inference_config.num_speculative_tokens
 
         pg_collection = inference_config.pg_collection
@@ -280,6 +288,41 @@ class TextGenerationController:
 
         self._init_mtp_sampling_tensors()
         self._select_async_sample_slot(0)
+
+    def _build_eos_token_ids(self, tokenizer) -> Optional[Tensor]:
+        """Build the model-level EOS token-id set used for termination.
+
+        Honors `generation_config.eos_token_id` (which HF may declare as a LIST, e.g.
+        `[2, 11]`) in addition to the tokenizer's single `eod`. The generation_config is
+        yanked off the tokenizer if present (HF tokenizers attach it; other tokenizers
+        won't). Returns None when there is at most one eos id -- the per-request
+        `termination_id` already covers that case, so behavior is unchanged. The tensor
+        is on CPU to match `sampled_tokens_cpu` in the finished-request check.
+        """
+        ids = set()
+        eod = getattr(tokenizer, "eod", None)
+        if eod is not None:
+            ids.add(int(eod))
+        gen_cfg = getattr(tokenizer, "generation_config", None)
+        if gen_cfg is not None:
+            eos = gen_cfg.get("eos_token_id")
+            if isinstance(eos, int):
+                ids.add(eos)
+            elif isinstance(eos, (list, tuple)):
+                ids.update(int(e) for e in eos if isinstance(e, int))
+        result = None if len(ids) <= 1 else torch.tensor(sorted(ids), dtype=torch.long)
+        is_rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
+        if is_rank0:
+            gen_cfg_eos = gen_cfg.get("eos_token_id") if gen_cfg is not None else None
+            logging.info(
+                "Inference termination EOS ids: tokenizer.eod=%s, "
+                "generation_config.eos_token_id=%s -> eos set=%s (multi-eos active=%s)",
+                eod,
+                gen_cfg_eos,
+                sorted(ids),
+                result is not None,
+            )
+        return result
 
     def _init_mtp_sampling_tensors(self):
         """Pre-allocate MTP sampling tensors.
@@ -2980,6 +3023,17 @@ class TextGenerationController:
         termination_ids = context.active_request_metadata["termination_id"][:active_request_count]
         termination_enabled = termination_ids >= 0
         termination_hit = termination_enabled & (sampled_tokens_cpu == termination_ids)
+        # Also terminate on any of the model's declared EOS tokens. The per-request
+        # `termination_id` is a single id (default `tokenizer.eod`), but a model may
+        # declare several (`generation_config.eos_token_id` list, e.g. [2, 11]).
+        # Gated by `termination_enabled` so `ignore_eos` (termination_id == -1) still
+        # never stops. `_eos_token_ids` is a small CPU tensor (or None => no extra ids).
+        # NOTE: this is a model-level set living beside the per-request check; a cleaner
+        # per-request refactor (populate stop_word_ids / a termination-id set) is a TODO.
+        if self._eos_token_ids is not None:
+            termination_hit |= termination_enabled & torch.isin(
+                sampled_tokens_cpu, self._eos_token_ids
+            )
         if self.num_speculative_tokens > 0 and termination_enabled.any().item():
             # Avoid a per-step CUDA sync in the common fixed-length MTP path.
             # Accepted speculative tokens only need to be inspected when at
@@ -2988,6 +3042,10 @@ class TextGenerationController:
             termination_hit |= termination_enabled & (
                 accepted_tokens_cpu == termination_ids[:, None]
             ).any(dim=1)
+            if self._eos_token_ids is not None:
+                termination_hit |= termination_enabled & torch.isin(
+                    accepted_tokens_cpu, self._eos_token_ids
+                ).any(dim=1)
         active_request_mask = (~termination_hit).byte() & torch.less(
             active_sequence_lengths, max_sequence_lengths
         ).byte()
