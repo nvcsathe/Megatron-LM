@@ -2147,14 +2147,38 @@ class DynamicInferenceEngine(AbstractEngine):
         records_to_send: list[DynamicInferenceRequestRecord],
     ) -> bytes:
         """Serialize finished request records for a coordinator reply."""
-        nvtx_range_push("coordinator_reply_pack")
+        torch.cuda.nvtx.range_push("pp:coordinator_reply_pack")
         try:
-            return msgpack.packb(
-                [Headers.ENGINE_REPLY.value, [r.merge().serialize() for r in records_to_send]],
+            _t0 = time.time()
+            merged = [r.merge() for r in records_to_send]
+            # Omit the full prompt_tokens list from the reply unless the client asked
+            # to round-trip them (prevent_retokenization -> return_prompt_tokens).
+            # num_prompt_tokens (set in merge()) preserves the count. Saves the
+            # O(prompt_len) serialize + transfer + downstream unpack of a 254k-token
+            # list for vLLM-shaped requests.
+            for m in merged:
+                sp = m.sampling_params
+                if sp is None or not getattr(sp, "return_prompt_tokens", False):
+                    m.prompt_tokens = None
+                    m.remaining_prompt_tokens = None
+            _t1 = time.time()
+            serialized = [m.serialize() for m in merged]
+            _t2 = time.time()
+            payload = msgpack.packb(
+                [Headers.ENGINE_REPLY.value, serialized],
                 use_bin_type=True,
             )
+            _t3 = time.time()
+            if _TIMING:
+                print(
+                    f"[TIMING ENGINE] reply_pack merge={(_t1-_t0)*1e3:.2f}ms "
+                    f"serialize={(_t2-_t1)*1e3:.2f}ms packb={(_t3-_t2)*1e3:.2f}ms "
+                    f"payload={len(payload)}B nrec={len(records_to_send)}",
+                    flush=True,
+                )
+            return payload
         finally:
-            nvtx_range_pop("coordinator_reply_pack")
+            torch.cuda.nvtx.range_pop()
 
     def _get_coordinator_reply_executor(self) -> concurrent.futures.ThreadPoolExecutor:
         """Return the single-worker executor used for coordinator reply packing."""
@@ -2168,11 +2192,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def _send_coordinator_reply_payload(self, payload: bytes) -> None:
         """Send an already-packed coordinator reply payload."""
-        nvtx_range_push("coordinator_reply_send")
+        torch.cuda.nvtx.range_push("pp:coordinator_reply_send")
         try:
             self.socket_for_receiving_requests.send(payload)
         finally:
-            nvtx_range_pop("coordinator_reply_send")
+            torch.cuda.nvtx.range_pop()
 
     async def _send_finished_records_to_coordinator_async(
         self, records_to_send: list[DynamicInferenceRequestRecord]
@@ -2246,6 +2270,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 [self.get_request(i).add_event_pause() for i in newly_paused_request_ids]
 
             # Process finished requests (adds FINISH events and returns records).
+            # torch NVTX (unconditional; Megatron's nvtx_range_push is gated by --nvtx).
+            torch.cuda.nvtx.range_push("pp:post_process_requests")
             (active_request_ids, finished_request_records) = self.post_process_requests(
                 active_request_ids,
                 finished_request_ids,
@@ -2259,6 +2285,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 pre_fwd_step_count=context_state.get("step_count"),
                 finished_routing_block_ids=finished_routing_block_ids,
             )
+            torch.cuda.nvtx.range_pop()
 
         else:
             active_request_ids: list[int] = []
@@ -2280,24 +2307,28 @@ class DynamicInferenceEngine(AbstractEngine):
         # the coordinator. Otherwise, the coordinator will
         # overlap detokenization with the engine.
         if not self.use_coordinator:
-            nvtx_range_push("detokenization")
+            torch.cuda.nvtx.range_push("pp:detokenization")
             for record in finished_request_records:
                 for request in record.requests:
                     if request.prompt is None:
+                        torch.cuda.nvtx.range_push("pp:detok_prompt")
                         request.prompt = self.controller.detokenize(
                             self.controller.tokenizer,
                             request.prompt_tokens.tolist(),
                             remove_EOD=False,
                         )
+                        torch.cuda.nvtx.range_pop()
                     request.generated_text = self.controller.detokenize(
                         self.controller.tokenizer,
                         request.generated_tokens,
                         remove_EOD=not request.sampling_params.detokenize_stop_sequence,
                     )
-            nvtx_range_pop("detokenization")
+            torch.cuda.nvtx.range_pop()
 
         if send_coordinator_replies:
+            torch.cuda.nvtx.range_push("pp:send_to_coordinator")
             self._send_finished_records_to_coordinator(finished_request_records)
+            torch.cuda.nvtx.range_pop()
 
         # Drain prefix cache hit counters from context into engine accumulators.
         if self.context.enable_prefix_caching:
@@ -2630,11 +2661,21 @@ class DynamicInferenceEngine(AbstractEngine):
         # Control signals are queued for the second pass.
         new_generation_epoch = None
         for message in all_messages:
+            _t_unpack = time.time()
             data = msgpack.unpackb(message, raw=False)
+            _unpack_ms = (time.time() - _t_unpack) * 1e3
             header = Headers(data[0])
             if header == Headers.SUBMIT_REQUEST:
                 request_id, prompt, sampling_params = data[1:]
+                _t_dsp = time.time()
                 sampling_params = SamplingParams.deserialize(sampling_params)
+                if _TIMING:
+                    print(
+                        f"[TIMING ENGINE] submit_unpackb {_unpack_ms:.2f}ms "
+                        f"sampling_params_deser {(time.time()-_t_dsp)*1e3:.2f}ms "
+                        f"({len(message)} bytes)",
+                        flush=True,
+                    )
                 nvtx_range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
                 nvtx_range_pop("add_request")

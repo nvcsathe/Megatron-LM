@@ -619,6 +619,11 @@ try:
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 add_BOS=add_BOS,
                 termination_id=-1 if ignore_eos else None,
+                # Only round-trip the full prompt_tokens list back when the client
+                # will echo them next turn (prevent_retokenization). Otherwise the
+                # engine omits them (vLLM-shaped response); the count is preserved
+                # via num_prompt_tokens.
+                return_prompt_tokens=req.get("prevent_retokenization", False),
             )
         except ValueError as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)
@@ -694,11 +699,21 @@ try:
         prevent_retokenization = req.get("prevent_retokenization", False)
         request_idx = 0
         for result_item in batch_results:
+            _t_unwrap = time.time()
             result = unwrap_serialized_tensors(result_item)
+            if _TIMING:
+                print(
+                    f"[TIMING FE] unwrap {(time.time()-_t_unwrap)*1e3:.2f}ms",
+                    flush=True,
+                )
 
-            prompt_tokens_out = result["prompt_tokens"]  # The engine can modify prompt_tokens.
+            prompt_tokens_out = result["prompt_tokens"]  # None unless prevent_retokenization.
             text_output = result["generated_text"]
-            prompt_tokens_count = len(prompt_tokens_out) if prompt_tokens_out is not None else 0
+            # prompt_tokens is omitted from the reply for vLLM-shaped requests; the
+            # count is preserved separately via num_prompt_tokens.
+            prompt_tokens_count = result.get("num_prompt_tokens") or (
+                len(prompt_tokens_out) if prompt_tokens_out is not None else 0
+            )
             prompt_tokens_counts.append(prompt_tokens_count)
             cached_tokens_counts.append(result.get("num_cached_tokens", 0))
             ttft_seconds = result.get("ttft")

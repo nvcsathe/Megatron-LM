@@ -364,6 +364,9 @@ class DynamicInferenceRequest(InferenceRequest):
     request_id: int
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None
+    # Prompt token count, preserved so usage/counters stay correct even when the
+    # full prompt_tokens list is omitted from the reply (return_prompt_tokens=False).
+    num_prompt_tokens: int = 0
     # remaining prompt tokens are used for chunked prefill
     remaining_prompt_tokens: Optional[torch.Tensor] = None
     policy_epoch: Optional[list[tuple[int, int]]] = None
@@ -737,6 +740,7 @@ class DynamicInferenceRequestRecord:
             request_id=self.requests[0].request_id,
             prompt=prompt_text,
             prompt_tokens=prompt_tokens,
+            num_prompt_tokens=(len(prompt_tokens) if prompt_tokens is not None else 0),
             prompt_log_probs=self.requests[0].prompt_log_probs,
             prompt_top_n_logprobs=self.requests[0].prompt_top_n_logprobs,
             generated_text=generated_text,

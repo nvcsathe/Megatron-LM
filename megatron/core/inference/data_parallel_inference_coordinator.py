@@ -4,8 +4,10 @@ import errno
 import faulthandler
 import json
 import logging
+import os
 import signal
 import socket
+import time
 from collections import deque
 from enum import Enum, auto
 from multiprocessing import Event
@@ -27,6 +29,10 @@ try:
     HAVE_ZMQ = True
 except:
     HAVE_ZMQ = False
+
+# Coordinator-side timing, enabled with the same env flag as the frontend
+# (MCORE_INFERENCE_TIMING=1). Prints [TIMING COORD] lines per request phase.
+_TIMING = os.environ.get("MCORE_INFERENCE_TIMING", "0") == "1"
 
 try:
     import msgpack
@@ -390,7 +396,9 @@ class DataParallelInferenceCoordinator:
         # Todo [Siddharth]: Make this more robust to handle invalid messages.
         known_clients = set()
         while True:
+            _t_recv = time.time()
             sender_identity, serialized_payload = self.router_socket.recv_multipart()
+            _recv_ms = (time.time() - _t_recv) * 1e3
 
             # Allow for re-registration if connecting to a running coordinator.
             if serialized_payload == b"":
@@ -399,8 +407,23 @@ class DataParallelInferenceCoordinator:
                     self._register_rank_identity(sender_identity)
                 continue
 
+            _t_unpack = time.time()
             deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
+            if _TIMING:
+                print(
+                    f"[TIMING COORD] unpackb {(time.time()-_t_unpack)*1e3:.2f}ms "
+                    f"({len(serialized_payload)} bytes)",
+                    flush=True,
+                )
             header = Headers(deserialized_payload[0])
+            if _TIMING and header == Headers.ENGINE_REPLY:
+                # recv_multipart blocks, so this includes the wait for the engine
+                # to finish + the transfer of the reply payload.
+                print(
+                    f"[TIMING COORD] recv_from_engine {_recv_ms:.2f}ms "
+                    f"({len(serialized_payload)} bytes)",
+                    flush=True,
+                )
 
             if header == Headers.CONNECT:
                 if sender_identity in known_clients:
@@ -444,12 +467,26 @@ class DataParallelInferenceCoordinator:
                 else:
                     raise Exception("specialize for <%s> prompt." % type(prompt).__name__)
 
+                _t0 = time.time()
                 payload = msgpack.packb(
                     [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params],
                     use_bin_type=True,
                 )
+                if _TIMING:
+                    print(
+                        f"[TIMING COORD] packb_forward {(time.time()-_t0)*1e3:.2f}ms "
+                        f"(prompt_len={len(prompt) if hasattr(prompt, '__len__') else '?'})",
+                        flush=True,
+                    )
 
+                _t0 = time.time()
                 request_hashes = self.compute_request_hashes(prompt)
+                if _TIMING:
+                    print(
+                        f"[TIMING COORD] compute_request_hashes {(time.time()-_t0)*1e3:.2f}ms "
+                        f"(nhashes={len(request_hashes)})",
+                        flush=True,
+                    )
                 if (
                     self.prefix_caching_coordinator_policy
                     == PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK
@@ -457,6 +494,7 @@ class DataParallelInferenceCoordinator:
                     request_hashes = request_hashes[:1]
 
                 # Account for the fact that some engines may have died.
+                _t0 = time.time()
                 for _ in range(len(self.identities_of_data_parallel_ranks)):
                     next_identity = self.get_best_data_parallel_rank(request_hashes)
                     if self._send_to_engine(next_identity, payload):
@@ -467,6 +505,12 @@ class DataParallelInferenceCoordinator:
                     del self.request_id_to_client_id[request_id]
                     del self.request_id_to_client_request_id[request_id]
                     return
+
+                if _TIMING:
+                    print(
+                        f"[TIMING COORD] route+send {(time.time()-_t0)*1e3:.2f}ms",
+                        flush=True,
+                    )
 
                 self.request_id_to_rank[request_id] = next_identity
                 self._pending_counts[self.identity_to_rank_index[next_identity]] += 1
@@ -566,15 +610,18 @@ class DataParallelInferenceCoordinator:
                             assert self._pending_counts[idx] >= 1
                             self._pending_counts[idx] -= 1
 
-                    self.router_socket.send_multipart(
-                        [
-                            client_identity,
-                            msgpack.packb(
-                                [header.value, client_request_identity, finished_request],
-                                use_bin_type=True,
-                            ),
-                        ]
+                    _t0 = time.time()
+                    fwd_payload = msgpack.packb(
+                        [header.value, client_request_identity, finished_request],
+                        use_bin_type=True,
                     )
+                    if _TIMING:
+                        print(
+                            f"[TIMING COORD] reply_forward_packb {(time.time()-_t0)*1e3:.2f}ms "
+                            f"({len(fwd_payload)} bytes)",
+                            flush=True,
+                        )
+                    self.router_socket.send_multipart([client_identity, fwd_payload])
 
             elif header == Headers.SHUTDOWN:
                 if sender_identity not in known_clients:
@@ -600,18 +647,28 @@ class DataParallelInferenceCoordinator:
             finished_request (dict): The serialized merged request containing the
                 generated tokens to be detokenized. It is modified in place.
         """
-        if finished_request["prompt"] is None:
-            finished_request["prompt"] = TextGenerationController.detokenize(
-                self.tokenizer, finished_request["prompt_tokens"][1], remove_EOD=False
-            )
+        # NOTE: We intentionally do NOT detokenize the prompt here. The prompt
+        # string (finished_request["prompt"]) is not consumed by any endpoint:
+        # chat completions returns only generated_text (plus optional
+        # prompt_token_ids for prevent_retokenization), and /completions echo
+        # detokenizes its own request input rather than this field. Detokenizing a
+        # long prompt on the coordinator's single event loop cost ~O(prompt_len)
+        # (~390 ms for a 254k-token prompt) and serialized all request scheduling.
         detokenize_stop_sequence = (finished_request.get("sampling_params", {}) or {}).get(
             "detokenize_stop_sequence", False
         )
+        _t0 = time.time()
         finished_request["generated_text"] = TextGenerationController.detokenize(
             self.tokenizer,
             finished_request["generated_tokens"],
             remove_EOD=not detokenize_stop_sequence,
         )
+        if _TIMING:
+            print(
+                f"[TIMING COORD] detokenize generated={(time.time()-_t0)*1e3:.2f}ms "
+                f"(prompt detok skipped)",
+                flush=True,
+            )
 
     @classmethod
     def entrypoint(

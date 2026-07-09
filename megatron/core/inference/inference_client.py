@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 import time
 from typing import List, Optional, Union
 
@@ -10,6 +11,9 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
 from .headers import Headers
+
+# Client-side timing, enabled with the same env flag as the frontend/coordinator.
+_TIMING = os.environ.get("MCORE_INFERENCE_TIMING", "0") == "1"
 
 try:
     import zmq
@@ -107,8 +111,15 @@ class InferenceClient:
         """
         request_id = self.next_request_id
         self.next_request_id += 1
+        _t0 = time.time()
         payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
         payload_serialized = msgpack.packb(payload, use_bin_type=True)
+        if _TIMING:
+            print(
+                f"[TIMING CLIENT] submit_packb {(time.time()-_t0)*1e3:.2f}ms "
+                f"({len(payload_serialized)} bytes)",
+                flush=True,
+            )
         self.socket.send(payload_serialized)
         assert request_id not in self.completion_futures
         self.completion_futures[request_id] = asyncio.get_running_loop().create_future()
@@ -130,7 +141,12 @@ class InferenceClient:
         """
         while True:
             try:
-                data = msgpack.unpackb(self.socket.recv(flags=zmq.NOBLOCK), raw=False)
+                _t_recv = time.time()
+                raw = self.socket.recv(flags=zmq.NOBLOCK)
+                _recv_ms = (time.time() - _t_recv) * 1e3
+                _t_unpack = time.time()
+                data = msgpack.unpackb(raw, raw=False)
+                _unpack_ms = (time.time() - _t_unpack) * 1e3
                 header = Headers(data[0])
                 if header == Headers.ENGINE_REPLY:
                     request_id, reply = data[1:]
@@ -141,9 +157,20 @@ class InferenceClient:
                     if completion_future.done():
                         logging.warning(f"Client: The future for {request_id} has been cancelled!")
                         continue
+                    _t_deser = time.time()
                     completed_request = (
                         DynamicInferenceRequest.deserialize(reply) if self.deserialize else reply
                     )
+                    if _TIMING:
+                        # NOBLOCK recv: message was already available, so recv is
+                        # the actual transfer time of the reply payload.
+                        print(
+                            f"[TIMING CLIENT] recv_engine_reply {_recv_ms:.2f}ms "
+                            f"unpackb {_unpack_ms:.2f}ms "
+                            f"deserialize {(time.time()-_t_deser)*1e3:.2f}ms "
+                            f"(deser={self.deserialize}, {len(raw)} bytes)",
+                            flush=True,
+                        )
                     completion_future.set_result(completed_request)
             except zmq.Again:
                 await asyncio.sleep(0.005)

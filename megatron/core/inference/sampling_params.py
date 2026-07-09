@@ -34,6 +34,13 @@ class SamplingParams:
         None  # List of strings that will stop generation when produced
     )
     detokenize_stop_sequence: bool = False  # Keep stop words and EOD in generated text
+    # If False (default, vLLM-shaped), the engine omits the full prompt_tokens list
+    # from the reply payload (only the count is returned via
+    # DynamicInferenceRequest.num_prompt_tokens). The chat frontend sets this to
+    # prevent_retokenization: clients that echo tokens back next turn opt in; shipping
+    # the whole prompt-token list across engine->coordinator->frontend is
+    # O(prompt_len) waste otherwise.
+    return_prompt_tokens: bool = False
 
     def __post_init__(self):
         """Ensure backward compatibility for return_prompt_top_n_logprobs.
