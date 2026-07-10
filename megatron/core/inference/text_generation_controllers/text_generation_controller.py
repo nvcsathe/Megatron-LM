@@ -205,6 +205,13 @@ class TextGenerationController:
         logits_dtype = self.inference_wrapped_model.config.params_dtype
 
         self._sampling_backend = context.config.sampling_backend
+        # The FlashInfer sampler runs eagerly (it is not CUDA-graphed), so its many
+        # kernel launches must be queued immediately after the forward pass to hide
+        # behind the forward's GPU execution. That means preparing the next batch
+        # AFTER sampling rather than before it (the default cheap-graph ordering);
+        # otherwise the eager launches land after the CPU-heavy prep and sit exposed
+        # on the timeline, breaking async-scheduling overlap.
+        self._prepare_next_after_sampling = self._sampling_backend == "flashinfer"
         self._enable_cuda_graph = self.model_config.cuda_graph_impl == "local"
         self._async_scheduling_enabled = context.config.enable_async_scheduling
         self._async_pending_forward = False
@@ -1103,10 +1110,13 @@ class TextGenerationController:
                 spec_tokens[indices] = tokens
             return spec_tokens
 
+        no_top_k, no_top_p = self._active_requests_sampling_filter_flags()
         return self._sampling.sample_kernel(
             logits_2d,
             logits_2d.shape[0],
             self.inference_wrapped_model.inference_context,
+            no_top_k=no_top_k,
+            no_top_p=no_top_p,
             eager=True,
         )
 
@@ -1350,24 +1360,17 @@ class TextGenerationController:
             :active_request_count
         ]
 
-        # Sampling-side request counts: padded when running a captured graph.
-        # Verify uses the actual counts so the Triton kernels operate on the real workload.
-        use_graph_for_sampling = (
-            self._sampling_backend == "flashinfer"
-            and self._enable_cuda_graph
-            and context.using_cuda_graph_this_step()
-        )
-        if use_graph_for_sampling:
-            sample_num_decode = context.padded_batch_dimensions.decode_req_count
-            sample_num_prefill = context.padded_batch_dimensions.prefill_req_count
-        else:
-            sample_num_decode = context.num_decode_requests
-            sample_num_prefill = context.num_prefill_requests
+        # The FlashInfer sampler runs eagerly (never CUDA-graphed), so verify with the
+        # actual request counts. When the forward pass is graphed `required_logits` is
+        # padded to a static shape, but sampling only the actual token prefix (below)
+        # leaves the trailing padded rows unsampled.
+        sample_num_decode = context.num_decode_requests
+        sample_num_prefill = context.num_prefill_requests
 
         # Logit indices for tokens that need sampling.
-        # Padded under graph capture so the captured `gather_indices` input has a stable shape.
-        # Padded slots resolve to row 0; verify and prepare-next read only the actual prefix,
-        # so the padded-row samples produced by the captured kernel are discarded.
+        # `speculative_required_logit_indices()` pads to a static shape when the forward
+        # pass is graphed (trailing slots resolve to row 0); sampling uses the actual
+        # counts, so those padded slots are never sampled.
         nvtx_range_push("mtp-spec-decoding/verify/logit-indices")
         # Use pre-allocated buffer for CUDA graph compatibility.
         logits = self._all_logits_cuda
@@ -1420,12 +1423,6 @@ class TextGenerationController:
                 self.num_speculative_tokens,
                 context,
                 gather_indices=sample_gather_indices,
-                eager=not use_graph_for_sampling,
-                cache_key=(
-                    ("sample_speculative", sample_num_decode, sample_num_prefill)
-                    if use_graph_for_sampling
-                    else None
-                ),
             )
         nvtx_range_pop("mtp-spec-decoding/verify/sample")
 
@@ -1537,9 +1534,9 @@ class TextGenerationController:
             self._sampled_tokens_cuda[sampled_indices] = sampled_tokens
             return
 
-        use_graph = self._enable_cuda_graph and context.using_cuda_graph_this_step()
-        # Padded count when running a captured graph (cache key buckets); actual otherwise.
-        n = context.padded_active_request_count if use_graph else active_request_count
+        # The FlashInfer sampler runs eagerly (never CUDA-graphed), so sample the
+        # actual active rows -- there is no captured static shape to pad up to.
+        n = active_request_count
         # When `materialize_only_last_token_logits` is true the forward pass already
         # selected the right rows. Otherwise point the kernel at per-request
         # last-token positions. Row-mapped reuse remaps those gather indices.
@@ -1551,40 +1548,19 @@ class TextGenerationController:
             gather_indices = context.gpu_view.active_request_last_token_idxs
             if row_indices is not None:
                 gather_indices = gather_indices.index_select(0, row_indices)
-        # `gather_indices` feeds advanced indexing and is a CUDA-graph input, so it must
-        # carry one dtype across every path. `row_indices` is int64 (it is also an
-        # `index_select` argument elsewhere, which requires int64) while the gpu_view
-        # last-token index buffer is int32; standardize on int64, the index-safe dtype.
-        # Only the prefill path is widened here; the decode row-mapped path is already int64.
+        # `gather_indices` feeds advanced indexing, so standardize on int64 (the
+        # index-safe dtype): `row_indices` is already int64 while the gpu_view
+        # last-token index buffer is int32.
         if gather_indices is not None and gather_indices.dtype != torch.int64:
             gather_indices = gather_indices.to(torch.int64)
-        # Under graph capture the kernel samples a static `n` (padded) rows, so
-        # `gather_indices` must supply `n` rows to match the padded `temperature`/
-        # `top_k`/`top_p` slices. Row-mapped async reuse passes only the active rows,
-        # so pad the trailing slots to row 0; those samples are discarded by the
-        # `[:active_request_count]` copy-back below.
-        if use_graph and gather_indices is not None and gather_indices.shape[0] < n:
-            padded_gather_indices = gather_indices.new_zeros(n)
-            padded_gather_indices[: gather_indices.shape[0]] = gather_indices
-            gather_indices = padded_gather_indices
+        no_top_k, no_top_p = self._active_requests_sampling_filter_flags(active_request_count)
         sampled_tokens = self._sampling.sample_kernel(
             self._all_logits_cuda.squeeze(0),
             n,
             context,
             gather_indices=gather_indices,
-            eager=not use_graph,
-            # `gather_indices` is a graph input with a now-uniform dtype, so its length is
-            # the only remaining discriminator: the decode row-mapped path passes `n`
-            # per-request indices while the prefill path passes a differently sized
-            # per-token index array. Keying on shape (and None vs Tensor) keeps their
-            # graphs distinct so the replay validator never sees a mismatched capture.
-            cache_key=(
-                ("sample", n, gather_indices.shape[0])
-                if gather_indices is not None
-                else ("sample", n, None)
-            )
-            if use_graph
-            else None,
+            no_top_k=no_top_k,
+            no_top_p=no_top_p,
         )
         self._sampled_tokens_cuda[:active_request_count].copy_(
             sampled_tokens[:active_request_count]
@@ -1663,6 +1639,33 @@ class TextGenerationController:
             (active_metadata["top_k"][active_slice] == 1).all()
             and (active_metadata["top_p"][active_slice] == 0.0).all()
         )
+
+    def _active_requests_sampling_filter_flags(
+        self, active_request_count: Optional[int] = None
+    ) -> Tuple[bool, bool]:
+        """Return ``(no_top_k, no_top_p)`` batch-level escape hatches for the active batch.
+
+        These drive the FlashInfer sampler's vLLM-style dispatch (top-p-only /
+        top-k-only / joint), and are computed from the same pinned CPU sampling
+        metadata as the greedy hatch (:meth:`_active_requests_use_greedy_sampling`),
+        so they incur no GPU sync. A filter is "absent" only when NO active request
+        uses it, mirroring vLLM's ``k is None`` / ``p is None`` flags. Padded rows
+        carry a neutral 0 and never flip a flag.
+        """
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+            if active_request_count is None
+            else active_request_count
+        )
+        if active_request_count <= 0:
+            return True, True
+
+        active_metadata = context.active_request_metadata
+        active_slice = slice(0, active_request_count)
+        no_top_k = bool((active_metadata["top_k"][active_slice] == 0).all())
+        no_top_p = bool((active_metadata["top_p"][active_slice] == 0.0).all())
+        return no_top_k, no_top_p
 
     def _active_requests_need_sampling_bookkeeping(self) -> bool:
         """Whether active requests need per-step sampling parameter buckets."""
@@ -3219,7 +3222,15 @@ class TextGenerationController:
                 self._retire_dynamic_forward_side_effects()
 
             if not pending_forward_row_mapped and self.num_speculative_tokens == 0:
-                async_next_prepared = self._try_prepare_async_decode_before_sampling()
+                if self._prepare_next_after_sampling:
+                    # Eager FlashInfer sampler: defer next-batch prep until AFTER
+                    # sampling so the sampling launches queue right behind the forward
+                    # and hide under its GPU execution. The deferred flag routes the
+                    # `else` sampling branch below into the after-sampling prep + copy
+                    # (the same ordering the pending-forward-reuse path already uses).
+                    self._async_prepare_deferred_until_after_sampling = True
+                else:
+                    async_next_prepared = self._try_prepare_async_decode_before_sampling()
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.

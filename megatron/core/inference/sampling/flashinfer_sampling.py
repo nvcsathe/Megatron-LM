@@ -11,40 +11,41 @@ except ImportError:
     flashinfer = None
 
 from megatron.core.inference.sampling.base import Sampling
-from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
 
 class FlashInferSampling(Sampling):
-    """Fused FlashInfer sampling, with optional CUDA graph capture/replay."""
+    """FlashInfer sampling, matching vLLM's ``flashinfer_sample`` dispatch.
+
+    The sampler runs EAGERLY -- it is intentionally not captured in a CUDA graph.
+    Capturing it (the previous behavior) had two independent defects:
+
+    1. It froze the FlashInfer philox offset at capture, so every graph replay drew
+       the *same* random numbers -> fully deterministic sampling (no rollout
+       diversity, and degenerate loops became absorbing since a repeating state
+       always re-sampled the same token).
+    2. It forced every top-p request through the joint top-k+top-p *rejection*
+       kernel (via ``top_k = vocab_size``), which can admit off-nucleus tail
+       tokens -- corrupting a Mamba2 SSM state into a degenerate loop.
+
+    Running eagerly (like vLLM, which also does not graph its sampler) lets us:
+
+    * branch per step into the *dedicated exact* top-p / top-k kernels, using the
+      joint kernel only for genuinely mixed batches; and
+    * let FlashInfer's internal RNG advance normally between launches.
+
+    The branch is data-dependent (which filters the batch uses), which is exactly
+    why it must not live inside a CUDA graph. The flags are read from the pinned
+    CPU sampling metadata, so evaluating them costs no GPU sync.
+    """
 
     def __init__(
         self, vocab_size: int, rng: torch.Generator, config=None, enable_cuda_graph: bool = False
     ) -> None:
+        # `config` / `enable_cuda_graph` are accepted for factory API symmetry but
+        # intentionally unused: the sampler is never graphed (see class docstring).
+        del config, enable_cuda_graph
         self._vocab_size = vocab_size
         self._rng = rng
-        if enable_cuda_graph and config is not None and config.cuda_graph_impl == "local":
-            CudaGraphManager(
-                config,
-                self,
-                function_name="sample_kernel",
-                need_backward=False,
-                inline_capture=True,
-            )
-            CudaGraphManager(
-                config,
-                self,
-                function_name="sample_speculative",
-                need_backward=False,
-                inline_capture=True,
-            )
-
-    def cuda_graph_generators(self):
-        """RNG generators used inside the captured `sample_kernel` region.
-
-        `CudaGraphManager` registers these with the graph so their philox offset stays
-        live across replays; otherwise every replay would draw identical random numbers.
-        """
-        return (self._rng,)
 
     def sample_kernel(
         self,
@@ -52,31 +53,35 @@ class FlashInferSampling(Sampling):
         n: int,
         context,
         *,
+        no_top_k: bool,
+        no_top_p: bool,
         gather_indices: Optional[Tensor] = None,
         token_to_request_index: Optional[Tensor] = None,
         eager: bool = False,
         cache_key: Any = None,
     ) -> Tensor:
-        """FlashInfer fused top-k / top-p sampling kernel.
+        """Sample tokens, dispatching top-p-only / top-k-only / joint like vLLM.
 
         Args:
             logits: Logits tensor of shape `[>=n, vocab_size]`.
             n: Number of rows to sample.
             context: The active DynamicInferenceContext.
+            no_top_k, no_top_p: Required batch-level dispatch flags (whether NO active
+                request uses top-k / top-p). The caller computes them once from the
+                pinned CPU sampling metadata (the controller's
+                `_active_requests_sampling_filter_flags`), alongside the greedy hatch.
             gather_indices: When set, sample from `logits[gather_indices[:n], :]`.
-            token_to_request_index: When set, sampling parameters are gathered per-token
-                rather than per-request (used by the speculative path).
-            eager, cache_key: Consumed by `CudaGraphManager` when it wraps this kernel.
+            token_to_request_index: When set, sampling parameters are gathered
+                per-token rather than per-request (speculative decoding path).
+            eager, cache_key: Accepted for API symmetry; ignored (no CUDA graph).
 
         Returns:
-            Sampled token ids of shape `[n]`. Under CUDA graph replay, this is a static buffer.
+            Sampled token ids of shape `[n]`.
         """
-        # CudaGraphManager consumes these args, if it exists.
         del eager, cache_key
 
-        # Read GPU sampling parameters from the per-step gpu_view mirror. The
-        # CPU source-of-truth (`active_request_metadata`) is pinned but resident
-        # on CPU, so reading it here would mix devices with `logits`.
+        # Per-row sampling params (GPU) for the kernel. gpu_view mirrors the pinned
+        # CPU `active_request_metadata` via the per-step coalesced H2D.
         gv = context.gpu_view
         if token_to_request_index is None:
             temperature = gv.temperature[:n]
@@ -87,23 +92,53 @@ class FlashInferSampling(Sampling):
             top_k = gv.top_k[token_to_request_index]
             top_p = gv.top_p[token_to_request_index]
 
-        # Clamp temperature to avoid division by 0.
+        # Temperature scale. `temperature` is a float32 tensor, so `bf16 logits /
+        # temperature` promotes `scaled` to fp32 -- the softmax / nucleus math must
+        # run in fp32 (a bf16 softmax over the vocab loses precision in exactly the
+        # tail region top-p depends on). The assert pins that guarantee.
         temperature = temperature.clamp(min=1e-6)
         if gather_indices is None:
             scaled = logits[:n] / temperature.unsqueeze(1)
         else:
             scaled = logits[gather_indices[:n], :] / temperature.unsqueeze(1)
-        probs = torch.softmax(scaled, dim=-1)
+        assert scaled.dtype == torch.float32, f"sampling math must be fp32, got {scaled.dtype}"
 
-        # Sentinel values disable filtering:
-        # top_k=vocab_size keeps all tokens, top_p=1.0 keeps the full probability mass.
-        # TODO: Consider changing the disable flags in the `InferenceRequest`.
-        top_k_safe = top_k.masked_fill(top_k == 0, self._vocab_size)
-        top_p_safe = top_p.masked_fill(top_p == 0.0, 1.0)
+        # `no_top_k` / `no_top_p` are the caller-supplied batch-level dispatch flags
+        # (a filter is absent only when NO active request uses it, mirroring vLLM's
+        # `k is None` / `p is None`). `top_k == 1` (greedy) is caught upstream by
+        # `_active_requests_use_greedy_sampling`, so an all-greedy batch never reaches
+        # this sampler; a mixed greedy/non-greedy batch keeps its greedy rows at
+        # `top_k == 1` (handled per-row as top-1 by the kernels below).
         output = torch.empty(n, device=logits.device, dtype=torch.int64)
-        output.copy_(
-            flashinfer.sampling.top_k_top_p_sampling_from_probs(
-                probs, top_k_safe, top_p_safe, generator=self._rng
+        if no_top_k and no_top_p:
+            # No nucleus / top-k filtering: sample the full temperature-scaled
+            # distribution. (torch.multinomial keeps this rare branch dependency-free.)
+            probs = torch.softmax(scaled, dim=-1)
+            output.copy_(torch.multinomial(probs, num_samples=1, generator=self._rng).view(-1))
+        elif no_top_k:
+            # Top-p only -> dedicated exact nucleus kernel (NOT the joint rejection
+            # kernel, which can leak off-nucleus tail tokens).
+            probs = torch.softmax(scaled, dim=-1)
+            top_p_safe = top_p.masked_fill(top_p == 0.0, 1.0)
+            output.copy_(
+                flashinfer.sampling.top_p_sampling_from_probs(probs, top_p_safe, deterministic=True)
             )
-        )
+        elif no_top_p:
+            # Top-k only -> dedicated exact top-k kernel.
+            probs = torch.softmax(scaled, dim=-1)
+            top_k_safe = top_k.masked_fill(top_k == 0, self._vocab_size)
+            output.copy_(
+                flashinfer.sampling.top_k_sampling_from_probs(probs, top_k_safe, deterministic=True)
+            )
+        else:
+            # Mixed batch (some top-k, some top-p, or requests using both) -> joint
+            # kernel, fed logits like vLLM. Per-row sentinels disable a filter for a
+            # row (top_k=vocab keeps all tokens, top_p=1.0 keeps the full mass).
+            top_k_safe = top_k.masked_fill(top_k == 0, self._vocab_size)
+            top_p_safe = top_p.masked_fill(top_p == 0.0, 1.0)
+            output.copy_(
+                flashinfer.sampling.top_k_top_p_sampling_from_logits(
+                    scaled, top_k_safe, top_p_safe, deterministic=True
+                )
+            )
         return output
