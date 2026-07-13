@@ -9,6 +9,7 @@ import msgpack
 import pytest
 import zmq
 
+from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.sampling_params import SamplingParams
@@ -32,7 +33,11 @@ async def test_add_request_streaming_emits_partials_then_final():
     recv_queue = [
         msgpack.packb([Headers.CONNECT_ACK.value], use_bin_type=True),
         msgpack.packb(
-            [Headers.ENGINE_REPLY_PARTIAL.value, 0, {"request_id": 0, "new_tokens": [1, 2]}],
+            [
+                Headers.ENGINE_REPLY_PARTIAL.value,
+                0,
+                {"request_id": 0, "new_tokens": [1, 2], "new_log_probs": [-0.1, -0.2]},
+            ],
             use_bin_type=True,
         ),
         msgpack.packb(
@@ -58,6 +63,7 @@ async def test_add_request_streaming_emits_partials_then_final():
 
     iterator = client.add_request_streaming("hi", params)
 
+    assert isinstance(iterator, AsyncStream)
     assert params.streaming is True
     assert 0 in client.stream_queues
     submit_payload = msgpack.unpackb(fake_socket.send.call_args.args[0], raw=False)
@@ -77,6 +83,36 @@ async def test_add_request_streaming_emits_partials_then_final():
     assert 0 not in client.stream_queues
     assert 0 not in client.request_submission_times
 
+    client.stop()
+
+
+async def test_openai_stream_can_request_partial_log_probs():
+    """Log-probability deltas are opt-in so the Dynamo payload stays unchanged."""
+    client, fake_socket = _make_client()
+    iterator = client.add_request_streaming(
+        "hi", SamplingParams(return_log_probs=True), include_log_probs=True
+    )
+
+    client.streams[iterator.request_id].put(
+        {
+            "partial": {
+                "request_id": iterator.request_id,
+                "new_tokens": [1],
+                "new_log_probs": [-0.25],
+            }
+        }
+    )
+    client.streams[iterator.request_id].finish()
+
+    assert [item async for item in iterator] == [
+        {
+            "partial": {
+                "request_id": iterator.request_id,
+                "new_tokens": [1],
+                "new_log_probs": [-0.25],
+            }
+        }
+    ]
     client.stop()
 
 

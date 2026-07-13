@@ -38,7 +38,7 @@ class SamplingParams:
     # drops prompt_tokens before serializing the finished request, saving the ZMQ
     # transmission cost for long prompts. Opt in when the client needs them.
     return_prompt_tokens: bool = False
-    streaming: bool = False  # Dynamo-only today: emit ENGINE_REPLY_PARTIAL per step.
+    streaming: bool = False  # Emit ENGINE_REPLY_PARTIAL per engine step.
 
     def __post_init__(self):
         """Ensure backward compatibility for return_prompt_top_n_logprobs.

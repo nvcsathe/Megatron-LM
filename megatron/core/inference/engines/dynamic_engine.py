@@ -316,8 +316,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
         self.failed_request_ids = []
-        # Generated token count already streamed for each request. Streaming
-        # is currently used only by the Dynamo frontend.
+        # Generated token count already streamed for each request.
         self._partial_emit_lengths: Dict[int, int] = {}
         self._generation_epoch: Optional[int] = None
         # Track requests that should stop due to stop words (detected in post_process_requests)
@@ -2158,7 +2157,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 total = len(request.generated_tokens)
                 if total > already:
                     new_tokens = list(request.generated_tokens[already:])
-                    partials.append({"request_id": rid, "new_tokens": new_tokens})
+                    partial = {"request_id": rid, "new_tokens": new_tokens}
+                    if request.sampling_params.return_log_probs:
+                        partial["new_log_probs"] = list(
+                            (request.generated_log_probs or [])[already:]
+                        )
+                    partials.append(partial)
                     self._partial_emit_lengths[rid] = total
             if partials:
                 nvtx_range_push("coordinator_streaming")

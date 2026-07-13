@@ -1,10 +1,12 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import functools
 import logging
 import time
 from typing import List, Optional, Union
 
+from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
@@ -26,33 +28,7 @@ except:
     HAVE_MSGPACK = False
 
 
-class InferenceStream:
-    """Async request stream with an addressable request id and cancellation.
-
-    Currently used only by the Dynamo frontend.
-    """
-
-    def __init__(self, client: "InferenceClient", request_id: int, queue: asyncio.Queue):
-        self.client = client
-        self.request_id = request_id
-        self.queue = queue
-        self.closed = False
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        item = await self.queue.get()
-        if item is None:
-            self.closed = True
-            raise StopAsyncIteration
-        return item
-
-    async def aclose(self) -> None:
-        """Abort the stream's request if it is still open."""
-        if not self.closed:
-            self.client.abort_request(self.request_id)
-            self.closed = True
+InferenceStream = AsyncStream
 
 
 class InferenceClient:
@@ -112,16 +88,24 @@ class InferenceClient:
         self.completion_futures = {}
         self.request_submission_times = {}
         self.next_request_id = 0
-        # A None queue item terminates a request stream after its final reply.
-        self.stream_queues: dict[int, asyncio.Queue] = {}
+        self.streams: dict[int, AsyncStream[dict]] = {}
+        # Compatibility alias for callers that inspect active stream requests.
+        self.stream_queues = self.streams
+        self.stream_log_probs: set[int] = set()
         self.aborted_request_ids: set[int] = set()
 
-    def _submit_stream(self, payload: list, request_id: int) -> InferenceStream:
+    def _submit_stream(
+        self, payload: list, request_id: int, include_log_probs: bool
+    ) -> AsyncStream[dict]:
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
-        queue: asyncio.Queue = asyncio.Queue()
-        self.stream_queues[request_id] = queue
+        stream = AsyncStream(
+            request_id, functools.partial(self.abort_request, request_id), loop=self._loop
+        )
+        self.streams[request_id] = stream
+        if include_log_probs:
+            self.stream_log_probs.add(request_id)
         self.request_submission_times[request_id] = time.perf_counter()
-        return InferenceStream(self, request_id, queue)
+        return stream
 
     def add_request(
         self, prompt: Union[str, List[int]], sampling_params: SamplingParams
@@ -158,9 +142,10 @@ class InferenceClient:
         """Cancel an in-flight request and close its local response stream."""
         request_id = int(request_id)
         self.aborted_request_ids.add(request_id)
-        queue = self.stream_queues.pop(request_id, None)
-        if queue is not None:
-            queue.put_nowait(None)
+        stream = self.streams.pop(request_id, None)
+        if stream is not None:
+            stream.finish()
+        self.stream_log_probs.discard(request_id)
         future = self.completion_futures.pop(request_id, None)
         if future is not None and not future.done():
             future.cancel()
@@ -169,11 +154,14 @@ class InferenceClient:
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
 
     def add_request_streaming(
-        self, prompt: Union[str, List[int]], sampling_params: SamplingParams
-    ) -> InferenceStream:
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        include_log_probs: bool = False,
+    ) -> AsyncStream[dict]:
         """Submit a streaming inference request.
 
-        Currently used only by the Dynamo frontend.
+        Used by Dynamo directly and by the OpenAI-compatible HTTP frontend.
 
         Returns an async iterator that yields one dict per engine step:
 
@@ -189,6 +177,8 @@ class InferenceClient:
             prompt: A string or list of token IDs.
             sampling_params: Sampling parameters. ``streaming`` is set to True
                 in-place.
+            include_log_probs: Include per-step ``new_log_probs`` values. False
+                preserves the existing Dynamo frontend payload.
 
         Returns:
             AsyncIterator[dict]: Per-step partial and final reply frames.
@@ -197,7 +187,7 @@ class InferenceClient:
         request_id = self.next_request_id
         self.next_request_id += 1
         payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
-        return self._submit_stream(payload, request_id)
+        return self._submit_stream(payload, request_id, include_log_probs)
 
     @trace_async_exceptions
     async def _recv_task(self):
@@ -225,15 +215,16 @@ class InferenceClient:
                     if submitted is not None:
                         reply['latency'] = time.perf_counter() - submitted
                     # Streaming path: deliver final reply + sentinel and stop.
-                    if request_id in self.stream_queues:
-                        queue = self.stream_queues.pop(request_id)
+                    if request_id in self.streams:
+                        stream = self.streams.pop(request_id)
+                        self.stream_log_probs.discard(request_id)
                         completed_request = (
                             DynamicInferenceRequest.deserialize(reply)
                             if self.deserialize
                             else reply
                         )
-                        queue.put_nowait({"final": completed_request})
-                        queue.put_nowait(None)
+                        stream.put({"final": completed_request})
+                        stream.finish()
                         continue
                     completion_future = self.completion_futures.pop(request_id)
                     if completion_future.done():
@@ -245,9 +236,11 @@ class InferenceClient:
                     completion_future.set_result(completed_request)
                 elif header == Headers.ENGINE_REPLY_PARTIAL:
                     request_id, partial = data[1:]
-                    queue = self.stream_queues.get(request_id)
-                    if queue is not None:
-                        queue.put_nowait({"partial": partial})
+                    stream = self.streams.get(request_id)
+                    if stream is not None:
+                        if request_id not in self.stream_log_probs and "new_log_probs" in partial:
+                            partial = {k: v for k, v in partial.items() if k != "new_log_probs"}
+                        stream.put({"partial": partial})
             except zmq.Again:
                 await asyncio.sleep(0.005)
                 continue
@@ -378,9 +371,10 @@ class InferenceClient:
                 future.cancel()
         self.completion_futures.clear()
         # Terminate any open streaming iterators.
-        for queue in self.stream_queues.values():
-            queue.put_nowait(None)
-        self.stream_queues.clear()
+        for stream in self.streams.values():
+            stream.finish()
+        self.streams.clear()
+        self.stream_log_probs.clear()
         self.aborted_request_ids.clear()
         self.socket.close(linger=0)
         self.context.term()
