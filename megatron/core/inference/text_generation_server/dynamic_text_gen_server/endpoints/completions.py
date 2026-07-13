@@ -131,11 +131,7 @@ try:
                 return_prompt_tokens=True,
             )
             if stream_requested:
-                tasks.append(
-                    client.add_request_streaming(
-                        prompt_tokens, per_req_params, include_log_probs=return_log_probs
-                    )
-                )
+                tasks.append(client.add_request_streaming(prompt_tokens, per_req_params))
             else:
                 tasks.append(client.add_request(prompt_tokens, per_req_params))
 

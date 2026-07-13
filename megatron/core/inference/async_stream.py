@@ -16,7 +16,7 @@ T = TypeVar("T")
 
 class AsyncStream(Generic[T]):
     """
-    Class for encapsulating an asynchronous stream of InferenceRequest outputs.
+    Class for encapsulating an asynchronous stream of request outputs.
 
     Adopted from https://github.com/vllm-project/vllm/blob/eb881ed006ca458b052905e33f0d16dbb428063a/vllm/v1/engine/async_stream.py # pylint: disable=line-too-long
     """

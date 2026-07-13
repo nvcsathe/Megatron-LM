@@ -614,10 +614,7 @@ try:
         stream_requested = bool(req.get("stream", False))
         if stream_requested:
             streams = [
-                client.add_request_streaming(
-                    prompt_tokens, sampling_params, include_log_probs=return_log_probs
-                )
-                for _ in range(n)
+                client.add_request_streaming(prompt_tokens, sampling_params) for _ in range(n)
             ]
             include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
             return Response(

@@ -28,9 +28,6 @@ except:
     HAVE_MSGPACK = False
 
 
-InferenceStream = AsyncStream
-
-
 class InferenceClient:
     """
     An asynchronous client for communicating with an inference coordinator service.
@@ -89,23 +86,7 @@ class InferenceClient:
         self.request_submission_times = {}
         self.next_request_id = 0
         self.streams: dict[int, AsyncStream[dict]] = {}
-        # Compatibility alias for callers that inspect active stream requests.
-        self.stream_queues = self.streams
-        self.stream_log_probs: set[int] = set()
         self.aborted_request_ids: set[int] = set()
-
-    def _submit_stream(
-        self, payload: list, request_id: int, include_log_probs: bool
-    ) -> AsyncStream[dict]:
-        self.socket.send(msgpack.packb(payload, use_bin_type=True))
-        stream = AsyncStream(
-            request_id, functools.partial(self.abort_request, request_id), loop=self._loop
-        )
-        self.streams[request_id] = stream
-        if include_log_probs:
-            self.stream_log_probs.add(request_id)
-        self.request_submission_times[request_id] = time.perf_counter()
-        return stream
 
     def add_request(
         self, prompt: Union[str, List[int]], sampling_params: SamplingParams
@@ -145,7 +126,6 @@ class InferenceClient:
         stream = self.streams.pop(request_id, None)
         if stream is not None:
             stream.finish()
-        self.stream_log_probs.discard(request_id)
         future = self.completion_futures.pop(request_id, None)
         if future is not None and not future.done():
             future.cancel()
@@ -154,10 +134,7 @@ class InferenceClient:
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
 
     def add_request_streaming(
-        self,
-        prompt: Union[str, List[int]],
-        sampling_params: SamplingParams,
-        include_log_probs: bool = False,
+        self, prompt: Union[str, List[int]], sampling_params: SamplingParams
     ) -> AsyncStream[dict]:
         """Submit a streaming inference request.
 
@@ -177,17 +154,21 @@ class InferenceClient:
             prompt: A string or list of token IDs.
             sampling_params: Sampling parameters. ``streaming`` is set to True
                 in-place.
-            include_log_probs: Include per-step ``new_log_probs`` values. False
-                preserves the existing Dynamo frontend payload.
 
         Returns:
-            AsyncIterator[dict]: Per-step partial and final reply frames.
+            AsyncStream[dict]: Per-step partial and final reply frames.
         """
         sampling_params.streaming = True
         request_id = self.next_request_id
         self.next_request_id += 1
         payload = [Headers.SUBMIT_REQUEST.value, request_id, prompt, sampling_params.serialize()]
-        return self._submit_stream(payload, request_id, include_log_probs)
+        self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        stream = AsyncStream(
+            request_id, functools.partial(self.abort_request, request_id), loop=self._loop
+        )
+        self.streams[request_id] = stream
+        self.request_submission_times[request_id] = time.perf_counter()
+        return stream
 
     @trace_async_exceptions
     async def _recv_task(self):
@@ -217,7 +198,6 @@ class InferenceClient:
                     # Streaming path: deliver final reply + sentinel and stop.
                     if request_id in self.streams:
                         stream = self.streams.pop(request_id)
-                        self.stream_log_probs.discard(request_id)
                         completed_request = (
                             DynamicInferenceRequest.deserialize(reply)
                             if self.deserialize
@@ -238,8 +218,6 @@ class InferenceClient:
                     request_id, partial = data[1:]
                     stream = self.streams.get(request_id)
                     if stream is not None:
-                        if request_id not in self.stream_log_probs and "new_log_probs" in partial:
-                            partial = {k: v for k, v in partial.items() if k != "new_log_probs"}
                         stream.put({"partial": partial})
             except zmq.Again:
                 await asyncio.sleep(0.005)
@@ -374,7 +352,6 @@ class InferenceClient:
         for stream in self.streams.values():
             stream.finish()
         self.streams.clear()
-        self.stream_log_probs.clear()
         self.aborted_request_ids.clear()
         self.socket.close(linger=0)
         self.context.term()
