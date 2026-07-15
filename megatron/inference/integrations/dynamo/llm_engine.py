@@ -35,6 +35,18 @@ from megatron.inference.integrations.dynamo.telemetry import EngineEventReceiver
 logger = logging.getLogger(__name__)
 
 
+def _completion_usage(
+    prompt_tokens: int, completion_tokens: int, cached_tokens: int
+) -> dict[str, Any]:
+    """Build OpenAI-compatible token usage from Megatron request counters."""
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "prompt_tokens_details": {"cached_tokens": cached_tokens},
+    }
+
+
 def build_sampling_params(request: GenerateRequest) -> SamplingParams:
     from megatron.core.inference.sampling_params import SamplingParams
 
@@ -327,11 +339,9 @@ class MegatronLLMEngine(LLMEngine):
                     "token_ids": [],
                     "index": 0,
                     "finish_reason": "stop",
-                    "completion_usage": {
-                        "prompt_tokens": len(token_ids),
-                        "completion_tokens": 0,
-                        "total_tokens": len(token_ids),
-                    },
+                    "completion_usage": _completion_usage(
+                        len(token_ids), 0, int(final.get("num_cached_tokens") or 0)
+                    ),
                     "disaggregated_params": disagg,
                 }
             finally:
@@ -341,10 +351,13 @@ class MegatronLLMEngine(LLMEngine):
             return
 
         release: dict[str, Any] = {}
+        cached_tokens_override: Optional[int] = None
         if self.config.role == "decode" and not probe:
             prefill = require_prefill_result(request, DisaggregationMode.DECODE)
             disagg = prefill.get("disaggregated_params") or {}
             release = disagg.get("release") or {}
+            prompt_details = prefill.get("prompt_tokens_details") or {}
+            cached_tokens_override = int(prompt_details.get("cached_tokens") or 0)
             stream = self.client.add_request_with_kv_handoff(
                 token_ids,
                 params,
@@ -357,7 +370,12 @@ class MegatronLLMEngine(LLMEngine):
 
         released = False
         try:
-            async for chunk in self._stream_chunks(stream, token_ids, params):
+            async for chunk in self._stream_chunks(
+                stream,
+                token_ids,
+                params,
+                cached_tokens_override=cached_tokens_override,
+            ):
                 if not released and self.config.role == "decode":
                     released = self._release_handoff_from_meta(release)
                 yield chunk
@@ -370,7 +388,11 @@ class MegatronLLMEngine(LLMEngine):
                     logger.exception("Failed to release Megatron handoff")
 
     async def _stream_chunks(
-        self, stream, prompt_token_ids: list[int], params: SamplingParams
+        self,
+        stream,
+        prompt_token_ids: list[int],
+        params: SamplingParams,
+        cached_tokens_override: Optional[int] = None,
     ) -> AsyncGenerator[GenerateChunk, None]:
         completion_tokens = 0
         completed = False
@@ -397,11 +419,15 @@ class MegatronLLMEngine(LLMEngine):
                         if max_tokens is not None and completion_tokens >= max_tokens
                         else "stop"
                     ),
-                    "completion_usage": {
-                        "prompt_tokens": len(prompt_token_ids),
-                        "completion_tokens": completion_tokens,
-                        "total_tokens": len(prompt_token_ids) + completion_tokens,
-                    },
+                    "completion_usage": _completion_usage(
+                        len(prompt_token_ids),
+                        completion_tokens,
+                        (
+                            int(final.get("num_cached_tokens") or 0)
+                            if cached_tokens_override is None
+                            else cached_tokens_override
+                        ),
+                    ),
                 }
                 completed = True
                 yield chunk

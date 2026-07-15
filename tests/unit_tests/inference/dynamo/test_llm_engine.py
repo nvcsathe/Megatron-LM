@@ -132,6 +132,58 @@ class _Context:
         return self.request_id
 
 
+class _FinalStream:
+    request_id = 31
+
+    def __init__(self, final):
+        self.final = final
+        self.done = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.done:
+            raise StopAsyncIteration
+        self.done = True
+        return {"final": self.final}
+
+    async def aclose(self):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_aggregated_usage_forwards_cached_tokens():
+    engine = MegatronLLMEngine(_config())
+    params = SimpleNamespace(num_tokens_to_generate=2)
+    stream = _FinalStream({"generated_tokens": [7, 8], "num_cached_tokens": 64})
+
+    chunks = [chunk async for chunk in engine._stream_chunks(stream, [1, 2, 3], params)]
+
+    assert chunks[-1]["completion_usage"] == {
+        "prompt_tokens": 3,
+        "completion_tokens": 2,
+        "total_tokens": 5,
+        "prompt_tokens_details": {"cached_tokens": 64},
+    }
+
+
+@pytest.mark.asyncio
+async def test_decode_usage_uses_prefill_cache_count_not_handoff_match_count():
+    engine = MegatronLLMEngine(_config())
+    params = SimpleNamespace(num_tokens_to_generate=1)
+    stream = _FinalStream({"generated_tokens": [9], "num_cached_tokens": 128})
+
+    chunks = [
+        chunk
+        async for chunk in engine._stream_chunks(
+            stream, [1, 2, 3], params, cached_tokens_override=32
+        )
+    ]
+
+    assert chunks[-1]["completion_usage"]["prompt_tokens_details"] == {"cached_tokens": 32}
+
+
 @pytest.mark.asyncio
 async def test_decode_health_probe_bypasses_kv_handoff():
     handoff_called = False
