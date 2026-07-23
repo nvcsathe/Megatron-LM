@@ -24,6 +24,7 @@ def mock_pipeline(monkeypatch):
     monkeypatch.setattr(base_mod, "GPTInferenceWrapper", MagicMock())
     monkeypatch.setattr(base_mod, "TextGenerationController", MagicMock())
     monkeypatch.setattr(base_mod, "DynamicInferenceEngine", MagicMock())
+    monkeypatch.setattr(base_mod, "DisaggDynamicInferenceEngine", MagicMock())
     # Bypass the EP-group initialization assert when no distributed setup
     # is in scope. Individual tests can override (e.g.,
     # ``test_ep_gt_1_requires_use_coordinator``).
@@ -93,6 +94,49 @@ class TestConstructorValidation:
         model, tok = fake_model_and_tokenizer
         with pytest.raises(ValueError, match="expert_model_parallel_size > 1"):
             MegatronLLM(model=model, tokenizer=tok, use_coordinator=False)
+
+    def test_disaggregation_requires_coordinator(
+        self, mock_pipeline, fake_model_and_tokenizer
+    ):
+        model, tok = fake_model_and_tokenizer
+        with pytest.raises(ValueError, match="disaggregation.*requires use_coordinator=True"):
+            _MegatronLLMBase(
+                model=model,
+                tokenizer=tok,
+                use_coordinator=False,
+                inference_shards="tp=1,role=prefill+tp=1,role=decode",
+            )
+
+    def test_disaggregation_selects_handoff_engine(
+        self, mock_pipeline, fake_model_and_tokenizer, monkeypatch
+    ):
+        model, tok = fake_model_and_tokenizer
+        specs = [MagicMock(role="prefill"), MagicMock(role="decode")]
+        engine = MagicMock()
+        base_mod.DisaggDynamicInferenceEngine.return_value = engine
+        monkeypatch.setattr(base_mod.dist, "get_world_size", lambda: 2)
+        monkeypatch.setattr(base_mod.dist, "get_rank", lambda: 0)
+        monkeypatch.setattr(base_mod, "normalize_shard_specs", MagicMock(return_value=specs))
+        configure = MagicMock()
+        monkeypatch.setattr(base_mod, "configure_prebuilt_disagg_engine", configure)
+        loop_manager = MagicMock()
+        monkeypatch.setattr(base_mod, "_EventLoopManager", MagicMock(return_value=loop_manager))
+        monkeypatch.setattr(base_mod, "_CoordinatorRuntime", MagicMock())
+
+        llm = _MegatronLLMBase(
+            model=model,
+            tokenizer=tok,
+            inference_shards=specs,
+            kv_transport_backend="nccl",
+        )
+
+        assert llm.engine is engine
+        configure.assert_called_once_with(
+            engine,
+            specs,
+            disagg_router="round_robin",
+            kv_transport_backend="nccl",
+        )
 
 
 class TestLifecycleGuards:
