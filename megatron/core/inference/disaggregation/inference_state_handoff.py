@@ -44,6 +44,7 @@ class InferenceStateHandoffMixin:
         """Initialize state without importing or constructing a transfer backend."""
 
         self._pinned_handoff_blocks: Dict[int, list] = {}
+        self._pinned_handoff_mamba_slots: Dict[int, list] = {}
         self._kv_transfer_agent = None
         self._kv_peer_metas = None
         self._mamba_transfer_agents = {}
@@ -261,12 +262,11 @@ class InferenceStateHandoffMixin:
         kv_peer = {"tp_metas": list(decode_metas)}
         handles = [self._kv_transfer_agent.begin_push_blocks(kv_peer, block_ids)]
         if self._mamba_transfer_agents:
-            msa = self.context.mamba_slot_allocator
-            slots = [
-                int(msa.get_slot(int(block)))
-                for block in block_ids
-                if msa.get_slot(int(block)) >= 0
-            ]
+            # Reuse the exact slots advertised in the handoff metadata. The
+            # allocator can acquire more cached Mamba states between metadata
+            # capture and SEND_KV; recomputing here would make the sender post
+            # more NCCL operations than the decode peer posted receives for.
+            slots = self._pinned_handoff_mamba_slots.get(request_id, [])
             if slots:
                 for state_kind, agent in self._mamba_transfer_agents.items():
                     peer = {
@@ -317,6 +317,7 @@ class InferenceStateHandoffMixin:
         local_kv: Any = self._kv_peer_metas
 
         local_mamba = None
+        local_mamba_slots = []
         if self._mamba_transfer_agents:
             msa = self.context.mamba_slot_allocator
             positions = []
@@ -326,6 +327,7 @@ class InferenceStateHandoffMixin:
                 if slot >= 0:
                     positions.append(pos)
                     slots.append(int(slot))
+            local_mamba_slots = slots
             local_mamba = {
                 "positions": positions,
                 **{
@@ -333,6 +335,7 @@ class InferenceStateHandoffMixin:
                     for state_kind, meta in self._mamba_peer_metas.items()
                 },
             }
+        self._pinned_handoff_mamba_slots[rid] = local_mamba_slots
 
         tp_size = get_pg_size(self.pg_collection.tp)
         if tp_size > 1 and torch.distributed.is_initialized():
@@ -397,6 +400,11 @@ class InferenceStateHandoffMixin:
 
         if isinstance(kv_meta, list):
             kv_meta = {"tp_metas": kv_meta}
+        else:
+            # TP=1 caches one static metadata dictionary for the engine. Keep
+            # request-specific Mamba metadata out of that shared object so a
+            # later handoff cannot overwrite an earlier request's positions.
+            kv_meta = dict(kv_meta)
         if mamba_meta is not None:
             kv_meta["mamba"] = mamba_meta
 
@@ -415,6 +423,7 @@ class InferenceStateHandoffMixin:
     def release_handoff_blocks(self, request_id: int) -> None:
         """Release blocks pinned by a previous do_kv_handoff completion."""
         block_ids = self._pinned_handoff_blocks.pop(request_id, None)
+        self._pinned_handoff_mamba_slots.pop(request_id, None)
         if not block_ids:
             return
         released = self._release_pinned_handoff_blocks(block_ids)
