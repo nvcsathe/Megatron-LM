@@ -322,7 +322,11 @@ class KVBlockAllocator:
         # Without resetting the block bag, context request memory will clash and
         # requests will point to each other's memory blocks, resulting in faulty
         # generations.
-        self.block_bag = torch.arange(self.total_count, dtype=torch.int32, device='cpu')
+        # Preserve the original tensor instead of replacing it. CUDA-graph warmup
+        # resets the context under torch.inference_mode(); allocating a replacement
+        # there would turn block_bag into an inference tensor that cannot later be
+        # mutated by the coordinator's out-of-inference-mode handoff release path.
+        torch.arange(self.total_count, out=self.block_bag)
 
         self.total_avail = self.total_count - 1
         self.pinned_blocks.clear()

@@ -225,6 +225,34 @@ def test_reset_clears_pinned_block_ownership():
     assert allocator.pinned_blocks == {}
 
 
+def test_reset_during_inference_mode_keeps_block_bag_mutable_afterward():
+    """CUDA-graph warmup must not replace block_bag with an inference tensor."""
+    context = _make_context()
+    context.prefix_cache_lru_clock = 0
+    allocator = KVBlockAllocator(
+        context,
+        total_count=8,
+        paused_count=0,
+        enable_prefix_caching=True,
+        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
+    )
+    original_block_bag = allocator.block_bag
+
+    with torch.inference_mode():
+        allocator.reset()
+        block = allocator.allocate_memory_blocks(1)
+        block_id = int(block[0])
+        allocator.pin_memory_blocks([block_id])
+        allocator.release_memory_blocks(block)
+
+    # Native disaggregation receives RELEASE_KV from the coordinator outside
+    # inference mode. This used to raise when reset() replaced block_bag during
+    # CUDA-graph warmup.
+    assert allocator.block_bag is original_block_bag
+    assert allocator.release_pinned_memory_blocks([block_id]) == 1
+    assert allocator.total_avail == 7
+
+
 def test_unpinned_owner_can_release_a_shared_pinned_block():
     allocator = KVBlockAllocator(
         _make_context(),
