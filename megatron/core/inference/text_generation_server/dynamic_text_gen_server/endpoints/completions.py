@@ -108,6 +108,7 @@ try:
                 num_tokens_to_generate=int(req.get("max_tokens", 16)),
                 stop_words=stop,
                 termination_id=-1 if ignore_eos else None,
+                streaming_interval=int(req.get("streaming_interval", 1)),
             )
         except ValueError as e:
             return f"Invalid sampling parameter: {e}", 400
@@ -129,6 +130,7 @@ try:
                 # This endpoint always echoes prompt_token_ids in its response, so
                 # keep the prompt tokens on the payload (default is now to drop them).
                 return_prompt_tokens=True,
+                streaming_interval=sampling_params.streaming_interval,
             )
             if stream_requested:
                 tasks.append(client.add_request_streaming(prompt_tokens, per_req_params))
