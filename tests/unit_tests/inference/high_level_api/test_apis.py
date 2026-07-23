@@ -13,6 +13,7 @@ import megatron.core.inference.apis._llm_base as base_mod
 from megatron.core.inference.apis._llm_base import _MegatronLLMBase
 from megatron.core.inference.apis.async_llm import MegatronAsyncLLM
 from megatron.core.inference.apis.llm import MegatronLLM
+from megatron.core.inference.config import InferenceConfig
 
 
 @pytest.fixture
@@ -126,8 +127,8 @@ class TestConstructorValidation:
         llm = _MegatronLLMBase(
             model=model,
             tokenizer=tok,
+            inference_config=InferenceConfig(kv_transport_backend="nccl"),
             inference_shards=specs,
-            kv_transport_backend="nccl",
         )
 
         assert llm.engine is engine

@@ -606,37 +606,6 @@ class DynamicInferenceEngine(AbstractEngine):
         self.capture_stats = capture_stats
 
     @internal_api
-    def set_disaggregation_config(
-        self,
-        *,
-        role,
-        identity,
-        spawn_coordinator,
-        disagg_router="round_robin",
-        kv_transport_backend="nixl",
-    ):
-        """Mark this engine as a coordinator-native prefill/decode instance.
-
-        Call before :meth:`start_listening_to_data_parallel_coordinator`.
-
-        Args:
-            role: ``"prefill"`` or ``"decode"``.
-            identity: Unique ZMQ identity for this instance's MP coordinator.
-            spawn_coordinator: Whether this rank spawns the shared coordinator.
-            disagg_router: Routing policy resolved by the coordinator.
-            kv_transport_backend: Transfer backend name.
-        """
-        assert role in ("prefill", "decode")
-        self._disagg_config = {
-            "role": role,
-            "identity": identity,
-            "spawn_coordinator": spawn_coordinator,
-            "disagg_router": disagg_router,
-            "kv_transport_backend": kv_transport_backend,
-        }
-        self.setup_kv_transfer(role, backend=kv_transport_backend)
-
-    @internal_api
     async def start_listening_to_data_parallel_coordinator(
         self,
         inference_coordinator_port: int | None = None,
@@ -721,7 +690,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Spawn a DP coordinator process and get the connection info.
         if disagg_config is not None:
-            spawn_coordinator = disagg_config["spawn_coordinator"] and self.is_mp_coordinator
+            spawn_coordinator = disagg_config.spawn_coordinator and self.is_mp_coordinator
         else:
             spawn_coordinator = launch_inference_coordinator and self.is_dp_coordinator
         if spawn_coordinator:
@@ -751,9 +720,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     "hostname": hostname,
                     "disaggregated": disagg_config is not None,
                     "disagg_router": (
-                        disagg_config["disagg_router"]
-                        if disagg_config is not None
-                        else "round_robin"
+                        disagg_config.router if disagg_config is not None else "round_robin"
                     ),
                 },
             )
@@ -799,9 +766,7 @@ class DynamicInferenceEngine(AbstractEngine):
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
         [mp_req_addr] = bcast
 
-        identity = (
-            disagg_config["identity"] if disagg_config is not None else f'mp-coord-{dp_rank}'
-        )
+        identity = disagg_config.identity if disagg_config is not None else f'mp-coord-{dp_rank}'
         if self.is_mp_coordinator:
             # 1. Create dealer sockets where tp_rank = 0 and pp_rank = 0
             #    These will receive requests from an InferenceCoordinator.
@@ -815,8 +780,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     msgpack.packb(
                         [
                             Headers.REGISTER_ROLE.value,
-                            disagg_config["role"],
-                            disagg_config["kv_transport_backend"],
+                            disagg_config.role,
+                            disagg_config.kv_transport_backend,
                             getattr(self, "_instance_transfer_meta", None),
                         ],
                         use_bin_type=True,

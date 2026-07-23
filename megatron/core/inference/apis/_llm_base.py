@@ -266,8 +266,6 @@ class _MegatronLLMBase:
         coordinator_host: Optional[str] = None,
         coordinator_port: Optional[int] = None,
         inference_shards=None,
-        disagg_router: str = "round_robin",
-        kv_transport_backend: str = "nixl",
     ) -> None:
         if (coordinator_host is not None or coordinator_port is not None) and not use_coordinator:
             raise ValueError("coordinator_host/port require use_coordinator=True")
@@ -299,8 +297,8 @@ class _MegatronLLMBase:
             configure_prebuilt_disagg_engine(
                 engine,
                 specs,
-                disagg_router=disagg_router,
-                kv_transport_backend=kv_transport_backend,
+                disagg_router=inference_config.disagg_router,
+                kv_transport_backend=inference_config.kv_transport_backend,
             )
 
         if use_coordinator:

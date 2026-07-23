@@ -397,7 +397,7 @@ class DataParallelInferenceCoordinator:
             self._disagg_mamba_flow.enqueue_prefill(
                 prefill_id, request_id, prompt, sampling_params, slot_cost
             )
-            logging.info(
+            logging.debug(
                 "Coordinator: queued prefill request %d on %s " "(Mamba slots=%d, used=%d/%s)",
                 request_id,
                 prefill_id,
@@ -433,7 +433,7 @@ class DataParallelInferenceCoordinator:
             )
             if request is None:
                 return
-            logging.info(
+            logging.debug(
                 "Coordinator: admitting queued prefill request %d on %s "
                 "(Mamba slots=%d, used=%d/%s)",
                 request.request_id,
@@ -468,7 +468,7 @@ class DataParallelInferenceCoordinator:
             handoff = self._disagg_mamba_flow.pop_next_admissible(decode_id)
             if handoff is None:
                 return
-            logging.info(
+            logging.debug(
                 "Coordinator: admitting queued decode handoff %d on %s "
                 "(Mamba slots=%d, used=%d/%s)",
                 handoff.request_id,
@@ -541,7 +541,7 @@ class DataParallelInferenceCoordinator:
             decode_id, request_id, slot_cost
         ):
             self._disagg_mamba_flow.enqueue(decode_id, request_id, payload, slot_cost)
-            logging.info(
+            logging.debug(
                 "Coordinator: queued decode handoff %d on %s " "(Mamba slots=%d, used=%d/%s)",
                 request_id,
                 decode_id,

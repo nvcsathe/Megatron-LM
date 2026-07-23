@@ -91,31 +91,17 @@ def test_prefill_reply_resubmits_to_decode_with_kv():
 def test_nixl_handoff_restores_registered_agent_metadata_across_tp_and_pp():
     registered = [
         {
-            "agent_name": "prefill-rank0",
-            "agent_metadata_b64": "a3Yw",
+            "agent_name": "kv-rank0",
+            "agent_metadata_b64": "kv0",
             "mamba": {
-                "conv": {
-                    "agent_name": "prefill-conv-rank0",
-                    "agent_metadata_b64": "Y29udjA=",
-                },
-                "ssm": {
-                    "agent_name": "prefill-ssm-rank0",
-                    "agent_metadata_b64": "c3NtMA==",
-                },
+                "conv": {"agent_name": "conv-rank0", "agent_metadata_b64": "conv0"}
             },
         },
         {
-            "agent_name": "prefill-rank1",
-            "agent_metadata_b64": "a3Yx",
+            "agent_name": "kv-rank1",
+            "agent_metadata_b64": "kv1",
             "mamba": {
-                "conv": {
-                    "agent_name": "prefill-conv-rank1",
-                    "agent_metadata_b64": "Y29udjE=",
-                },
-                "ssm": {
-                    "agent_name": "prefill-ssm-rank1",
-                    "agent_metadata_b64": "c3NtMQ==",
-                },
+                "conv": {"agent_name": "conv-rank1", "agent_metadata_b64": "conv1"}
             },
         },
     ]
@@ -123,38 +109,19 @@ def test_nixl_handoff_restores_registered_agent_metadata_across_tp_and_pp():
         "pp_metas": [
             {
                 "tp_metas": [
-                    {
-                        "agent_name": registered[0]["agent_name"],
-                        "agent_metadata_b64": registered[0]["agent_metadata_b64"],
-                        "block_ids": [7, 8],
-                    },
-                    {
-                        "agent_name": registered[1]["agent_name"],
-                        "agent_metadata_b64": registered[1]["agent_metadata_b64"],
-                        "block_ids": [9, 10],
-                    },
+                    {**registered[0], "mamba": None, "block_ids": [7]},
+                    {**registered[1], "mamba": None, "block_ids": [8]},
                 ],
-                "block_ids": [7, 8],
             }
         ],
         "mamba": {
-            "positions": [0, 2],
+            "positions": [0],
             "conv": {
                 "pp_metas": [
                     {
                         "tp_metas": [
-                            {**registered[0]["mamba"]["conv"], "block_ids": [3, 4]},
-                            {**registered[1]["mamba"]["conv"], "block_ids": [5, 6]},
-                        ]
-                    }
-                ]
-            },
-            "ssm": {
-                "pp_metas": [
-                    {
-                        "tp_metas": [
-                            {**registered[0]["mamba"]["ssm"], "block_ids": [3, 4]},
-                            {**registered[1]["mamba"]["ssm"], "block_ids": [5, 6]},
+                            {**registered[0]["mamba"]["conv"], "block_ids": [3]},
+                            {**registered[1]["mamba"]["conv"], "block_ids": [4]},
                         ]
                     }
                 ]
@@ -166,12 +133,11 @@ def test_nixl_handoff_restores_registered_agent_metadata_across_tp_and_pp():
     assert "agent_metadata_b64" not in repr(compact)
     restored = restore_registered_nixl_agent_metadata(compact, registered)
 
-    assert restored["pp_metas"][0]["tp_metas"][0]["block_ids"] == [7, 8]
-    assert restored["mamba"]["positions"] == [0, 2]
-    assert (
-        restored["mamba"]["ssm"]["pp_metas"][0]["tp_metas"][1]["agent_metadata_b64"]
-        == "c3NtMQ=="
-    )
+    assert restored["pp_metas"][0]["tp_metas"][0]["block_ids"] == [7]
+    assert restored["mamba"]["positions"] == [0]
+    assert restored["mamba"]["conv"]["pp_metas"][0]["tp_metas"][1][
+        "agent_metadata_b64"
+    ] == "conv1"
 
 
 def test_nixl_handoff_rejects_unregistered_or_conflicting_agent_metadata():

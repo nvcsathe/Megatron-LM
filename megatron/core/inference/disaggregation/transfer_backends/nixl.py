@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import base64
 import logging
-import os
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
@@ -30,13 +29,6 @@ from megatron.core.inference.disaggregation.transfer_backends.base import comput
 from megatron.core.inference.disaggregation.utils import transfer_peer_records
 
 logger = logging.getLogger(__name__)
-
-# NIXL uses UCX active messages for its control path in addition to CUDA
-# transports for VRAM. Configure UCX before importing NIXL so its first context
-# sees both capabilities. Operators may supply a fabric-specific AM transport
-# (for example, rc) through UCX_TLS before importing this module.
-os.environ.setdefault("UCX_TLS", "tcp,cuda_ipc,cuda_copy,cma,shm,self")
-os.environ.setdefault("UCX_MEMTYPE_CACHE", "n")
 
 try:
     from nixl import _api as _nixl_api  # type: ignore[import-not-found]

@@ -48,15 +48,18 @@ class TestInferenceConfig:
         args = parser.parse_args(["--inference-dynamic-batching-async-sched-mode", "overlap"])
         assert args.inference_dynamic_batching_async_sched_mode == "overlap"
 
-    def test_inference_setup_config_maps_async_sched_mode(self):
-        """Ensure declarative inference config maps async scheduling mode to runtime config."""
+    def test_inference_setup_config_maps_runtime_fields(self):
+        """Ensure declarative settings map to their runtime inference fields."""
         model = SimpleNamespace(
             position_embedding_type="rope",
             max_sequence_length=4096,
             pg_collection="pg",
             decoder=SimpleNamespace(layer_type_list=None),
         )
-        setup_config = InferenceSetupConfig(inference_dynamic_batching_async_sched_mode="overlap")
+        setup_config = InferenceSetupConfig(
+            inference_dynamic_batching_async_sched_mode="overlap",
+            disagg_kv_transport_backend="nccl",
+        )
 
         inference_config = setup_config.to_inference_config(
             model=model,
@@ -67,6 +70,7 @@ class TestInferenceConfig:
         )
 
         assert inference_config.async_sched_mode == AsyncScheduleMode.OVERLAP
+        assert inference_config.kv_transport_backend == "nccl"
 
     def test_offset_sampling_seed_argparse_plumbing(self):
         """Ensure the CLI can select a shared sampling seed across DP ranks."""

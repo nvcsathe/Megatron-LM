@@ -33,9 +33,9 @@ def test_shard_builder_keeps_replica_process_group(monkeypatch):
     )
 
     assert shards[0].pg_collection is pg_collections[0]
-    assert shards[0].process_group is shard_groups[0]
+    assert shards[0].model_replica_group is shard_groups[0]
     assert shards[1].pg_collection is None
-    assert shards[1].process_group is None
+    assert shards[1].model_replica_group is None
     assert [call.kwargs["ranks"] for call in new_group.call_args_list] == [[0, 1], [2, 3]]
 
 

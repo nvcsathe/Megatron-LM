@@ -179,7 +179,9 @@ class InferenceSetupConfig:
     """Enable/disable prefix caching for dynamic batching inference. When disabled, KV cache blocks
     cannot be shared between requests with identical prompt prefixes."""
 
-    inference_dynamic_batching_prefix_caching_eviction_policy: Literal["ref_zero", "lru"] = "ref_zero"
+    inference_dynamic_batching_prefix_caching_eviction_policy: Literal["ref_zero", "lru"] = (
+        "ref_zero"
+    )
     """Eviction policy for prefix caching blocks. "ref_zero" (default) immediately returns blocks to
     the free pool when ref_count hits 0. "lru" keeps blocks cached and evicts via LRU only when
     space is needed."""
@@ -225,6 +227,9 @@ class InferenceSetupConfig:
     inference_disable_ep_consensus: bool = False
     """Skip the EP-group consensus all-reduce in the inference engine control loop and step on local
     state only. Only safe when EP coordination is not required (e.g. ep_world_size == 1)."""
+
+    disagg_kv_transport_backend: Literal["nccl", "nixl"] = "nixl"
+    """State-transfer backend for coordinator-native prefill/decode inference."""
 
     # ---------------- Mamba inference state dtypes ----------------
     # NOTE: These are provided on the CLI as strings ("bf16"/"fp16"/"fp32") but are mapped to the
@@ -377,6 +382,7 @@ class InferenceSetupConfig:
             num_speculative_tokens=self.num_speculative_tokens,
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
             disable_ep_consensus=self.inference_disable_ep_consensus,
+            kv_transport_backend=self.disagg_kv_transport_backend,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
             offset_sampling_seed_by_dp_rank=self.offset_sampling_seed_by_dp_rank,
             async_sched_mode=AsyncScheduleMode(
