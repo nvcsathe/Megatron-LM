@@ -91,12 +91,23 @@ def get_model_builder(
     raise ValueError(f"Invalid model provider {provider}")
 
 
-def get_model_for_inference() -> MegatronModule:
-    """Initialize model and load checkpoint for inference."""
+def get_model_for_inference(
+    pg_collection: Optional[ProcessGroupCollection] = None,
+) -> MegatronModule:
+    """Initialize a model and load its inference checkpoint.
+
+    Args:
+        pg_collection: Process groups used to build and load the model. When
+            omitted, the initialized global MPU process groups are used.
+    """
 
     args = get_args()
 
     if HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
+        if pg_collection is not None:
+            raise ValueError(
+                "Custom inference process groups are not supported by the ModelOpt builder"
+            )
         # ModelOpt path keeps the legacy callable-based builder because the
         # modelopt hooks (custom layer specs, calibration, etc.) have not been
         # ported to the new ``ModelBuilder`` API yet. ``_get_model`` also takes
@@ -104,7 +115,8 @@ def get_model_for_inference() -> MegatronModule:
         model = _get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
     else:
         builder = get_model_builder(args)
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         model = builder.build_distributed_models(
             pg_collection=pg_collection, wrap_with_ddp=False
         )
@@ -117,6 +129,16 @@ def get_model_for_inference() -> MegatronModule:
         optimizer=None,
         opt_param_scheduler=None,
         strict=not args.inference_ckpt_non_strict,
+        tp_group=pg_collection.tp if pg_collection is not None else None,
+        pp_group=pg_collection.pp if pg_collection is not None else None,
+        dp_cp_group=pg_collection.dp_cp if pg_collection is not None else None,
+        dp_group=pg_collection.dp if pg_collection is not None else None,
+        expt_dp_group=pg_collection.expt_dp if pg_collection is not None else None,
+        checkpoint_group=(
+            pg_collection.tp_ep_pp
+            if pg_collection is not None and hasattr(pg_collection, "tp_ep_pp")
+            else None
+        ),
     )
 
     # No virtual PP.
