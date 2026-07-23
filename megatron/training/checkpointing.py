@@ -1722,8 +1722,22 @@ def load_args_from_checkpoint(
     return args, checkpoint_args
 
 
-def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', strict=True,
-                    checkpointing_context=None, skip_load_to_model_and_opt=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None, dp_group: Optional[torch.distributed.ProcessGroup] = None, expt_dp_group: Optional[torch.distributed.ProcessGroup] = None, checkpoint_group: Optional[torch.distributed.ProcessGroup] = None, rng_state_key_prefix: str = ''):
+def load_checkpoint(
+    ddp_model,
+    optimizer,
+    opt_param_scheduler,
+    load_arg='load',
+    strict=True,
+    checkpointing_context=None,
+    skip_load_to_model_and_opt=False,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    pp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    dp_group: Optional[torch.distributed.ProcessGroup] = None,
+    expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
+    checkpoint_group: Optional[torch.distributed.ProcessGroup] = None,
+    rng_state_key_prefix: str = '',
+):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
         :attr:`state_dict` of the checkpoint match the names of

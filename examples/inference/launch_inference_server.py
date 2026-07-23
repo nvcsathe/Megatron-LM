@@ -67,7 +67,8 @@ def _build_model_and_inference_config(args):
         shards = build_inference_pg_collections_for_shards(world_size, specs)
         local_shard = next(shard for shard in shards if shard.pg_collection is not None)
         model = get_model_for_inference(
-            pg_collection=local_shard.pg_collection, checkpoint_group=local_shard.process_group
+            pg_collection=local_shard.pg_collection,
+            checkpoint_group=local_shard.model_replica_group,
         )
         inference_config = get_inference_config_from_model_and_args(model, args)
         inference_config.pg_collection = local_shard.pg_collection
@@ -87,7 +88,6 @@ async def _serve(args, model, tokenizer, inference_config, inference_shards):
         coordinator_host=args.coordinator_host,
         coordinator_port=args.coordinator_port,
         inference_shards=inference_shards,
-        kv_transport_backend=args.disagg_kv_transport_backend,
     ) as llm:
         serve_config = ServeConfig(
             host=args.host,

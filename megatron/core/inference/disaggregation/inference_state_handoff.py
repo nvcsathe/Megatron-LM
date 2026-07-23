@@ -20,6 +20,7 @@ except ImportError:
     HAVE_MSGPACK = False
 
 from megatron.core.inference.contexts.mamba_slot_allocator import MambaSlotCapacityError
+from megatron.core.inference.disaggregation.config import DisaggregationConfig
 from megatron.core.inference.disaggregation.handoff_wire_protocol import (
     strip_registered_nixl_agent_metadata,
 )
@@ -33,7 +34,7 @@ from megatron.core.inference.disaggregation.transfer_backends.base import (
 )
 from megatron.core.inference.disaggregation.utils import transfer_block_count
 from megatron.core.inference.headers import Headers
-from megatron.core.utils import get_pg_rank, get_pg_size
+from megatron.core.utils import get_pg_rank, get_pg_size, internal_api
 
 if TYPE_CHECKING:
     from megatron.core.inference.inference_request import DynamicInferenceRequest
@@ -90,6 +91,27 @@ def _select_mamba_state_meta(meta: Any, source_positions: list, selected_positio
 
 class InferenceStateHandoffMixin:
     """Optional KV/Mamba handoff behavior composed into the dynamic engine."""
+
+    @internal_api
+    def set_disaggregation_config(
+        self,
+        *,
+        role,
+        identity,
+        spawn_coordinator,
+        disagg_router="round_robin",
+        kv_transport_backend="nixl",
+    ) -> None:
+        """Configure one coordinator-native prefill or decode engine instance."""
+
+        self._disagg_config = DisaggregationConfig(
+            role=role,
+            identity=identity,
+            spawn_coordinator=spawn_coordinator,
+            router=disagg_router,
+            kv_transport_backend=kv_transport_backend,
+        )
+        self.setup_kv_transfer(role, backend=kv_transport_backend)
 
     def _initialize_disaggregation_state(self) -> None:
         """Initialize state without importing or constructing a transfer backend."""
@@ -490,8 +512,8 @@ class InferenceStateHandoffMixin:
         disagg_config = getattr(self, "_disagg_config", None)
         if (
             disagg_config is not None
-            and disagg_config["role"] == "prefill"
-            and disagg_config["kv_transport_backend"] == "nixl"
+            and disagg_config.role == "prefill"
+            and disagg_config.kv_transport_backend == "nixl"
         ):
             kv_meta = strip_registered_nixl_agent_metadata(kv_meta)
 
@@ -573,7 +595,7 @@ class InferenceStateHandoffMixin:
         # starving an older, larger one.
         if self._deferred_kv_handoffs:
             self._deferred_kv_handoffs.append(handoff)
-            logging.info(
+            logging.debug(
                 "DISAGG_DECODE_CAPACITY_QUEUE request_id=%d queued=%d",
                 request_id,
                 len(self._deferred_kv_handoffs),
@@ -583,7 +605,7 @@ class InferenceStateHandoffMixin:
         started, capacity_error = self._try_start_kv_handoff_import(handoff)
         if not started:
             self._deferred_kv_handoffs.append(handoff)
-            logging.info(
+            logging.debug(
                 "DISAGG_DECODE_CAPACITY_QUEUE request_id=%d required=%d available=%d queued=%d",
                 request_id,
                 capacity_error.required,
@@ -724,7 +746,7 @@ class InferenceStateHandoffMixin:
                 break
             self._deferred_kv_handoffs.popleft()
             started_count += 1
-            logging.info(
+            logging.debug(
                 "DISAGG_DECODE_CAPACITY_ADMIT request_id=%d queued=%d",
                 handoff.request_id,
                 len(self._deferred_kv_handoffs),

@@ -41,6 +41,7 @@ class DisaggMambaFlowControl:
     def __init__(self) -> None:
         self._capacity: Dict[Any, int] = {}
         self._prefill_usage: Dict[Any, int] = {}
+        self._prefill_request_count: Dict[Any, int] = {}
         self._prefill_reservations: Dict[int, Tuple[Any, int]] = {}
         self._prefill_queues: Dict[Any, Deque[QueuedPrefillRequest]] = {}
         self._decode_usage: Dict[Any, int] = {}
@@ -81,6 +82,7 @@ class DisaggMambaFlowControl:
             self._capacity[identity] = capacity
         if role == "prefill":
             self._prefill_usage.setdefault(identity, 0)
+            self._prefill_request_count.setdefault(identity, 0)
         if role == "decode":
             self._decode_usage.setdefault(identity, 0)
         return capacity
@@ -90,6 +92,7 @@ class DisaggMambaFlowControl:
 
         self._capacity.pop(identity, None)
         self._prefill_usage.pop(identity, None)
+        self._prefill_request_count.pop(identity, None)
         self._prefill_queues.pop(identity, None)
         self._decode_usage.pop(identity, None)
         self._decode_queues.pop(identity, None)
@@ -121,12 +124,6 @@ class DisaggMambaFlowControl:
             raise ValueError("Mamba prefill admission requires a positive token block size")
         return (len(prompt) + block_size_tokens - 1) // block_size_tokens
 
-    def _prefill_count(self, identity) -> int:
-        return sum(
-            reserved_identity == identity
-            for reserved_identity, _ in self._prefill_reservations.values()
-        )
-
     def try_reserve_prefill(
         self, identity, request_id: int, slot_cost: int, max_requests: int
     ) -> bool:
@@ -136,13 +133,15 @@ class DisaggMambaFlowControl:
             raise ValueError(f"Mamba slot cost cannot be negative, got {slot_cost}")
         if request_id in self._prefill_reservations:
             raise RuntimeError(f"Prefill request {request_id} already holds a Mamba reservation")
-        if self._prefill_count(identity) >= max_requests:
+        request_count = self._prefill_request_count.get(identity, 0)
+        if request_count >= max_requests:
             return False
         capacity = self._capacity.get(identity)
         usage = self._prefill_usage.get(identity, 0)
         if capacity is not None and usage + slot_cost > capacity:
             return False
         self._prefill_usage[identity] = usage + slot_cost
+        self._prefill_request_count[identity] = request_count + 1
         self._prefill_reservations[request_id] = (identity, slot_cost)
         return True
 
@@ -194,7 +193,11 @@ class DisaggMambaFlowControl:
                 f"Prefill Mamba slot accounting underflow on {identity!r}: "
                 f"used={usage}, release={slot_cost}"
             )
+        request_count = self._prefill_request_count.get(identity, 0)
+        if request_count < 1:
+            raise RuntimeError(f"Prefill request accounting underflow on {identity!r}")
         self._prefill_usage[identity] = usage - slot_cost
+        self._prefill_request_count[identity] = request_count - 1
         return identity
 
     @staticmethod

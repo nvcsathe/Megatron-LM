@@ -391,6 +391,15 @@ class InferenceConfig:
     step at typical decode throughput).
     """
 
+    # =================================
+    # Disaggregated inference config
+    # =================================
+    disagg_router: str = "round_robin"
+    """Routing policy for coordinator-native prefill/decode inference."""
+
+    kv_transport_backend: Literal["nccl", "nixl"] = "nixl"
+    """State-transfer backend for coordinator-native prefill/decode inference."""
+
     verbose: InitVar[bool] = False
     """Whether to log detailed context configuration at initialization.
     This is an InitVar and is not stored as a field on the config."""

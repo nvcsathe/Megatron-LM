@@ -178,7 +178,7 @@ class InferenceShard:
             the collective process-group creation for every shard
             (``dist.new_group`` is world-collective); only members get a usable
             handle.
-        process_group: Group spanning every rank in this shard, used for
+        model_replica_group: Group spanning every rank in this shard, used for
             shard-scoped operations such as checkpoint metadata validation.
     """
 
@@ -186,7 +186,7 @@ class InferenceShard:
     rank_offset: int
     world_size: int
     pg_collection: Optional[ProcessGroupCollection]
-    process_group: Optional[dist.ProcessGroup]
+    model_replica_group: Optional[dist.ProcessGroup]
 
 
 def build_inference_pg_collections_for_shards(
@@ -246,7 +246,7 @@ def build_inference_pg_collections_for_shards(
                 rank_offset=offset,
                 world_size=shard_world,
                 pg_collection=pgc if in_shard else None,
-                process_group=shard_group if in_shard else None,
+                model_replica_group=shard_group if in_shard else None,
             )
         )
         offset += shard_world
