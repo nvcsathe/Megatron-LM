@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import logging
 from typing import TYPE_CHECKING, Dict
 
 import torch
@@ -14,6 +15,18 @@ if TYPE_CHECKING:
 # are: KV divergence boundary, last block-aligned boundary, and penultimate
 # block boundary (see compute_and_store_offsets for details).
 MAX_INTERMEDIATE_OFFSETS_PER_REQUEST = 3
+
+
+class MambaSlotCapacityError(RuntimeError):
+    """Raised when active KV ownership leaves too few Mamba cache slots."""
+
+    def __init__(self, required: int, available: int):
+        self.required = required
+        self.available = available
+        super().__init__(
+            f"Mamba cache requires {required} new durable slots, but only "
+            f"{available} free or evictable slots are available"
+        )
 
 
 class MambaSlotAllocator:
@@ -159,6 +172,20 @@ class MambaSlotAllocator:
         if num_new == 0:
             return existing_slots
 
+        # Capacity admission must be atomic. Previously the allocator consumed
+        # free slots before discovering that the remainder could not be
+        # evicted, leaving the pool partially mutated when allocation failed.
+        need_evict = max(0, num_new - self.free_count)
+        evictable_block_ids = (
+            self._evictable_block_ids()
+            if need_evict > 0
+            else torch.empty(0, dtype=torch.int64, device=device)
+        )
+        evictable_count = evictable_block_ids.numel()
+        available = self.free_count + evictable_count
+        if available < num_new:
+            raise MambaSlotCapacityError(required=num_new, available=available)
+
         # Phase 3: Get slots from free pool, evicting if necessary
         from_free = min(num_new, self.free_count)
         new_slots = []
@@ -169,7 +196,7 @@ class MambaSlotAllocator:
 
         need_evict = num_new - from_free
         if need_evict > 0:
-            new_slots.extend(self._evict_lru_slots_batch(need_evict))
+            new_slots.extend(self._evict_lru_slots_batch(need_evict, evictable_block_ids))
 
         # Phase 4: Batch GPU writes for new mappings
         new_bid_tensor = torch.tensor(new_bids, dtype=torch.int64, device=device)
@@ -188,26 +215,29 @@ class MambaSlotAllocator:
                 result.append(alloc_bid_to_slot[bid])
         return result
 
-    def _evict_lru_slots_batch(self, num_needed: int) -> list:
+    def _evictable_block_ids(self) -> Tensor:
+        """Return blocks whose durable Mamba slots have no live KV owner."""
+
+        kv_alloc = self.context.kv_block_allocator
+        has_slot_mask = self.block_to_slot[: kv_alloc.total_count] >= 0
+        ref_zero_mask = kv_alloc.block_ref_counts[: kv_alloc.total_count] == 0
+        return torch.nonzero(has_slot_mask & ref_zero_mask, as_tuple=True)[0]
+
+    def _evict_lru_slots_batch(self, num_needed: int, candidate_ids: Tensor) -> list:
         """Evict the least recently used Mamba cache slots.
 
         Does NOT return slots to the free pool — caller takes ownership.
 
         Args:
             num_needed: Number of slots to evict.
+            candidate_ids: Prevalidated evictable block IDs from the atomic
+                capacity check.
 
         Returns:
             List of freed slot indices.
         """
         kv_alloc = self.context.kv_block_allocator
-        # Find blocks that have mamba slots and ref_count == 0
-        has_slot_mask = self.block_to_slot[: kv_alloc.total_count] >= 0
-        ref_zero_mask = kv_alloc.block_ref_counts[: kv_alloc.total_count] == 0
-        candidates = has_slot_mask & ref_zero_mask
-        candidate_ids = torch.nonzero(candidates, as_tuple=True)[0]
-
-        if candidate_ids.numel() < num_needed:
-            raise RuntimeError("No evictable Mamba cache slots available")
+        assert candidate_ids.numel() >= num_needed
 
         # Pick oldest blocks by timestamp (LRU) or first N (REF_ZERO)
         if self.context.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
@@ -515,9 +545,23 @@ class MambaSlotAllocator:
             return
         intermediate_bids, src_offsets, eos_bids, eos_ctx_indices, all_hashes = collected
 
-        # Allocate all slots in one batch (intermediates + EOS)
+        # These snapshots only improve future prefix-cache hits; the active
+        # request continues from its live Mamba state. If every durable slot
+        # is owned by an active request, skip this optional insertion rather
+        # than failing an otherwise successful forward pass. Required state
+        # imports remain strict callers of allocate_slots_batch().
         all_bids = intermediate_bids + eos_bids
-        all_slots = self.allocate_slots_batch(all_bids)
+        try:
+            all_slots = self.allocate_slots_batch(all_bids)
+        except MambaSlotCapacityError as error:
+            logging.info(
+                "MAMBA_PREFIX_CACHE_INSERT_SKIPPED checkpoints=%d required=%d available=%d",
+                len(all_bids),
+                error.required,
+                error.available,
+            )
+            self._clear_intermediate_state()
+            return
 
         # Copy intermediate states from output buffers to cache
         n_intermediate = len(intermediate_bids)

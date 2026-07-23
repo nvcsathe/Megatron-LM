@@ -30,6 +30,7 @@ def _make_context(
         total_request_count=total_request_count,
         request_kv_block_counts=request_kv_block_counts,
         request_to_kv_block_ids=request_to_kv_block_ids,
+        prefix_cache_lru_clock=0,
     )
 
 
@@ -208,10 +209,8 @@ def test_reset_clears_pinned_block_ownership():
 
 def test_reset_during_inference_mode_keeps_block_bag_mutable_afterward():
     """CUDA-graph warmup must not replace block_bag with an inference tensor."""
-    context = _make_context()
-    context.prefix_cache_lru_clock = 0
     allocator = KVBlockAllocator(
-        context,
+        _make_context(),
         total_count=8,
         paused_count=0,
         enable_prefix_caching=True,

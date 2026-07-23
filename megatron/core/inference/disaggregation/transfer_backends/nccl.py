@@ -237,11 +237,13 @@ class NcclTransferBackend:
         ops: List[Any] = []
         buffers: List[torch.Tensor] = []
         scatters: List[Any] = []
+        peer_ranks = set()
         device = self._memory_buffer.device
         dtype = self._memory_buffer.dtype
 
         if self._mamba_layout is not None:
             for meta, layer, lo, hi in self._mamba_transfers(records, mine_is_src=False):
+                peer_ranks.add(int(meta["nccl_rank"]))
                 for slot in dst_block_ids:
                     view = self._memory_buffer[layer, int(slot), lo:hi]
                     buf = torch.empty(view.shape, dtype=dtype, device=device)
@@ -251,6 +253,7 @@ class NcclTransferBackend:
         else:
             geo = self._geometry
             for meta, layers, heads in self._kv_transfers(records, mine_is_src=False):
+                peer_ranks.add(int(meta["nccl_rank"]))
                 n_layers = layers.stop - layers.start
                 n_heads = heads.stop - heads.start
                 for block in dst_block_ids:
@@ -263,6 +266,13 @@ class NcclTransferBackend:
                     ops.append(dist.P2POp(dist.irecv, buf, int(meta["nccl_rank"])))
                     scatters.append(_make_copy(self._kv_block_view(int(block), layers, heads), buf))
 
+        logger.info(
+            "DISAGG_NCCL_PULL_SUBMIT agent=%s peers=%s ops=%d blocks=%d",
+            self.agent_name,
+            sorted(peer_ranks),
+            len(ops),
+            len(dst_block_ids),
+        )
         works = dist.batch_isend_irecv(ops) if ops else []
         return NcclTransferHandle(works, buffers, scatters)
 
@@ -278,19 +288,29 @@ class NcclTransferBackend:
 
         ops: List[Any] = []
         keep: List[torch.Tensor] = []
+        peer_ranks = set()
 
         if self._mamba_layout is not None:
             for meta, layer, lo, hi in self._mamba_transfers(records, mine_is_src=True):
+                peer_ranks.add(int(meta["nccl_rank"]))
                 for slot in src_block_ids:
                     sub = self._memory_buffer[layer, int(slot), lo:hi].contiguous()
                     keep.append(sub)
                     ops.append(dist.P2POp(dist.isend, sub, int(meta["nccl_rank"])))
         else:
             for meta, layers, heads in self._kv_transfers(records, mine_is_src=True):
+                peer_ranks.add(int(meta["nccl_rank"]))
                 for block in src_block_ids:
                     sub = self._kv_block_view(int(block), layers, heads).contiguous()
                     keep.append(sub)
                     ops.append(dist.P2POp(dist.isend, sub, int(meta["nccl_rank"])))
 
+        logger.info(
+            "DISAGG_NCCL_PUSH_SUBMIT agent=%s peers=%s ops=%d blocks=%d",
+            self.agent_name,
+            sorted(peer_ranks),
+            len(ops),
+            len(src_block_ids),
+        )
         works = dist.batch_isend_irecv(ops) if ops else []
         return NcclTransferHandle(works, keep, [])

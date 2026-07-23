@@ -2,6 +2,7 @@
 
 import asyncio
 from collections import deque
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -9,6 +10,10 @@ import torch
 
 from megatron.core.inference.config import InferenceConfig, PrefixCachingEvictionPolicy
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.contexts.mamba_slot_allocator import (
+    MambaSlotAllocator,
+    MambaSlotCapacityError,
+)
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
@@ -988,6 +993,70 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
         assert len(log_probs_list[4]) == fresh_ql
 
 
+@pytest.mark.internal
+def test_failed_mamba_batch_allocation_is_atomic(monkeypatch):
+    """A failed capacity check must not consume free Mamba slots."""
+
+    # This test covers CPU bookkeeping only; keep the allocator's state
+    # buffers on CPU so the invariant can run without a GPU.
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+    context = SimpleNamespace(
+        max_requests=1,
+        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
+        kv_block_allocator=SimpleNamespace(
+            total_count=3, block_ref_counts=torch.ones(3, dtype=torch.int32, device="cpu")
+        ),
+    )
+    allocator = MambaSlotAllocator(
+        context=context,
+        max_slots=2,
+        num_mamba_layers=1,
+        conv_states_shape=(1,),
+        ssm_states_shape=(1,),
+        conv_states_dtype=torch.float32,
+        ssm_states_dtype=torch.float32,
+    )
+    allocator.allocate_slots_batch([0, 1])
+    block_to_slot_before = allocator.block_to_slot.clone()
+    slot_to_block_before = allocator.slot_to_block.clone()
+
+    with pytest.raises(MambaSlotCapacityError, match="only 0 free or evictable"):
+        allocator.allocate_slots_batch([2])
+
+    assert allocator.free_count == 0
+    assert torch.equal(allocator.block_to_slot, block_to_slot_before)
+    assert torch.equal(allocator.slot_to_block, slot_to_block_before)
+
+
+@pytest.mark.internal
+def test_commit_intermediate_states_skips_optional_insert_at_capacity(caplog):
+    """A full durable cache must not fail the request that produced the state."""
+    msa = object.__new__(MambaSlotAllocator)
+    msa._collect_commit_data = lambda: ([11], [0], [12], [0], [101, 102])
+
+    def raise_capacity(_block_ids):
+        raise MambaSlotCapacityError(required=2, available=0)
+
+    msa.allocate_slots_batch = raise_capacity
+    msa._copy_intermediate_to_cache = lambda *_args: pytest.fail(
+        "state copy must not run after admission failure"
+    )
+    msa.store_from_live_batch = lambda *_args: pytest.fail(
+        "live-state copy must not run after admission failure"
+    )
+    msa.register_block_hashes_batch = lambda *_args: pytest.fail(
+        "hash registration must not run after admission failure"
+    )
+    clear_calls = []
+    msa._clear_intermediate_state = lambda: clear_calls.append(True)
+
+    with caplog.at_level("INFO"):
+        msa.commit_intermediate_states()
+
+    assert clear_calls == [True]
+    assert "MAMBA_PREFIX_CACHE_INSERT_SKIPPED checkpoints=2 required=2 available=0" in caplog.text
+
+
 class TestMambaSlotAllocator(PrefixCachingTestBase):
 
     def _mctx(self, **kwargs):
@@ -1157,7 +1226,6 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
 
         # Verify _has_intermediates cleared
         assert not msa._has_intermediates
-
 
 class TestPerBlockRouting(PrefixCachingTestBase):
     """Tests for per-block routing storage and reconstruction."""
