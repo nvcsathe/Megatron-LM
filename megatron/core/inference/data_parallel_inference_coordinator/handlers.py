@@ -74,12 +74,7 @@ def handle_register_role(coordinator, sender_identity, payload):
     """Register a disaggregated engine and its transfer metadata."""
     assert coordinator.disaggregated, "REGISTER_ROLE on a non-disaggregated coordinator"
     _, role, transport, instance_meta = payload
-    if sender_identity not in coordinator.identities_of_data_parallel_ranks:
-        coordinator.identities_of_data_parallel_ranks.append(sender_identity)
-        coordinator._register_rank_identity(sender_identity)
-    coordinator._disagg.register(sender_identity, role)
-    coordinator._engine_transport[sender_identity] = transport
-    coordinator._engine_metas[sender_identity] = instance_meta
+    coordinator._register_disagg_engine(sender_identity, role, transport, instance_meta)
 
 
 @message_handler(Headers.SUBMIT_REQUEST)
@@ -233,6 +228,7 @@ def handle_engine_reply(coordinator, sender_identity, payload):
                 assert coordinator._pending_counts[idx] >= 1
                 coordinator._pending_counts[idx] -= 1
         if coordinator.disaggregated:
+            coordinator._release_decode_slot_reservation(fid)
             coordinator._disagg.forget(fid)
             coordinator._req_meta.pop(fid, None)
             coordinator._handle_kv_read_done(fid)
