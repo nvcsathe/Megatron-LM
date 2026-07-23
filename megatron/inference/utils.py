@@ -93,12 +93,15 @@ def get_model_builder(
 
 def get_model_for_inference(
     pg_collection: Optional[ProcessGroupCollection] = None,
+    checkpoint_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> MegatronModule:
     """Initialize a model and load its inference checkpoint.
 
     Args:
         pg_collection: Process groups used to build and load the model. When
             omitted, the initialized global MPU process groups are used.
+        checkpoint_group: Ranks that collectively form this model replica's
+            complete checkpoint view. Defaults to the global process group.
     """
 
     args = get_args()
@@ -134,11 +137,7 @@ def get_model_for_inference(
         dp_cp_group=pg_collection.dp_cp if pg_collection is not None else None,
         dp_group=pg_collection.dp if pg_collection is not None else None,
         expt_dp_group=pg_collection.expt_dp if pg_collection is not None else None,
-        checkpoint_group=(
-            pg_collection.tp_ep_pp
-            if pg_collection is not None and hasattr(pg_collection, "tp_ep_pp")
-            else None
-        ),
+        checkpoint_group=checkpoint_group,
     )
 
     # No virtual PP.
