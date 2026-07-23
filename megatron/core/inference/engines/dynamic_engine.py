@@ -378,6 +378,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.waiting_request_ids = deque()
         if hasattr(self, "_pinned_handoff_blocks"):
             self._pinned_handoff_blocks.clear()
+        if hasattr(self, "_pinned_handoff_mamba_slots"):
+            self._pinned_handoff_mamba_slots.clear()
         self.failed_request_ids = []
         # Generated token count already streamed for each request.
         self._partial_emit_lengths: Dict[int, int] = {}
