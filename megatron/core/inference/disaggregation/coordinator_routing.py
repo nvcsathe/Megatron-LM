@@ -50,7 +50,8 @@ class DisaggRouter(abc.ABC):
 
 class DisaggRouting(DisaggRouter):
     """Round-robin 2-hop router: prefill engine -> (KV handoff) -> decode
-    engine.
+    engine. Engine pools are sorted by identity after registration so routing
+    does not depend on process startup races.
 
     TODO: replace round-robin with a load- and prefix-aware policy. The KV
     cache events the engines already publish (stored/removed/cleared) carry
@@ -83,6 +84,7 @@ class DisaggRouting(DisaggRouter):
             raise ValueError(f"disagg engine role must be 'prefill'/'decode'; got {role!r}")
         if identity not in pool:
             pool.append(identity)
+            pool.sort(key=lambda item: item.decode() if isinstance(item, bytes) else str(item))
 
     def remove(self, identity) -> None:
         """Drop a disconnected engine from both pools."""

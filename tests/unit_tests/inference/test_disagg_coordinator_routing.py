@@ -67,6 +67,19 @@ def test_registration_partitions_by_role():
         r.register("x", "both")
 
 
+def test_registration_order_does_not_change_routing_order():
+    r = DisaggRouting()
+    r.register(b"prefill_s0_dp1", "prefill")
+    r.register(b"decode_s1_dp1", "decode")
+    r.register(b"decode_s1_dp0", "decode")
+    r.register(b"prefill_s0_dp0", "prefill")
+
+    assert r.route_submit(0) == b"prefill_s0_dp0"
+    assert r.route_submit(1) == b"prefill_s0_dp1"
+    assert r.route_prefill_done(0) == (b"prefill_s0_dp0", b"decode_s1_dp0")
+    assert r.route_prefill_done(1) == (b"prefill_s0_dp1", b"decode_s1_dp1")
+
+
 def test_submit_goes_to_prefill_then_prefill_done_picks_decode_round_robin():
     r = _routing(n_prefill=1, n_decode=2)
     # every submit routes to the single prefill engine
