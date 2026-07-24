@@ -63,9 +63,14 @@ def test_backend_registry_selects_by_explicit_name():
 def test_nixl_direct_backend_exports_metadata_with_fake_agent(monkeypatch):
     from megatron.core.inference.disaggregation.transfer_backends import nixl as nixl_mod
 
+    class FakeAgentConfig:
+        def __init__(self, *, enable_prog_thread):
+            self.enable_prog_thread = enable_prog_thread
+
     class FakeAgent:
-        def __init__(self, name):
+        def __init__(self, name, config):
             self.name = name
+            self.config = config
 
         def get_agent_metadata(self):
             return b"agent-meta"
@@ -75,6 +80,7 @@ def test_nixl_direct_backend_exports_metadata_with_fake_agent(monkeypatch):
 
     monkeypatch.setattr(nixl_mod, "_HAVE_NIXL", True)
     monkeypatch.setattr(nixl_mod, "nixl_agent", FakeAgent)
+    monkeypatch.setattr(nixl_mod, "nixl_agent_config", FakeAgentConfig)
 
     backend = nixl_mod.NixlTransferBackend(
         "prefill", torch.zeros(2, 3, 5, dtype=torch.float32), expected_num_blocks=3
@@ -86,13 +92,14 @@ def test_nixl_direct_backend_exports_metadata_with_fake_agent(monkeypatch):
     assert metadata["num_outer"] == 2
     assert metadata["num_blocks"] == 3
     assert metadata["blocks_axis"] == 1
+    assert backend._agent.config.enable_prog_thread is False
 
 
 def test_nixl_begin_pull_blocks_uses_remote_metadata_with_fake_agent(monkeypatch):
     from megatron.core.inference.disaggregation.transfer_backends import nixl as nixl_mod
 
     class FakeAgent:
-        def __init__(self, name):
+        def __init__(self, name, config):
             self.name = name
             self.transferred = False
 
@@ -124,6 +131,7 @@ def test_nixl_begin_pull_blocks_uses_remote_metadata_with_fake_agent(monkeypatch
 
     monkeypatch.setattr(nixl_mod, "_HAVE_NIXL", True)
     monkeypatch.setattr(nixl_mod, "nixl_agent", FakeAgent)
+    monkeypatch.setattr(nixl_mod, "nixl_agent_config", lambda **_: object())
 
     backend = nixl_mod.NixlTransferBackend(
         "decode", torch.zeros(2, 3, 5, dtype=torch.float32), expected_num_blocks=3
@@ -148,7 +156,7 @@ def test_nixl_begin_pull_blocks_returns_pollable_handle(monkeypatch):
     from megatron.core.inference.disaggregation.transfer_backends import nixl as nixl_mod
 
     class FakeAgent:
-        def __init__(self, name):
+        def __init__(self, name, config):
             self.name = name
             self.transfers = 0
             self.polls = 0
@@ -181,6 +189,7 @@ def test_nixl_begin_pull_blocks_returns_pollable_handle(monkeypatch):
 
     monkeypatch.setattr(nixl_mod, "_HAVE_NIXL", True)
     monkeypatch.setattr(nixl_mod, "nixl_agent", FakeAgent)
+    monkeypatch.setattr(nixl_mod, "nixl_agent_config", lambda **_: object())
 
     backend = nixl_mod.NixlTransferBackend(
         "decode", torch.zeros(2, 3, 5, dtype=torch.float32), expected_num_blocks=3

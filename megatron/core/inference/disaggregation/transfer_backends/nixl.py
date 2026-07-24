@@ -34,11 +34,13 @@ try:
     from nixl import _api as _nixl_api  # type: ignore[import-not-found]
 
     nixl_agent = _nixl_api.nixl_agent
+    nixl_agent_config = _nixl_api.nixl_agent_config
     _NIXL_VARIANT = _nixl_api.__name__.split(".", maxsplit=1)[0]
 
     _HAVE_NIXL = True
 except ImportError:
     nixl_agent = None  # type: ignore[assignment]
+    nixl_agent_config = None  # type: ignore[assignment]
     _NIXL_VARIANT = None
     _HAVE_NIXL = False
 
@@ -205,7 +207,13 @@ class NixlTransferBackend:
         self._mamba_layout = mamba_layout
         self._mamba_state_kind = mamba_state_kind
 
-        self._agent = nixl_agent(agent_name)
+        # Transfers are polled by the inference engine on every scheduling
+        # iteration. A NIXL progress thread per registered buffer would be
+        # redundant; hybrid models register separate KV, convolution-state,
+        # and SSM-state agents, so those threads otherwise contend with model
+        # execution even when no transfer is active.
+        agent_config = nixl_agent_config(enable_prog_thread=False)
+        self._agent = nixl_agent(agent_name, agent_config)
         _validate_nixl_cuda_support(self._agent, memory_buffer)
         self._reg_handle = self._agent.register_memory(memory_buffer)
 
