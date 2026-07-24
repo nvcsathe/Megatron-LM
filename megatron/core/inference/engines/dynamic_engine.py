@@ -3087,10 +3087,10 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             self.ep_async_step_protocol.complete_idle_step()
 
-    async def _run_ep_work_step(self, local_pending: int) -> None:
+    async def _run_ep_work_step(self, local_schedulable: int) -> None:
         """Run one coordinator-driven EP work step and close it before external replies."""
         finished_request_records = None
-        if local_pending > 0:
+        if local_schedulable > 0:
             step_result = await self.async_step(send_coordinator_replies=False)
             finished_request_records = step_result["finished_request_records"]
         else:
@@ -3198,7 +3198,11 @@ class DynamicInferenceEngine(AbstractEngine):
                         self._state_events[EngineState.PAUSED].set()
                     elif global_work > 0:
                         # At least one EP peer has work: all must participate.
-                        await self._run_ep_work_step(local_pending)
+                        # A pending KV import contributes to global work, but it is
+                        # not schedulable until polling admits the request. Such a
+                        # rank must dummy-forward to enter the same EP phases as
+                        # peers that already have schedulable work.
+                        await self._run_ep_work_step(local_schedulable)
                     else:
                         # No work, but not all pausing: idle.
                         self.ep_async_step_protocol.complete_idle_step()

@@ -361,6 +361,25 @@ class TestCoordinator:
             for _ in range(num_requests)
         ]
 
+    @pytest.mark.asyncio
+    async def test_ep_work_step_pending_import_only_uses_dummy_forward(self):
+        """Pending KV imports are global work, but are not locally schedulable yet."""
+        engine = unittest.mock.MagicMock()
+        engine.pending_kv_import_count = 1
+        engine.context.step_count = 4
+        engine.context.prefix_cache_lru_clock = 7
+        engine.async_step = unittest.mock.AsyncMock()
+        engine._ep_complete_work_step = unittest.mock.AsyncMock()
+
+        await DynamicInferenceEngine._run_ep_work_step(engine, local_schedulable=0)
+
+        engine.controller.dummy_forward.assert_called_once_with()
+        engine.async_step.assert_not_awaited()
+        engine._ep_complete_work_step.assert_awaited_once_with()
+        engine._send_finished_records_to_coordinator.assert_not_called()
+        assert engine.context.step_count == 5
+        assert engine.context.prefix_cache_lru_clock == 8
+
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
