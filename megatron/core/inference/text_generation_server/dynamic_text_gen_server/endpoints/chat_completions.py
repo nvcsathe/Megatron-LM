@@ -606,7 +606,7 @@ try:
                 client.add_request_streaming(prompt_tokens, sampling_params) for _ in range(n)
             ]
             include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
-            return Response(
+            response = Response(
                 openai_stream(
                     streams,
                     tokenizer,
@@ -616,6 +616,8 @@ try:
                 ),
                 content_type="text/event-stream",
             )
+            response.timeout = None
+            return response
 
         tasks = [client.add_request(prompt_tokens, sampling_params) for _ in range(n)]
 

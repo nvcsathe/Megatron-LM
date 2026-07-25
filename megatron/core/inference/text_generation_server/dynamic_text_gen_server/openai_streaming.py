@@ -113,13 +113,8 @@ async def openai_stream(streams, tokenizer, *, chat, return_log_probs=False, inc
             state["tokens"].extend(new_tokens)
             state["log_probs"].extend(new_log_probs)
             start_offset = len(state["text"])
-            full_text = tokenizer.detokenize(state["tokens"])
-            delta = (
-                full_text[len(state["text"]) :]
-                if full_text.startswith(state["text"])
-                else tokenizer.detokenize(new_tokens)
-            )
-            state["text"] = full_text
+            delta = tokenizer.detokenize(new_tokens)
+            state["text"] += delta
             choice = {
                 "index": index,
                 "logprobs": (
