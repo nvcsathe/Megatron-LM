@@ -42,12 +42,26 @@ def _finish_reason(result):
     return "length" if requested is not None and generated >= requested else "stop"
 
 
-async def openai_stream(streams, tokenizer, *, chat, return_log_probs=False, include_usage=False):
+async def openai_stream(
+    streams,
+    tokenizer,
+    incremental_detokenizers,
+    *,
+    chat,
+    return_log_probs=False,
+    include_usage=False,
+):
     """Yield SSE records for one or more inference streams."""
+    if len(streams) != len(incremental_detokenizers):
+        raise ValueError("Each inference stream must have an incremental detokenizer.")
+
     response_id = f"chatcmpl-{uuid.uuid4().hex}" if chat else str(uuid.uuid4())
     created = int(time.time())
     queue = asyncio.Queue()
-    states = [dict(tokens=[], log_probs=[], text="", final=None) for _ in streams]
+    states = [
+        dict(tokens=[], log_probs=[], detokenizer=detokenizer, final=None)
+        for detokenizer in incremental_detokenizers
+    ]
 
     async def pump(index, stream):
         try:
@@ -112,9 +126,8 @@ async def openai_stream(streams, tokenizer, *, chat, return_log_probs=False, inc
                 continue
             state["tokens"].extend(new_tokens)
             state["log_probs"].extend(new_log_probs)
-            start_offset = len(state["text"])
-            delta = tokenizer.detokenize(new_tokens)
-            state["text"] += delta
+            start_offset = state["detokenizer"].text_length
+            delta = state["detokenizer"].update(new_tokens)
             choice = {
                 "index": index,
                 "logprobs": (
@@ -141,7 +154,7 @@ async def openai_stream(streams, tokenizer, *, chat, return_log_probs=False, inc
                 "finish_reason": _finish_reason(result),
                 "generation_token_ids": list(state["tokens"]),
                 "generation_log_probs": list(state["log_probs"]),
-                "generated_text": state["text"],
+                "generated_text": state["detokenizer"].text,
                 "generated_length": len(state["tokens"]),
             }
             choice["delta" if chat else "text"] = {} if chat else ""
