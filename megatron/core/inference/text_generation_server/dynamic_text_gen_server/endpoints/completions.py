@@ -139,7 +139,7 @@ try:
 
         if stream_requested:
             include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
-            return Response(
+            response = Response(
                 openai_stream(
                     tasks,
                     tokenizer,
@@ -149,6 +149,8 @@ try:
                 ),
                 content_type="text/event-stream",
             )
+            response.timeout = None
+            return response
 
         if current_app.config['verbose']:
             start_time = time.perf_counter()
