@@ -10,6 +10,9 @@ import warnings
 
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server.incremental_detokenizer import (
+    HuggingFaceFastIncrementalDetokenizer,
+)
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.openai_streaming import (
     openai_stream,
 )
@@ -602,6 +605,15 @@ try:
         # --- 3. Send Requests to Engine ---
         stream_requested = bool(req.get("stream", False))
         if stream_requested:
+            # Streaming currently supports only Hugging Face fast tokenizers.
+            try:
+                incremental_detokenizers = [
+                    HuggingFaceFastIncrementalDetokenizer(tokenizer, prompt_tokens)
+                    for _ in range(n)
+                ]
+            except ValueError as error:
+                return Response(str(error), status=400)
+
             streams = [
                 client.add_request_streaming(prompt_tokens, sampling_params) for _ in range(n)
             ]
@@ -610,6 +622,7 @@ try:
                 openai_stream(
                     streams,
                     tokenizer,
+                    incremental_detokenizers,
                     chat=True,
                     return_log_probs=return_log_probs,
                     include_usage=include_usage,
