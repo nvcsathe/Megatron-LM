@@ -8,6 +8,7 @@ import time
 import uuid
 
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
+from megatron.core.inference.streaming_profiler import get_streaming_profiler
 
 
 def _token_logprobs(tokenizer, token_ids, log_probs, chat, start_offset):
@@ -58,6 +59,7 @@ async def openai_stream(
     response_id = f"chatcmpl-{uuid.uuid4().hex}" if chat else str(uuid.uuid4())
     created = int(time.time())
     queue = asyncio.Queue()
+    profiler = get_streaming_profiler("frontend-sse")
     states = [
         dict(tokens=[], log_probs=[], detokenizer=detokenizer, final=None)
         for detokenizer in incremental_detokenizers
@@ -111,10 +113,20 @@ async def openai_stream(
                 continue
 
             state = states[index]
-            if "partial" in item:
+            is_partial = "partial" in item
+            if is_partial:
                 partial = item["partial"]
                 new_tokens = partial.get("new_tokens") or []
                 new_log_probs = partial.get("new_log_probs") or []
+                profile_metadata = partial.get("_stream_profile")
+                if (
+                    profiler.enabled
+                    and profile_metadata
+                    and "frontend_ready_ns" in profile_metadata
+                ):
+                    profiler.record_duration(
+                        "frontend_queue", profiler.now_ns() - profile_metadata["frontend_ready_ns"]
+                    )
             else:
                 result = unwrap_serialized_tensors(item["final"])
                 state["final"] = result
@@ -127,27 +139,34 @@ async def openai_stream(
             state["tokens"].extend(new_tokens)
             state["log_probs"].extend(new_log_probs)
             start_offset = state["detokenizer"].text_length
+            detokenize_start_ns = profiler.now_ns()
             delta = state["detokenizer"].update(new_tokens)
-            choice = {
-                "index": index,
-                "logprobs": (
-                    _token_logprobs(tokenizer, new_tokens, new_log_probs, chat, start_offset)
-                    if return_log_probs
-                    else None
-                ),
-                "finish_reason": None,
-            }
+            profiler.record_elapsed("detokenize", detokenize_start_ns)
+            logprobs = None
+            if return_log_probs:
+                logprobs_start_ns = profiler.now_ns()
+                logprobs = _token_logprobs(tokenizer, new_tokens, new_log_probs, chat, start_offset)
+                profiler.record_elapsed("logprobs", logprobs_start_ns)
+            choice = {"index": index, "logprobs": logprobs, "finish_reason": None}
             choice["delta" if chat else "text"] = {"content": delta} if chat else delta
-            yield sse([choice])
+            json_start_ns = profiler.now_ns()
+            record = sse([choice])
+            profiler.record_elapsed("json", json_start_ns)
+            profiler.increment("chunks")
+            profiler.increment("tokens", len(new_tokens))
+            if not is_partial:
+                profiler.increment("final_reconciliation_chunks")
+            yield_start_ns = profiler.now_ns()
+            yield record
+            profiler.record_elapsed("yield_resume", yield_start_ns)
+            profiler.event()
 
         prompt_tokens = completion_tokens = cached_token_count = 0
         for index, state in enumerate(states):
             result = state["final"] or {}
             prompt_tokens = max(prompt_tokens, len(result.get("prompt_tokens") or []))
             completion_tokens += len(result.get("generated_tokens") or [])
-            cached_token_count = max(
-                cached_token_count, result.get("num_cached_tokens", 0)
-            )
+            cached_token_count = max(cached_token_count, result.get("num_cached_tokens", 0))
             choice = {
                 "index": index,
                 "logprobs": None,

@@ -6,6 +6,7 @@ import asyncio
 import torch
 
 from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.streaming_profiler import configure_streaming_profiling
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
     start_text_gen_server,
     stop_text_gen_server,
@@ -24,18 +25,40 @@ def add_text_generation_server_args(parser: argparse.ArgumentParser):
     parser = add_inference_args(parser)
     parser.add_argument("--port", type=int, default=5000, help="Port for Flask server to run on")
     parser.add_argument(
-        "--host", type=str, default=None,
-        help="Hostname or IP address to bind the server to. Defaults to 0.0.0.0 (all interfaces)."
+        "--host",
+        type=str,
+        default=None,
+        help="Hostname or IP address to bind the server to. Defaults to 0.0.0.0 (all interfaces).",
     )
     parser.add_argument(
         "--parsers", type=str, nargs="+", default=[], help="Parsers to use for parsing the response"
+    )
+    parser.add_argument(
+        "--streaming-profile",
+        action="store_true",
+        help="Emit aggregated per-stage token-streaming profiling logs.",
+    )
+    parser.add_argument(
+        "--streaming-profile-report-interval",
+        type=int,
+        default=1000,
+        help="Number of streaming events aggregated into each profiling report.",
+    )
+    parser.add_argument(
+        "--streaming-poll-interval-ms",
+        type=float,
+        default=5.0,
+        help="Frontend ZeroMQ empty-poll sleep in milliseconds.",
     )
     return parser
 
 
 @trace_async_exceptions
 async def run_text_generation_server(
-    engine: DynamicInferenceEngine, coordinator_port: int, server_port: int, hostname: str | None = None,
+    engine: DynamicInferenceEngine,
+    coordinator_port: int,
+    server_port: int,
+    hostname: str | None = None,
 ):
     """
     Runs the text generation server from rank 0 and initializes the
@@ -50,7 +73,8 @@ async def run_text_generation_server(
     rank = torch.distributed.get_rank()
 
     coordinator_addr = await engine.start_listening_to_data_parallel_coordinator(
-        inference_coordinator_port=coordinator_port, launch_inference_coordinator=True,
+        inference_coordinator_port=coordinator_port,
+        launch_inference_coordinator=True,
         hostname=hostname,
     )
 
@@ -84,6 +108,11 @@ if __name__ == "__main__":
         initialize_megatron()
 
         args = get_args()
+        configure_streaming_profiling(
+            args.streaming_profile,
+            args.streaming_profile_report_interval,
+            args.streaming_poll_interval_ms,
+        )
 
         # Match training's NVTX gating (training.py only flips this when both
         # --profile and --nvtx-ranges are set). Otherwise the engine-side
@@ -101,7 +130,9 @@ if __name__ == "__main__":
 
         try:
             asyncio.run(
-                run_text_generation_server(engine, args.inference_coordinator_port, args.port, args.host)
+                run_text_generation_server(
+                    engine, args.inference_coordinator_port, args.port, args.host
+                )
             )
         except KeyboardInterrupt:
             # Catching at the top level ensures clean stdout without spamming the traceback

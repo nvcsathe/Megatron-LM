@@ -9,6 +9,11 @@ from typing import List, Optional, Union
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.streaming_profiler import (
+    flush_streaming_profilers,
+    get_streaming_poll_interval_seconds,
+    get_streaming_profiler,
+)
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
 from .headers import Headers
@@ -87,6 +92,8 @@ class InferenceClient:
         self.next_request_id = 0
         self.streams: dict[int, AsyncStream[dict]] = {}
         self.aborted_request_ids: set[int] = set()
+        self.streaming_profiler = get_streaming_profiler("frontend-receiver")
+        self.streaming_poll_interval_seconds = get_streaming_poll_interval_seconds()
 
     def add_request(
         self, prompt: Union[str, List[int]], sampling_params: SamplingParams
@@ -185,7 +192,12 @@ class InferenceClient:
         """
         while True:
             try:
-                data = msgpack.unpackb(self.socket.recv(flags=zmq.NOBLOCK), raw=False)
+                recv_start_ns = self.streaming_profiler.now_ns()
+                serialized_data = self.socket.recv(flags=zmq.NOBLOCK)
+                recv_duration_ns = self.streaming_profiler.now_ns() - recv_start_ns
+                unpack_start_ns = self.streaming_profiler.now_ns()
+                data = msgpack.unpackb(serialized_data, raw=False)
+                unpack_duration_ns = self.streaming_profiler.now_ns() - unpack_start_ns
                 header = Headers(data[0])
                 if header == Headers.ENGINE_REPLY:
                     request_id, reply = data[1:]
@@ -216,11 +228,39 @@ class InferenceClient:
                     completion_future.set_result(completed_request)
                 elif header == Headers.ENGINE_REPLY_PARTIAL:
                     request_id, partial = data[1:]
+                    profiler = self.streaming_profiler
+                    profiler.record_duration("recv", recv_duration_ns)
+                    profiler.record_duration("unpack", unpack_duration_ns)
+                    profile_metadata = partial.get("_stream_profile")
+                    if (
+                        profiler.enabled
+                        and profile_metadata
+                        and profile_metadata.get("coordinator_host") == profiler.hostname
+                        and "coordinator_ready_ns" in profile_metadata
+                    ):
+                        profiler.record_duration(
+                            "coordinator_to_frontend",
+                            profiler.now_ns() - profile_metadata["coordinator_ready_ns"],
+                        )
+                    if profiler.enabled:
+                        profile_metadata = partial.setdefault("_stream_profile", {})
+                        profile_metadata["frontend_ready_ns"] = profiler.now_ns()
                     stream = self.streams.get(request_id)
                     if stream is not None:
+                        put_start_ns = profiler.now_ns()
                         stream.put({"partial": partial})
+                        profiler.record_elapsed("stream_put", put_start_ns)
+                        profiler.increment("partials")
+                        profiler.increment("tokens", len(partial.get("new_tokens") or []))
+                    else:
+                        profiler.increment("missing_stream")
+                    profiler.event()
             except zmq.Again:
-                await asyncio.sleep(0.005)
+                profiler = self.streaming_profiler
+                profiler.increment("empty_polls")
+                sleep_start_ns = profiler.now_ns()
+                await asyncio.sleep(self.streaming_poll_interval_seconds)
+                profiler.record_elapsed("poll_sleep", sleep_start_ns)
                 continue
             except KeyboardInterrupt:
                 break
@@ -341,6 +381,7 @@ class InferenceClient:
         and terminates the ZMQ context. It should be called when the client is
         no longer needed to ensure a graceful shutdown.
         """
+        flush_streaming_profilers()
         if hasattr(self, 'listener_task') and not self.listener_task.done():
             self.listener_task.cancel()
         # Wake up any listeners.

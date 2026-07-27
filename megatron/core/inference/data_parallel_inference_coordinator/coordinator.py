@@ -16,6 +16,10 @@ import torch
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import compute_block_hashes_batched
+from megatron.core.inference.streaming_profiler import (
+    flush_streaming_profilers,
+    get_streaming_profiler,
+)
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -128,6 +132,7 @@ class DataParallelInferenceCoordinator:
             "please install the messagepack library to use DataParallelInferenceCoordinator\n"
             "pip install msgpack"
         )
+        self.streaming_profiler = get_streaming_profiler("coordinator")
         self.pipe_connection = pipe_connection
         self.data_parallel_size = data_parallel_size
         self.context = zmq.Context()
@@ -436,8 +441,11 @@ class DataParallelInferenceCoordinator:
                 self._handle_rank_registration(sender_identity)
                 continue
 
+            unpack_start_ns = self.streaming_profiler.now_ns()
             deserialized_payload = msgpack.unpackb(serialized_payload, raw=False)
             header = Headers(deserialized_payload[0])
+            if header == Headers.ENGINE_REPLY_PARTIAL:
+                self.streaming_profiler.record_elapsed("unpack", unpack_start_ns)
 
             handler = self._handlers.get(header)
             if handler is None:
@@ -536,6 +544,7 @@ class DataParallelInferenceCoordinator:
         """
         Stops the inference coordinator, performing any necessary cleanup operations.
         """
+        flush_streaming_profilers()
         if self.schedule_output_path and self.schedule_records:
             schedule_data = {
                 "policy": self.prefix_caching_coordinator_policy.value,

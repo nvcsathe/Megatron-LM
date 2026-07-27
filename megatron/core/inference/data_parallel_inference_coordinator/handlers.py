@@ -195,9 +195,7 @@ def handle_engine_reply(coordinator, sender_identity, payload):
         client_request_identity = coordinator.request_id_to_client_request_id[fid]
         del coordinator.request_id_to_client_id[fid]
         original_request_id = coordinator.request_id_to_client_request_id.pop(fid)
-        coordinator.client_request_to_request_id.pop(
-            (client_identity, original_request_id), None
-        )
+        coordinator.client_request_to_request_id.pop((client_identity, original_request_id), None)
         assigned_rank = coordinator.request_id_to_rank.pop(fid, None)
         if assigned_rank is not None:
             idx = coordinator.identity_to_rank_index.get(assigned_rank)
@@ -220,21 +218,48 @@ def handle_engine_reply(coordinator, sender_identity, payload):
 def handle_engine_reply_partial(coordinator, sender_identity, payload):
     """Route incremental engine replies without releasing request routing state."""
     assert sender_identity in coordinator.identities_of_data_parallel_ranks
-    for partial in payload[1]:
+    profiler = coordinator.streaming_profiler
+    partials = payload[1]
+    forwarded_partials = 0
+    forwarded_tokens = 0
+    for partial in partials:
+        profile_metadata = partial.get("_stream_profile")
+        if (
+            profiler.enabled
+            and profile_metadata
+            and profile_metadata.get("engine_host") == profiler.hostname
+            and "engine_ready_ns" in profile_metadata
+        ):
+            profiler.record_duration(
+                "engine_to_coordinator", profiler.now_ns() - profile_metadata["engine_ready_ns"]
+            )
         request_id = partial["request_id"]
         client_identity = coordinator.request_id_to_client_id.get(request_id)
         if client_identity is None:
+            profiler.increment("missing_client")
             continue
         client_request_id = coordinator.request_id_to_client_request_id[request_id]
-        coordinator.router_socket.send_multipart(
-            [
-                client_identity,
-                msgpack.packb(
-                    [Headers.ENGINE_REPLY_PARTIAL.value, client_request_id, partial],
-                    use_bin_type=True,
-                ),
-            ]
+        if profiler.enabled:
+            profile_metadata = partial.setdefault("_stream_profile", {})
+            profile_metadata["coordinator_host"] = profiler.hostname
+            profile_metadata["coordinator_ready_ns"] = profiler.now_ns()
+
+        pack_start_ns = profiler.now_ns()
+        forwarded_payload = msgpack.packb(
+            [Headers.ENGINE_REPLY_PARTIAL.value, client_request_id, partial], use_bin_type=True
         )
+        profiler.record_elapsed("pack", pack_start_ns)
+
+        send_start_ns = profiler.now_ns()
+        coordinator.router_socket.send_multipart([client_identity, forwarded_payload])
+        profiler.record_elapsed("send", send_start_ns)
+        forwarded_partials += 1
+        forwarded_tokens += len(partial.get("new_tokens") or [])
+
+    profiler.increment("frames")
+    profiler.increment("partials", forwarded_partials)
+    profiler.increment("tokens", forwarded_tokens)
+    profiler.event()
 
 
 @message_handler(Headers.ABORT_REQUEST)
@@ -244,9 +269,7 @@ def handle_abort_request(coordinator, sender_identity, payload):
         logging.warning("Coordinator: ignoring abort from unknown client.")
         return
     client_request_id = int(payload[1])
-    request_id = coordinator.client_request_to_request_id.get(
-        (sender_identity, client_request_id)
-    )
+    request_id = coordinator.client_request_to_request_id.get((sender_identity, client_request_id))
     if request_id is None:
         return
     assigned_rank = coordinator.request_id_to_rank.get(request_id)

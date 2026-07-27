@@ -43,6 +43,10 @@ from megatron.core.inference.inference_request import (
     Status,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.streaming_profiler import (
+    flush_streaming_profilers,
+    get_streaming_profiler,
+)
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -326,6 +330,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Timing and logging variables.
         self.rank = torch.distributed.get_rank()
+        self._streaming_profiler = get_streaming_profiler(f"engine-rank-{self.rank}")
         self.step_start_event = torch.cuda.Event(enable_timing=True)
         self.step_end_event = torch.cuda.Event(enable_timing=True)
         self.capture_stats = None
@@ -2011,45 +2016,91 @@ class DynamicInferenceEngine(AbstractEngine):
 
     def _try_send_streaming_partials(self) -> None:
         """Send pending token deltas without blocking the inference loop."""
-        if not self.socket_for_receiving_requests.poll(timeout=0, flags=zmq.POLLOUT):
-            return
-
-        partials: list = []
-        emit_lengths: Dict[int, int] = {}
-        for rid, entry in self.requests.items():
-            request = entry.record[-1]
-            if not getattr(request.sampling_params, "streaming", False):
-                continue
-            already = self._partial_emit_lengths.get(rid, 0)
-            total = len(request.generated_tokens)
-            streaming_interval = getattr(request.sampling_params, "streaming_interval", 1)
-            if total - already >= streaming_interval:
-                new_tokens = list(request.generated_tokens[already:])
-                partial = {"request_id": rid, "new_tokens": new_tokens}
-                if request.sampling_params.return_log_probs:
-                    partial["new_log_probs"] = list(
-                        (request.generated_log_probs or [])[already:]
-                    )
-                partials.append(partial)
-                emit_lengths[rid] = total
-
-        if not partials:
-            return
-
-        payload = msgpack.packb(
-            [Headers.ENGINE_REPLY_PARTIAL.value, partials], use_bin_type=True
-        )
-        nvtx_range_push("coordinator_streaming")
+        profiler = getattr(self, "_streaming_profiler", None)
+        if profiler is None:
+            profiler = get_streaming_profiler("engine")
+            self._streaming_profiler = profiler
+        total_start_ns = profiler.now_ns()
+        profiler.increment("calls")
+        nvtx_range_push("streaming_total")
         try:
-            self.socket_for_receiving_requests.send(payload, flags=zmq.NOBLOCK)
-        except zmq.Again:
-            # Leave emit lengths unchanged so the unsent tokens are included
-            # in the next delta once the socket becomes writable.
-            return
-        finally:
-            nvtx_range_pop("coordinator_streaming")
+            poll_start_ns = profiler.now_ns()
+            nvtx_range_push("streaming_poll")
+            socket_writable = self.socket_for_receiving_requests.poll(timeout=0, flags=zmq.POLLOUT)
+            nvtx_range_pop("streaming_poll")
+            profiler.record_elapsed("poll", poll_start_ns)
+            if not socket_writable:
+                profiler.increment("poll_not_writable")
+                return
 
-        self._partial_emit_lengths.update(emit_lengths)
+            partials: list = []
+            emit_lengths: Dict[int, int] = {}
+            maximum_unsent_tokens = 0
+            scan_start_ns = profiler.now_ns()
+            nvtx_range_push("streaming_scan")
+            for rid, entry in self.requests.items():
+                request = entry.record[-1]
+                if not getattr(request.sampling_params, "streaming", False):
+                    continue
+                already = self._partial_emit_lengths.get(rid, 0)
+                total = len(request.generated_tokens)
+                unsent_tokens = total - already
+                maximum_unsent_tokens = max(maximum_unsent_tokens, unsent_tokens)
+                streaming_interval = getattr(request.sampling_params, "streaming_interval", 1)
+                if unsent_tokens >= streaming_interval:
+                    new_tokens = list(request.generated_tokens[already:])
+                    partial = {"request_id": rid, "new_tokens": new_tokens}
+                    if request.sampling_params.return_log_probs:
+                        partial["new_log_probs"] = list(
+                            (request.generated_log_probs or [])[already:]
+                        )
+                    partials.append(partial)
+                    emit_lengths[rid] = total
+            nvtx_range_pop("streaming_scan")
+            profiler.record_elapsed("scan", scan_start_ns)
+            profiler.maximum("maximum_unsent_tokens", maximum_unsent_tokens)
+
+            if not partials:
+                profiler.increment("calls_without_partials")
+                return
+
+            if profiler.enabled:
+                engine_ready_ns = profiler.now_ns()
+                for partial in partials:
+                    partial["_stream_profile"] = {
+                        "engine_host": profiler.hostname,
+                        "engine_ready_ns": engine_ready_ns,
+                    }
+
+            pack_start_ns = profiler.now_ns()
+            nvtx_range_push("streaming_pack")
+            payload = msgpack.packb(
+                [Headers.ENGINE_REPLY_PARTIAL.value, partials], use_bin_type=True
+            )
+            nvtx_range_pop("streaming_pack")
+            profiler.record_elapsed("pack", pack_start_ns)
+
+            send_start_ns = profiler.now_ns()
+            nvtx_range_push("streaming_send")
+            try:
+                self.socket_for_receiving_requests.send(payload, flags=zmq.NOBLOCK)
+            except zmq.Again:
+                # Leave emit lengths unchanged so the unsent tokens are included
+                # in the next delta once the socket becomes writable.
+                profiler.increment("send_again")
+                return
+            finally:
+                nvtx_range_pop("streaming_send")
+                profiler.record_elapsed("send", send_start_ns)
+
+            profiler.increment("frames")
+            profiler.increment("partials", len(partials))
+            profiler.increment("tokens", sum(len(partial["new_tokens"]) for partial in partials))
+            self._partial_emit_lengths.update(emit_lengths)
+        finally:
+            profiler.record_elapsed("total", total_start_ns)
+            profiler.event()
+            nvtx_range_pop("streaming_total")
 
     async def async_bookkeep(
         self, step_result: Optional[Dict], context_state: Dict, step_time: float
@@ -2579,6 +2630,7 @@ class DynamicInferenceEngine(AbstractEngine):
         Called from the engine loop's finally block after the loop exits.
         """
         self.state = EngineState.STOPPED
+        flush_streaming_profilers()
 
         # Cleanup the request futures.
         for entry in self.requests.values():
