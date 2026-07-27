@@ -53,7 +53,7 @@ def test_capture_handoff_keeps_request_mamba_metadata_independent():
 
     first = SimpleNamespace(request_id=2, prompt_tokens=[0] * 10, disaggregated_params=None)
     second = SimpleNamespace(request_id=3, prompt_tokens=[0] * 6, disaggregated_params=None)
-    engine.context.mamba_slot_allocator.get_slot.side_effect = [4, 5, 6]
+    engine.context.mamba_slot_allocator.get_slots.side_effect = [[4, 5], [6]]
 
     pg_size = "megatron.core.inference.disaggregation.inference_state_handoff.get_pg_size"
     with mock.patch(pg_size, return_value=1):
@@ -108,7 +108,7 @@ def test_capture_handoff_uses_mamba_positions_common_to_tp_and_pp():
     engine._mamba_transfer_agents = {"conv": mock.Mock(), "ssm": mock.Mock()}
     engine._mamba_peer_metas = {"conv": {"transport": "nccl"}, "ssm": {"transport": "nccl"}}
     engine.context = SimpleNamespace(mamba_slot_allocator=mock.Mock(), block_size_tokens=4)
-    engine.context.mamba_slot_allocator.get_slot.side_effect = [4, 5, 6]
+    engine.context.mamba_slot_allocator.get_slots.return_value = [4, 5, 6]
     request = SimpleNamespace(request_id=8, prompt_tokens=[0] * 6, disaggregated_params=None)
 
     remote_tp = {

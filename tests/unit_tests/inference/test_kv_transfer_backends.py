@@ -92,7 +92,66 @@ def test_nixl_direct_backend_exports_metadata_with_fake_agent(monkeypatch):
     assert metadata["num_outer"] == 2
     assert metadata["num_blocks"] == 3
     assert metadata["blocks_axis"] == 1
-    assert backend._agent.config.enable_prog_thread is False
+    assert backend._agent.config.enable_prog_thread is True
+
+
+def test_nixl_registered_buffers_share_agent_and_peer_cache(monkeypatch):
+    from megatron.core.inference.disaggregation.transfer_backends import nixl as nixl_mod
+
+    agents = []
+
+    class FakeAgent:
+        def __init__(self, name, config):
+            self.registrations = []
+            agents.append(self)
+
+        def get_agent_metadata(self):
+            return f"registrations={len(self.registrations)}".encode()
+
+        def register_memory(self, tensor):
+            self.registrations.append(tensor)
+            return ("reg", len(self.registrations))
+
+    monkeypatch.setattr(nixl_mod, "_HAVE_NIXL", True)
+    monkeypatch.setattr(nixl_mod, "nixl_agent", FakeAgent)
+    monkeypatch.setattr(nixl_mod, "nixl_agent_config", lambda **_: object())
+
+    backend = nixl_mod.NixlTransferBackend(
+        "prefill", torch.zeros(2, 3, 5, dtype=torch.float32), expected_num_blocks=3
+    )
+    sibling = backend.new_registered_buffer(
+        agent_name="prefill-mamba-conv",
+        memory_buffer=torch.zeros(2, 4, 5, dtype=torch.float32),
+        expected_num_blocks=4,
+    )
+
+    assert len(agents) == 1
+    assert sibling._agent is backend._agent
+    assert sibling._known_peers is backend._known_peers
+    assert sibling.export_meta()["agent_name"] == "prefill"
+    assert backend.export_meta()["agent_metadata_b64"] == "cmVnaXN0cmF0aW9ucz0y"
+
+
+def test_nixl_empty_pipeline_pull_is_a_completed_noop(monkeypatch):
+    from megatron.core.inference.disaggregation.transfer_backends import nixl as nixl_mod
+
+    class FakeAgent:
+        def __init__(self, name, config):
+            pass
+
+        def register_memory(self, tensor):
+            return "reg"
+
+    monkeypatch.setattr(nixl_mod, "_HAVE_NIXL", True)
+    monkeypatch.setattr(nixl_mod, "nixl_agent", FakeAgent)
+    monkeypatch.setattr(nixl_mod, "nixl_agent_config", lambda **_: object())
+
+    backend = nixl_mod.NixlTransferBackend(
+        "decode", torch.zeros(2, 3, 5, dtype=torch.float32), expected_num_blocks=3
+    )
+    handle = backend.begin_pull_blocks({"pp_metas": [{"block_ids": []}]}, [], [])
+
+    assert handle.poll()
 
 
 def test_nixl_begin_pull_blocks_uses_remote_metadata_with_fake_agent(monkeypatch):

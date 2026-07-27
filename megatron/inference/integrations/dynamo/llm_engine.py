@@ -95,7 +95,9 @@ class MegatronLLMEngine(LLMEngine):
         self._publisher: Optional[KvEventPublisher] = None
         self._publisher_lock = threading.Lock()
         self._event_receiver: Optional[EngineEventReceiver] = None
+        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._release_clients: dict[str, Any] = {}
+        self._handoff_releases: dict[int, Optional[dict[str, Any]]] = {}
         self._request_ids: dict[str, int] = {}
         self.worker_id: Optional[int] = None
 
@@ -129,6 +131,7 @@ class MegatronLLMEngine(LLMEngine):
 
     async def start(self, worker_id: int) -> EngineConfig:
         self.worker_id = int(worker_id)
+        self._event_loop = asyncio.get_running_loop()
         if not os.path.isdir(self.config.megatron_root):
             raise FileNotFoundError(
                 f"Megatron root does not exist: {self.config.megatron_root}"
@@ -351,23 +354,31 @@ class MegatronLLMEngine(LLMEngine):
                 disagg.get("kv_meta") or {},
                 list(disagg.get("block_ids") or []),
             )
+            self._handoff_releases[stream.request_id] = dict(release)
         else:
             stream = self.client.add_request_streaming(token_ids, params)
         self._request_ids[context_id] = stream.request_id
 
         released = False
+        fallback_attempted = False
         try:
             async for chunk in self._stream_chunks(stream, token_ids, params):
-                if not released and self.config.role == "decode":
-                    released = self._release_handoff_from_meta(release)
+                if (
+                    not released
+                    and not fallback_attempted
+                    and self.config.role == "decode"
+                ):
+                    fallback_attempted = True
+                    released = self._release_handoff_for_request(stream.request_id)
                 yield chunk
         finally:
             self._request_ids.pop(context_id, None)
             if not released and self.config.role == "decode":
                 try:
-                    self._release_handoff_from_meta(release)
+                    self._release_handoff_for_request(stream.request_id)
                 except Exception:
                     logger.exception("Failed to release Megatron handoff")
+            self._handoff_releases.pop(stream.request_id, None)
 
     async def _stream_chunks(
         self, stream, prompt_token_ids: list[int], params: SamplingParams
@@ -429,6 +440,17 @@ class MegatronLLMEngine(LLMEngine):
         self._release_remote_handoff(str(address), int(request_id))
         return True
 
+    def _release_handoff_for_request(self, request_id: int) -> bool:
+        if request_id not in self._handoff_releases:
+            return False
+        release = self._handoff_releases[request_id]
+        if release is None:
+            return True
+        if not self._release_handoff_from_meta(release):
+            return False
+        self._handoff_releases[request_id] = None
+        return True
+
     async def abort(self, context: Context) -> None:
         request_id = self._request_ids.pop(str(context.id()), None)
         if request_id is not None and self.client is not None:
@@ -450,6 +472,7 @@ class MegatronLLMEngine(LLMEngine):
             except Exception:
                 logger.exception("Failed to close Megatron handoff client")
         self._release_clients.clear()
+        self._handoff_releases.clear()
         client = self.client
         self.client = None
         if client is not None:
@@ -473,6 +496,7 @@ class MegatronLLMEngine(LLMEngine):
         if self._event_receiver is not None:
             self._event_receiver.stop()
             self._event_receiver = None
+        self._event_loop = None
         with self._publisher_lock:
             self._publisher = None
         if self._log_tasks:
@@ -524,6 +548,15 @@ class MegatronLLMEngine(LLMEngine):
             except queue.Full:
                 logger.warning("Ignoring duplicate Megatron readiness message")
             return
+        if kind == "handoff_imported":
+            if self._event_loop is None:
+                logger.warning("Ignoring handoff import event before engine startup")
+                return
+            request_id = int(payload["request_id"])
+            self._event_loop.call_soon_threadsafe(
+                self._release_imported_handoff, request_id
+            )
+            return
         if kind in ("stored", "removed", "cleared"):
             with self._publisher_lock:
                 if self._publisher is None:
@@ -532,6 +565,15 @@ class MegatronLLMEngine(LLMEngine):
                     self._publish_event(self._publisher, kind, payload)
             return
         logger.warning("Ignoring unknown Megatron engine event %s", kind)
+
+    def _release_imported_handoff(self, request_id: int) -> None:
+        try:
+            self._release_handoff_for_request(request_id)
+        except Exception:
+            logger.exception(
+                "Failed to release imported Megatron handoff for request %d",
+                request_id,
+            )
 
     def _set_publisher(self, publisher: KvEventPublisher) -> None:
         with self._publisher_lock:

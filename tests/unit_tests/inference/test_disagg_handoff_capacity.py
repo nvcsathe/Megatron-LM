@@ -14,6 +14,7 @@ from megatron.core.inference.disaggregation.inference_state_handoff import (
     InferenceStateHandoffMixin,
 )
 from megatron.core.inference.disaggregation.pending_handoff_imports import PendingKvImport
+from megatron.core.inference.inference_request import compute_block_hashes_batched
 from megatron.core.inference.sampling_params import SamplingParams
 
 
@@ -28,6 +29,7 @@ class _PendingHandle:
 class _TransferAgent:
     def __init__(self):
         self.calls = []
+        self.is_push = False
 
     def begin_pull_blocks(self, peer_meta, src_block_ids, dst_block_ids):
         self.calls.append((peer_meta, list(src_block_ids), list(dst_block_ids)))
@@ -56,6 +58,9 @@ class _KvAllocator:
 
     def register_kv_block_hashes(self, block_ids, block_hashes):
         self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
+
+    def update_timestamps(self, block_ids):
+        return None
 
 
 class _MambaAllocator:
@@ -106,6 +111,7 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
         self.waiting_request_ids = deque()
         self.requests = {}
         self.blocks_to_bind = {}
+        self.precomputed_hashes = {}
         self.partial_admissions = set()
 
     async def _notify_cond_for_new_request(self):
@@ -113,6 +119,7 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
 
     def add_request(self, request_id, prompt, sampling_params, precomputed_block_hashes=None):
         self.requests[request_id] = SimpleNamespace(finished_chunk_token_count=0)
+        self.precomputed_hashes[request_id] = precomputed_block_hashes
         self.waiting_request_ids.append(request_id)
         return self._loop.create_future()
 
@@ -143,6 +150,7 @@ def _pending_import(engine, request_id, block_id, block_hash):
         local_blocks=[block_id],
         hashes=[block_hash],
         hashes_to_register=1,
+        hash_registration_start=0,
         handle=None,
         future=engine._loop.create_future(),
     )
@@ -196,6 +204,80 @@ def test_attention_only_handoff_has_no_mamba_admission_overhead(handoff_loop):
     assert len(engine._pending_kv_imports) == 1
     assert len(engine._kv_transfer_agent.calls) == 1
     assert engine.context.kv_block_allocator.releases == []
+
+
+def test_nixl_handoff_reuses_decode_cached_prefix(handoff_loop):
+    engine = _HandoffHarness(handoff_loop, available=0)
+    engine.context.mamba_slot_allocator = None
+    engine._mamba_transfer_agents = {}
+    prompt = [1] * 12
+    hashes = compute_block_hashes_batched(
+        torch.tensor(prompt), engine.context.block_size_tokens, include_partial=True
+    )
+    cached = engine.context.kv_block_allocator.allocate_memory_blocks(2)
+    engine.context.kv_block_allocator.release_memory_blocks(cached)
+    engine.context.kv_block_allocator.kv_hash_to_block_id.update(zip(hashes[:2], cached.tolist()))
+
+    engine.add_request_with_kv_handoff(
+        5, prompt, SamplingParams(num_tokens_to_generate=2), {"request_id": 5}, [100, 101, 102]
+    )
+    _drain_loop(handoff_loop)
+
+    pending = engine._pending_kv_imports[0]
+    assert engine._kv_transfer_agent.calls == [({"request_id": 5}, [102], [12])]
+    assert pending.local_blocks == [10, 11, 12]
+    assert pending.hash_registration_start == 2
+    assert pending.hashes_to_register == 1
+    engine._finalize_kv_handoff_import(pending)
+    assert engine.precomputed_hashes[5] == hashes
+
+
+def test_nixl_handoff_trims_pipeline_stage_block_lists(handoff_loop):
+    engine = _HandoffHarness(handoff_loop, available=0)
+    engine.context.mamba_slot_allocator = None
+    engine._mamba_transfer_agents = {}
+    prompt = [2] * 12
+    hashes = compute_block_hashes_batched(
+        torch.tensor(prompt), engine.context.block_size_tokens, include_partial=True
+    )
+    cached = engine.context.kv_block_allocator.allocate_memory_blocks(1)
+    engine.context.kv_block_allocator.release_memory_blocks(cached)
+    engine.context.kv_block_allocator.kv_hash_to_block_id[hashes[0]] = int(cached[0])
+    kv_meta = {
+        "pp_metas": [
+            {"tp_metas": {"rank": 0}, "block_ids": [100, 101, 102]},
+            {"tp_metas": {"rank": 1}, "block_ids": [200, 201, 202]},
+        ]
+    }
+
+    engine.add_request_with_kv_handoff(
+        6, prompt, SamplingParams(num_tokens_to_generate=2), kv_meta, [100, 101, 102]
+    )
+    _drain_loop(handoff_loop)
+
+    submitted_meta, src_blocks, dst_blocks = engine._kv_transfer_agent.calls[0]
+    assert src_blocks == [101, 102]
+    assert dst_blocks == [11, 12]
+    assert [stage["block_ids"] for stage in submitted_meta["pp_metas"]] == [[101, 102], [201, 202]]
+
+
+def test_nccl_handoff_does_not_filter_source_push(handoff_loop):
+    engine = _HandoffHarness(handoff_loop, available=0)
+    engine.context.mamba_slot_allocator = None
+    engine._mamba_transfer_agents = {}
+    engine._kv_transfer_agent.is_push = True
+    prompt = [3] * 8
+    hashes = compute_block_hashes_batched(
+        torch.tensor(prompt), engine.context.block_size_tokens, include_partial=True
+    )
+    engine.context.kv_block_allocator.kv_hash_to_block_id[hashes[0]] = 4
+
+    engine.add_request_with_kv_handoff(
+        9, prompt, SamplingParams(num_tokens_to_generate=2), {"request_id": 9}, [100, 101]
+    )
+    _drain_loop(handoff_loop)
+
+    assert engine._kv_transfer_agent.calls == [({"request_id": 9}, [100, 101], [10, 11])]
 
 
 def test_capacity_queue_is_fifo(handoff_loop):
@@ -290,3 +372,14 @@ def test_chunked_admission_releases_import_owner(handoff_loop):
     assert engine.get_request(3).finished_chunk_token_count == 4
     assert engine.context.kv_block_allocator.block_ref_counts[block_id] == 1
     assert not engine._handoff_import_owners
+
+
+def test_handoff_import_listener_runs_after_transfer_finalization(handoff_loop):
+    engine = _HandoffHarness(handoff_loop, available=0)
+    block_id = int(engine.context.kv_block_allocator.allocate_memory_blocks(1)[0])
+    events = []
+    engine.add_handoff_import_listener(lambda kind, payload: events.append((kind, payload)))
+
+    engine._finalize_kv_handoff_import(_pending_import(engine, 4, block_id, 104))
+
+    assert events == [("handoff_imported", {"request_id": 4})]

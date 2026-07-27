@@ -32,7 +32,10 @@ from megatron.core.inference.disaggregation.pending_handoff_imports import (
 from megatron.core.inference.disaggregation.transfer_backends.base import (
     construct_kv_transfer_backend_class,
 )
-from megatron.core.inference.disaggregation.utils import transfer_block_count
+from megatron.core.inference.disaggregation.utils import (
+    drop_transfer_prefix_blocks,
+    transfer_block_count,
+)
 from megatron.core.inference.headers import Headers
 from megatron.core.utils import get_pg_rank, get_pg_size, internal_api
 
@@ -143,6 +146,7 @@ class InferenceStateHandoffMixin:
         self._deferred_kv_handoffs = deque()
         self._pending_kv_imports = deque()
         self._handoff_import_owners: Dict[int, list[int]] = {}
+        self._handoff_import_listeners = []
         self._pending_kv_pushes: list = []
         self._instance_transfer_meta = None
 
@@ -198,6 +202,18 @@ class InferenceStateHandoffMixin:
             len(local_blocks),
         )
         return True
+
+    def add_handoff_import_listener(self, listener) -> None:
+        """Register a nonblocking listener for completed decode-side imports."""
+
+        self._handoff_import_listeners.append(listener)
+
+    def _notify_handoff_imported(self, request_id: int) -> None:
+        for listener in tuple(self._handoff_import_listeners):
+            try:
+                listener("handoff_imported", {"request_id": request_id})
+            except Exception:
+                logging.exception("Handoff import listener failed for request %d", request_id)
 
     def schedule_waiting_requests(self) -> None:
         """Release completed-import ownership after requests acquire context blocks."""
@@ -291,15 +307,6 @@ class InferenceStateHandoffMixin:
             layer_end=layer_end,
         )
 
-        # Cache static peer metadata for every request.
-        self._kv_peer_metas = self._kv_transfer_agent.export_meta()
-        if torch.distributed.is_initialized() and tp_size > 1:
-            gathered: list = [None] * tp_size
-            torch.distributed.all_gather_object(
-                gathered, self._kv_peer_metas, group=self.pg_collection.tp
-            )
-            self._kv_peer_metas = gathered
-
         # Mamba uses the same transport segments as KV, with conv channels or
         # SSM heads as the fragment axis.
         self._mamba_transfer_agents = {}
@@ -356,8 +363,9 @@ class InferenceStateHandoffMixin:
                     msa.ssm_states.shape[-2] * msa.ssm_states.shape[-1],
                 ),
             }
+            backend_factory = getattr(self._kv_transfer_agent, "new_registered_buffer", backend_cls)
             for state_kind, (memory_buffer, width, state_dim) in state_specs.items():
-                self._mamba_transfer_agents[state_kind] = backend_cls(
+                self._mamba_transfer_agents[state_kind] = backend_factory(
                     agent_name=f"{role}-mamba-{state_kind}-rank{rank}",
                     memory_buffer=memory_buffer,
                     expected_num_blocks=msa.max_slots,
@@ -371,6 +379,16 @@ class InferenceStateHandoffMixin:
                 state_kind: agent.export_meta()
                 for state_kind, agent in self._mamba_transfer_agents.items()
             }
+
+        # NIXL metadata describes every buffer registered on the shared agent,
+        # so export it only after the optional Mamba buffers are registered.
+        self._kv_peer_metas = self._kv_transfer_agent.export_meta()
+        if torch.distributed.is_initialized() and tp_size > 1:
+            gathered: list = [None] * tp_size
+            torch.distributed.all_gather_object(
+                gathered, self._kv_peer_metas, group=self.pg_collection.tp
+            )
+            self._kv_peer_metas = gathered
 
         # Gather this instance's per-rank transfer metadata (KV plus Mamba
         # kinds), model-parallel-wide. The MP coordinator registers it with
@@ -421,7 +439,7 @@ class InferenceStateHandoffMixin:
                     }
                     handles.append(agent.begin_push_blocks(peer, slots))
         self._pending_kv_pushes.append((request_id, handles))
-        logging.info(
+        logging.debug(
             "DISAGG_PREFILL_PUSH request_id=%d blocks=%d mamba=%d",
             request_id,
             len(block_ids),
@@ -465,18 +483,18 @@ class InferenceStateHandoffMixin:
         if self._mamba_transfer_agents:
             msa = self.context.mamba_slot_allocator
             positions = []
-            slots = []
-            for pos, block in enumerate(block_ids):
-                slot = msa.get_slot(int(block))
+            slots = msa.get_slots([int(block) for block in block_ids])
+            retained_slots = []
+            for pos, slot in enumerate(slots):
                 if slot >= 0:
                     positions.append(pos)
-                    slots.append(int(slot))
-            local_mamba_slots = slots
-            local_position_to_slot = dict(zip(positions, slots))
+                    retained_slots.append(int(slot))
+            local_mamba_slots = retained_slots
+            local_position_to_slot = dict(zip(positions, retained_slots))
             local_mamba = {
                 "positions": positions,
                 **{
-                    state_kind: {**meta, "block_ids": slots}
+                    state_kind: {**meta, "block_ids": retained_slots}
                     for state_kind, meta in self._mamba_peer_metas.items()
                 },
             }
@@ -601,7 +619,7 @@ class InferenceStateHandoffMixin:
             "block_ids": top_block_ids,
             "kv_meta": kv_meta,
         }
-        logging.info(
+        logging.debug(
             "DISAGG_PREFILL_HANDOFF request_id=%d pinned_blocks=%d mamba_blocks=%d",
             rid,
             len(block_ids),
@@ -615,7 +633,7 @@ class InferenceStateHandoffMixin:
         if not block_ids:
             return
         released = self._release_pinned_handoff_blocks(block_ids)
-        logging.info(
+        logging.debug(
             "DISAGG_PREFILL_RELEASE request_id=%d released_blocks=%d", request_id, released
         )
 
@@ -706,15 +724,31 @@ class InferenceStateHandoffMixin:
 
         allocator = self.context.kv_block_allocator
         num_blocks = handoff.num_blocks
-        local_blocks_tensor = allocator.allocate_memory_blocks(num_blocks)
+        cached_blocks = []
+        if not getattr(self._kv_transfer_agent, "is_push", False):
+            cached_blocks = self._retain_cached_handoff_prefix(handoff.hashes, num_blocks)
+
+        num_blocks_to_import = num_blocks - len(cached_blocks)
+        local_blocks_tensor = allocator.allocate_memory_blocks(num_blocks_to_import)
         if local_blocks_tensor is None:
-            raise RuntimeError(f"add_request_with_kv_handoff: OOM allocating {num_blocks} blocks")
-        local_blocks = [int(b) for b in local_blocks_tensor.tolist()]
+            if cached_blocks:
+                allocator.release_memory_blocks(
+                    torch.tensor(cached_blocks, dtype=torch.int32, device="cpu")
+                )
+            raise RuntimeError(
+                f"add_request_with_kv_handoff: OOM allocating {num_blocks_to_import} blocks"
+            )
+        imported_blocks = [int(b) for b in local_blocks_tensor.tolist()]
+        local_blocks = cached_blocks + imported_blocks
+        owned_blocks_tensor = torch.tensor(local_blocks, dtype=torch.int32, device="cpu")
 
         handle = None
         mamba_import = None
         capacity_error = None
         try:
+            transfer_meta, transfer_src_blocks = drop_transfer_prefix_blocks(
+                handoff.kv_meta, handoff.src_block_ids, len(cached_blocks)
+            )
             mamba_meta = handoff.kv_meta.get("mamba") if isinstance(handoff.kv_meta, dict) else None
             if mamba_meta and self._mamba_transfer_agents:
                 try:
@@ -730,11 +764,11 @@ class InferenceStateHandoffMixin:
                     msa = self.context.mamba_slot_allocator
                     for block_id in mamba_import.target_blocks:
                         msa.invalidate_block(block_id)
-                allocator.release_memory_blocks(local_blocks_tensor)
+                allocator.release_memory_blocks(owned_blocks_tensor)
                 return False, capacity_error
 
             handle = self._kv_transfer_agent.begin_pull_blocks(
-                handoff.kv_meta, handoff.src_block_ids, local_blocks
+                transfer_meta, transfer_src_blocks, imported_blocks
             )
             if mamba_import is not None:
                 self._start_mamba_handoff_import(handoff.request_id, mamba_meta, mamba_import)
@@ -745,7 +779,7 @@ class InferenceStateHandoffMixin:
                 handles.extend(mamba_import.handles.values())
             safe_to_release &= self._wait_for_transfer_handles(*handles)
             if safe_to_release:
-                allocator.release_memory_blocks(local_blocks_tensor)
+                allocator.release_memory_blocks(owned_blocks_tensor)
                 if mamba_import is not None:
                     msa = self.context.mamba_slot_allocator
                     for block_id in mamba_import.target_blocks:
@@ -765,21 +799,41 @@ class InferenceStateHandoffMixin:
             sampling_params=handoff.sampling_params,
             local_blocks=local_blocks,
             hashes=handoff.hashes,
-            hashes_to_register=min(num_blocks, len(handoff.hashes)),
+            hashes_to_register=max(0, min(num_blocks, len(handoff.hashes)) - len(cached_blocks)),
+            hash_registration_start=len(cached_blocks),
             handle=handle,
             future=handoff.future,
             mamba=mamba_import,
         )
         self._pending_kv_imports.append(pending)
-        logging.info(
-            "DISAGG_DECODE_PULL_SUBMIT request_id=%d prompt_tokens=%d blocks=%d pending_imports=%d",
+        logging.debug(
+            "DISAGG_DECODE_PULL_SUBMIT request_id=%d prompt_tokens=%d "
+            "cached_blocks=%d imported_blocks=%d pending_imports=%d",
             handoff.request_id,
             len(handoff.prompt),
-            num_blocks,
+            len(cached_blocks),
+            len(imported_blocks),
             len(self._pending_kv_imports),
         )
         self._loop.call_soon_threadsafe(self._loop.create_task, self._notify_cond_for_new_request())
         return True, None
+
+    def _retain_cached_handoff_prefix(self, hashes: list[int], num_blocks: int) -> list[int]:
+        """Retain the contiguous handoff prefix already cached on decode."""
+
+        allocator = self.context.kv_block_allocator
+        cached_blocks = []
+        for block_hash in hashes[:num_blocks]:
+            block_id = allocator.kv_hash_to_block_id.get(block_hash)
+            if block_id is None:
+                break
+            cached_blocks.append(int(block_id))
+
+        if cached_blocks:
+            block_tensor = torch.tensor(cached_blocks, dtype=torch.int32, device="cpu")
+            allocator.block_ref_counts[block_tensor] += 1
+            allocator.update_timestamps(block_tensor)
+        return cached_blocks
 
     def _agree_mamba_handoff_capacity(
         self, mamba_meta: Optional[dict], local_error: Optional[MambaSlotCapacityError]
@@ -842,26 +896,30 @@ class InferenceStateHandoffMixin:
     def _finalize_kv_handoff_import(self, pending: PendingKvImport) -> None:
         allocator = self.context.kv_block_allocator
         n = pending.hashes_to_register
+        start = pending.hash_registration_start
+        end = start + n
         local_blocks = pending.local_blocks
 
         if pending.request_id in self._handoff_import_owners:
             raise RuntimeError(f"Duplicate decode handoff request ID {pending.request_id}")
 
         if n > 0:
-            allocator.register_kv_block_hashes(local_blocks[:n], pending.hashes[:n])
+            allocator.register_kv_block_hashes(local_blocks[start:end], pending.hashes[start:end])
 
         if pending.mamba is not None:
             self._complete_mamba_handoff_import(pending.request_id, pending.mamba, pending.hashes)
 
-        logging.info(
+        logging.debug(
             "DISAGG_DECODE_IMPORT request_id=%d prompt_tokens=%d "
-            "imported_blocks=%d hashes_registered=%d pending_imports=%d",
+            "cached_blocks=%d imported_blocks=%d hashes_registered=%d pending_imports=%d",
             pending.request_id,
             len(pending.prompt),
-            len(local_blocks),
+            start,
+            len(local_blocks) - start,
             n,
             len(self._pending_kv_imports),
         )
+        self._notify_handoff_imported(pending.request_id)
 
         # Coordinator-native mode: tell the coordinator the read drained so it
         # releases the prefill's pinned blocks and a flow-control slot. In the
@@ -879,7 +937,7 @@ class InferenceStateHandoffMixin:
                 pending.request_id,
                 pending.prompt,
                 pending.sampling_params,
-                precomputed_block_hashes=pending.hashes[:n] if n > 0 else None,
+                precomputed_block_hashes=pending.hashes[:end] if end > 0 else None,
             )
         except Exception:
             self._release_handoff_import_owner(pending.request_id)
@@ -1046,7 +1104,7 @@ class InferenceStateHandoffMixin:
             handles[state_kind] = agent.begin_pull_blocks(
                 mamba_meta[state_kind], [], pending.local_slots
             )
-        logging.info(
+        logging.debug(
             "DISAGG_DECODE_MAMBA_IMPORT_SUBMIT request_id=%d mamba_blocks=%d",
             request_id,
             len(pending.target_blocks),
@@ -1061,7 +1119,7 @@ class InferenceStateHandoffMixin:
         msa.register_block_hashes_batch(
             pending.target_blocks, [hashes[p] for p in pending.positions]
         )
-        logging.info(
+        logging.debug(
             "DISAGG_DECODE_MAMBA_IMPORT request_id=%d mamba_blocks=%d",
             request_id,
             len(pending.target_blocks),

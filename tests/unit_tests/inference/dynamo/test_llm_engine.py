@@ -43,7 +43,12 @@ def _config(role="aggregated"):
         request_plane="nats",
         event_plane="nats",
         role=role,
+        launcher="local",
+        nnodes=1,
         nproc_per_node=1,
+        master_addr=None,
+        master_port=None,
+        slurm_nodelist=None,
         coordinator_host=None,
         coordinator_port=None,
         worker_id_file=None,
@@ -186,3 +191,18 @@ async def test_abort_uses_megatron_request_id_recorded_for_context():
     await engine.abort(_Context())
 
     assert aborted == [77]
+
+
+def test_handoff_import_event_releases_prefill_ownership_once():
+    engine = MegatronLLMEngine(_config("decode"))
+    engine._event_loop = SimpleNamespace(
+        call_soon_threadsafe=lambda callback, *args: callback(*args)
+    )
+    engine._handoff_releases[7] = {"coordinator_addr": "tcp://prefill:5000", "request_id": 17}
+    engine._release_remote_handoff = MagicMock()
+
+    engine._on_engine_event("handoff_imported", {"request_id": 7})
+    engine._on_engine_event("handoff_imported", {"request_id": 7})
+
+    engine._release_remote_handoff.assert_called_once_with("tcp://prefill:5000", 17)
+    assert engine._handoff_releases[7] is None

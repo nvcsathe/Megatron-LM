@@ -29,6 +29,7 @@ class EngineEventReporter:
         if self.engine.rank != 0:
             return
         self.engine.add_kv_event_listener(self.observe)
+        self.engine.add_handoff_import_listener(self.observe)
         self._thread = threading.Thread(
             target=self._run,
             daemon=True,

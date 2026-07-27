@@ -133,8 +133,21 @@ class NixlPullHandle:
             time.sleep(_POLL_INTERVAL_S)
 
 
+class _NixlAgentContext:
+    """NIXL resources shared by the state buffers on one rank."""
+
+    def __init__(self, agent_name: str):
+        # One-sided reads require the passive peer to make transport progress.
+        # Sharing the agent keeps this to one progress thread per rank across
+        # KV, convolution-state, and SSM-state registrations.
+        agent_config = nixl_agent_config(enable_prog_thread=True)
+        self.agent_name = agent_name
+        self.agent = nixl_agent(agent_name, agent_config)
+        self.known_peers: Dict[str, Any] = {}
+
+
 class NixlTransferBackend:
-    """Per-rank NIXL agent owning a registration over the paged KV buffer.
+    """Per-buffer registration on a rank's NIXL agent.
 
     Per-block transfers are descriptor ranges over that registration. Peer
     metadata is exchanged by the control plane and registered lazily on first
@@ -162,6 +175,7 @@ class NixlTransferBackend:
         layer_end: Optional[int] = None,
         mamba_layout: Optional[MambaShardLayout] = None,
         mamba_state_kind: Optional[str] = None,
+        _shared_context: Optional[_NixlAgentContext] = None,
     ):
         if not _HAVE_NIXL:
             raise RuntimeError(
@@ -209,21 +223,15 @@ class NixlTransferBackend:
         self._mamba_layout = mamba_layout
         self._mamba_state_kind = mamba_state_kind
 
-        # Transfers are polled by the inference engine on every scheduling
-        # iteration. A NIXL progress thread per registered buffer would be
-        # redundant; hybrid models register separate KV, convolution-state,
-        # and SSM-state agents, so those threads otherwise contend with model
-        # execution even when no transfer is active.
-        agent_config = nixl_agent_config(enable_prog_thread=False)
-        self._agent = nixl_agent(agent_name, agent_config)
+        if _shared_context is None:
+            _shared_context = _NixlAgentContext(agent_name)
+        self._agent_context = _shared_context
+        self._agent = _shared_context.agent
         _validate_nixl_cuda_support(self._agent, memory_buffer)
         self._reg_handle = self._agent.register_memory(memory_buffer)
 
-        # Base64 keeps NIXL metadata safe for msgpack/json control messages.
-        self._agent_metadata = self._agent.get_agent_metadata()
-
         # Peer agent_name -> id returned by add_remote_agent.
-        self._known_peers: Dict[str, Any] = {}
+        self._known_peers = _shared_context.known_peers
 
         logger.info(
             "NixlTransferBackend[%s] registered %d-block buffer "
@@ -239,15 +247,21 @@ class NixlTransferBackend:
             shape,
         )
 
+    def new_registered_buffer(self, **kwargs) -> "NixlTransferBackend":
+        """Register another state buffer on this backend's NIXL agent."""
+
+        return type(self)(_shared_context=self._agent_context, **kwargs)
+
     def export_meta(self) -> Dict[str, Any]:
         """Return JSON/msgpack-safe metadata for shipping to a decode peer.
 
         Layout fields describe the scatter-gather address ranges needed to pull
         source blocks into decode-owned blocks.
         """
+        agent_metadata = self._agent.get_agent_metadata()
         meta = {
-            "agent_name": self.agent_name,
-            "agent_metadata_b64": base64.b64encode(self._agent_metadata).decode("ascii"),
+            "agent_name": self._agent_context.agent_name,
+            "agent_metadata_b64": base64.b64encode(agent_metadata).decode("ascii"),
             "base_addr": self._buf_ptr,
             "outer_stride_bytes": self._outer_stride_bytes,
             "device_id": self._device_id,
@@ -375,15 +389,14 @@ class NixlTransferBackend:
         self, peer_meta: Any, src_block_ids: List[int], dst_block_ids: List[int]
     ) -> NixlPullHandle:
         """Submit a pull and return a handle that can be polled later."""
-        if not isinstance(peer_meta, dict) or "pp_metas" not in peer_meta:
-            if not src_block_ids and not dst_block_ids:
-                return NixlPullHandle(
-                    agent=self._agent,
-                    xfers=[],
-                    contexts=[],
-                    submitted_at=time.perf_counter(),
-                    done=True,
-                )
+        if not src_block_ids and not dst_block_ids:
+            return NixlPullHandle(
+                agent=self._agent,
+                xfers=[],
+                contexts=[],
+                submitted_at=time.perf_counter(),
+                done=True,
+            )
 
         xfers: List[Any] = []
         contexts: List[str] = []

@@ -45,6 +45,7 @@ class PendingKvImport:
     local_blocks: List[int]
     hashes: list
     hashes_to_register: int
+    hash_registration_start: int
     handle: Any
     future: asyncio.Future
     mamba: Optional[PendingMambaImport] = None
