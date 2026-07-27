@@ -48,6 +48,7 @@ def _coord(max_outstanding=32, mamba_capacity=None):
     if mamba_capacity is not None:
         for meta in (prefill_meta, decode_meta):
             meta["mamba_slot_capacity"] = mamba_capacity
+            meta["mamba_handoff_max_slots"] = 1
     c._engine_metas = {b"p0": [prefill_meta], b"d0": [decode_meta]}
     c._disagg.register(b"p0", "prefill")
     c._disagg.register(b"d0", "decode")
@@ -93,16 +94,12 @@ def test_nixl_handoff_restores_registered_agent_metadata_across_tp_and_pp():
         {
             "agent_name": "kv-rank0",
             "agent_metadata_b64": "kv0",
-            "mamba": {
-                "conv": {"agent_name": "conv-rank0", "agent_metadata_b64": "conv0"}
-            },
+            "mamba": {"conv": {"agent_name": "conv-rank0", "agent_metadata_b64": "conv0"}},
         },
         {
             "agent_name": "kv-rank1",
             "agent_metadata_b64": "kv1",
-            "mamba": {
-                "conv": {"agent_name": "conv-rank1", "agent_metadata_b64": "conv1"}
-            },
+            "mamba": {"conv": {"agent_name": "conv-rank1", "agent_metadata_b64": "conv1"}},
         },
     ]
     handoff = {
@@ -111,7 +108,7 @@ def test_nixl_handoff_restores_registered_agent_metadata_across_tp_and_pp():
                 "tp_metas": [
                     {**registered[0], "mamba": None, "block_ids": [7]},
                     {**registered[1], "mamba": None, "block_ids": [8]},
-                ],
+                ]
             }
         ],
         "mamba": {
@@ -135,9 +132,7 @@ def test_nixl_handoff_restores_registered_agent_metadata_across_tp_and_pp():
 
     assert restored["pp_metas"][0]["tp_metas"][0]["block_ids"] == [7]
     assert restored["mamba"]["positions"] == [0]
-    assert restored["mamba"]["conv"]["pp_metas"][0]["tp_metas"][1][
-        "agent_metadata_b64"
-    ] == "conv1"
+    assert restored["mamba"]["conv"]["pp_metas"][0]["tp_metas"][1]["agent_metadata_b64"] == "conv1"
 
 
 def test_nixl_handoff_rejects_unregistered_or_conflicting_agent_metadata():
@@ -149,11 +144,7 @@ def test_nixl_handoff_rejects_unregistered_or_conflicting_agent_metadata():
         )
     with pytest.raises(ValueError, match="differs from its registration"):
         restore_registered_nixl_agent_metadata(
-            {
-                "agent_name": "prefill-rank0",
-                "agent_metadata_b64": "different",
-                "block_ids": [1],
-            },
+            {"agent_name": "prefill-rank0", "agent_metadata_b64": "different", "block_ids": [1]},
             registered,
         )
 
@@ -182,11 +173,7 @@ def test_coordinator_hydrates_compact_nixl_handoff_from_prefill_registration():
     c._route_submit_disagg(5, [1, 2, 3], {"temperature": 0.0})
     c.sent.clear()
     handoff = {
-        "kv_meta": {
-            "agent_name": "prefill-rank0",
-            "global_rank": 0,
-            "block_ids": [4, 5],
-        },
+        "kv_meta": {"agent_name": "prefill-rank0", "global_rank": 0, "block_ids": [4, 5]},
         "block_ids": [4, 5],
     }
 
@@ -305,8 +292,8 @@ def test_nccl_send_waits_for_decode_mamba_capacity():
 
 
 def test_mamba_capacity_reduces_prefill_outstanding_window():
-    c = _coord(max_outstanding=32, mamba_capacity=8)
-    prompt = list(range(513))  # Three 256-token blocks per reservation.
+    c = _coord(max_outstanding=32, mamba_capacity=2)
+    prompt = list(range(513))
     for request_id in (5, 6, 7):
         c._route_submit_disagg(request_id, prompt, {})
 
@@ -317,4 +304,4 @@ def test_mamba_capacity_reduces_prefill_outstanding_window():
     ]
     assert [message[1] for message in prefill_submits] == [5, 6]
     assert c._disagg_mamba_flow.has_queued_prefill(b"p0")
-    assert c._disagg_mamba_flow.prefill_usage(b"p0") == 6
+    assert c._disagg_mamba_flow.prefill_usage(b"p0") == 2

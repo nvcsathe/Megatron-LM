@@ -172,9 +172,8 @@ class MambaSlotAllocator:
         if num_new == 0:
             return existing_slots
 
-        # Capacity admission must be atomic. Previously the allocator consumed
-        # free slots before discovering that the remainder could not be
-        # evicted, leaving the pool partially mutated when allocation failed.
+        # Validate the complete reservation before mutating either the free
+        # pool or the block-to-slot mappings.
         need_evict = max(0, num_new - self.free_count)
         evictable_block_ids = (
             self._evictable_block_ids()

@@ -45,9 +45,7 @@ def _registered_nixl_agents(instance_meta: Any) -> Dict[str, str]:
             if name is not None and metadata is not None:
                 previous = agents.setdefault(name, metadata)
                 if previous != metadata:
-                    raise ValueError(
-                        f"NIXL agent {name!r} has conflicting registered metadata"
-                    )
+                    raise ValueError(f"NIXL agent {name!r} has conflicting registered metadata")
             for child in value.values():
                 visit(child)
         elif isinstance(value, (list, tuple)):

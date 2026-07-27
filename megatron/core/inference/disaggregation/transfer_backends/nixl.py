@@ -58,11 +58,13 @@ def _validate_nixl_cuda_support(agent: Any, memory_buffer: torch.Tensor) -> None
 
     cuda_version = torch.version.cuda
     if cuda_version and _NIXL_VARIANT:
-        expected_variant = f"nixl_cu{cuda_version.split('.', maxsplit=1)[0]}"
+        cuda_major = cuda_version.split(".", maxsplit=1)[0]
+        expected_variant = f"nixl_cu{cuda_major}"
         if _NIXL_VARIANT.startswith("nixl_cu") and _NIXL_VARIANT != expected_variant:
+            expected_package = expected_variant.replace("_", "-")
             raise RuntimeError(
                 f"PyTorch uses CUDA {cuda_version}, but NIXL selected {_NIXL_VARIANT}. "
-                f"Install the matching backend with `pip install {expected_variant.replace('_', '-')}` "
+                f"Install the matching backend with `pip install {expected_package}` "
                 "before starting a disaggregated worker. A mismatched NIXL backend can make "
                 "UCX classify GPU buffers as host memory."
             )

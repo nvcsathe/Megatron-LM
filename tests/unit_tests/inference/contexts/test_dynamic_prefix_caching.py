@@ -1227,6 +1227,7 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
         # Verify _has_intermediates cleared
         assert not msa._has_intermediates
 
+
 class TestPerBlockRouting(PrefixCachingTestBase):
     """Tests for per-block routing storage and reconstruction."""
 

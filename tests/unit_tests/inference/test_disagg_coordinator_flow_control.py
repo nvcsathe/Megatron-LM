@@ -78,13 +78,15 @@ def test_partially_advertised_model_parallel_capacity_is_rejected():
         flow.register_engine(b"decode", "decode", [{"mamba_slot_capacity": 4}, {"global_rank": 1}])
 
 
-def test_prefill_reservations_use_prompt_block_count_and_fifo_queue():
+def test_prefill_reservations_use_advertised_handoff_bound_and_fifo_queue():
     flow = DisaggMambaFlowControl()
-    flow.register_engine(b"prefill", "prefill", [{"mamba_slot_capacity": 5}])
+    flow.register_engine(
+        b"prefill", "prefill", [{"mamba_slot_capacity": 1, "mamba_handoff_max_slots": 1}]
+    )
     prompt = list(range(513))
-    slot_cost = flow.prefill_slot_cost(prompt, block_size_tokens=256)
+    slot_cost = flow.prefill_slot_cost(b"prefill")
 
-    assert slot_cost == 3
+    assert slot_cost == 1
     assert flow.try_reserve_prefill(b"prefill", 1, slot_cost, max_requests=32)
     assert not flow.try_reserve_prefill(b"prefill", 2, slot_cost, max_requests=32)
     flow.enqueue_prefill(b"prefill", 2, prompt, {}, slot_cost)
@@ -94,4 +96,4 @@ def test_prefill_reservations_use_prompt_block_count_and_fifo_queue():
     admitted = flow.pop_next_prefill(b"prefill", max_requests=32)
 
     assert admitted.request_id == 2
-    assert flow.prefill_usage(b"prefill") == 3
+    assert flow.prefill_usage(b"prefill") == 1

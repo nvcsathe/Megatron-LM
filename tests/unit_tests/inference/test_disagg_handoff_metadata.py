@@ -49,10 +49,10 @@ def test_capture_handoff_keeps_request_mamba_metadata_independent():
         "conv": {"transport": "nccl", "state": "conv"},
         "ssm": {"transport": "nccl", "state": "ssm"},
     }
-    engine.context = SimpleNamespace(mamba_slot_allocator=mock.Mock())
+    engine.context = SimpleNamespace(mamba_slot_allocator=mock.Mock(), block_size_tokens=4)
 
-    first = SimpleNamespace(request_id=2, disaggregated_params=None)
-    second = SimpleNamespace(request_id=3, disaggregated_params=None)
+    first = SimpleNamespace(request_id=2, prompt_tokens=[0] * 10, disaggregated_params=None)
+    second = SimpleNamespace(request_id=3, prompt_tokens=[0] * 6, disaggregated_params=None)
     engine.context.mamba_slot_allocator.get_slot.side_effect = [4, 5, 6]
 
     pg_size = "megatron.core.inference.disaggregation.inference_state_handoff.get_pg_size"
@@ -60,7 +60,7 @@ def test_capture_handoff_keeps_request_mamba_metadata_independent():
         engine._capture_handoff_meta(first, [10, 11])
         engine._capture_handoff_meta(second, [12])
 
-    assert first.disaggregated_params["kv_meta"]["mamba"]["positions"] == [0, 1]
+    assert first.disaggregated_params["kv_meta"]["mamba"]["positions"] == [1]
     assert second.disaggregated_params["kv_meta"]["mamba"]["positions"] == [0]
     assert first.disaggregated_params["kv_meta"] is not second.disaggregated_params["kv_meta"]
     assert "mamba" not in engine._kv_peer_metas
@@ -107,9 +107,9 @@ def test_capture_handoff_uses_mamba_positions_common_to_tp_and_pp():
     engine._kv_peer_metas = [{"global_rank": 0}, {"global_rank": 1}]
     engine._mamba_transfer_agents = {"conv": mock.Mock(), "ssm": mock.Mock()}
     engine._mamba_peer_metas = {"conv": {"transport": "nccl"}, "ssm": {"transport": "nccl"}}
-    engine.context = SimpleNamespace(mamba_slot_allocator=mock.Mock())
+    engine.context = SimpleNamespace(mamba_slot_allocator=mock.Mock(), block_size_tokens=4)
     engine.context.mamba_slot_allocator.get_slot.side_effect = [4, 5, 6]
-    request = SimpleNamespace(request_id=8, disaggregated_params=None)
+    request = SimpleNamespace(request_id=8, prompt_tokens=[0] * 6, disaggregated_params=None)
 
     remote_tp = {
         "positions": [0, 2],

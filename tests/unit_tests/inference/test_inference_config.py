@@ -55,8 +55,7 @@ class TestInferenceConfig:
             decoder=SimpleNamespace(layer_type_list=None),
         )
         setup_config = InferenceSetupConfig(
-            inference_dynamic_batching_async_sched_mode="serial",
-            disagg_kv_transport_backend="nccl",
+            inference_dynamic_batching_async_sched_mode="serial", disagg_kv_transport_backend="nccl"
         )
 
         inference_config = setup_config.to_inference_config(

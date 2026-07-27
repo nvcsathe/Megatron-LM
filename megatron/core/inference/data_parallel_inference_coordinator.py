@@ -343,8 +343,8 @@ class DataParallelInferenceCoordinator:
         """Hop 1: forward a new request to a prefill engine with do_kv_handoff
         set, stashing its prompt and original sampling params for hop 2.
 
-        Capacity is reserved from the prompt's conservative block count until
-        a decode KV_READ_DONE frees the prefill's pinned state."""
+        Capacity is reserved from the engine's handoff checkpoint bound until a
+        decode KV_READ_DONE frees the prefill's pinned state."""
         self._req_meta[request_id] = (prompt, sampling_params)
         try:
             prefill_id = self._disagg.route_submit(request_id)
@@ -352,11 +352,7 @@ class DataParallelInferenceCoordinator:
             self._drop_disagg_request(request_id, f"cannot route to prefill: {e}")
             return
         capacity = self._disagg_mamba_flow.capacity(prefill_id)
-        slot_cost = (
-            self._disagg_mamba_flow.prefill_slot_cost(prompt, self.block_size_tokens)
-            if capacity is not None
-            else 0
-        )
+        slot_cost = self._disagg_mamba_flow.prefill_slot_cost(prefill_id)
         if not self._disagg_mamba_flow.can_ever_fit(prefill_id, slot_cost):
             self._drop_disagg_request(
                 request_id,
@@ -488,9 +484,7 @@ class DataParallelInferenceCoordinator:
                     kv_meta, self._engine_metas.get(prefill_id)
                 )
             except ValueError as error:
-                self._drop_disagg_request(
-                    request_id, f"invalid NIXL handoff metadata: {error}"
-                )
+                self._drop_disagg_request(request_id, f"invalid NIXL handoff metadata: {error}")
                 return
         payload = msgpack.packb(
             make_submit_request_with_kv_message(
@@ -860,8 +854,7 @@ class DataParallelInferenceCoordinator:
                         [
                             client_identity,
                             msgpack.packb(
-                                [header.value, client_request_identity, partial],
-                                use_bin_type=True,
+                                [header.value, client_request_identity, partial], use_bin_type=True
                             ),
                         ]
                     )

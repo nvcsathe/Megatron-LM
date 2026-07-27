@@ -96,9 +96,7 @@ class TestConstructorValidation:
         with pytest.raises(ValueError, match="expert_model_parallel_size > 1"):
             MegatronLLM(model=model, tokenizer=tok, use_coordinator=False)
 
-    def test_disaggregation_requires_coordinator(
-        self, mock_pipeline, fake_model_and_tokenizer
-    ):
+    def test_disaggregation_requires_coordinator(self, mock_pipeline, fake_model_and_tokenizer):
         model, tok = fake_model_and_tokenizer
         with pytest.raises(ValueError, match="disaggregation.*requires use_coordinator=True"):
             _MegatronLLMBase(
@@ -133,10 +131,7 @@ class TestConstructorValidation:
 
         assert llm.engine is engine
         configure.assert_called_once_with(
-            engine,
-            specs,
-            disagg_router="round_robin",
-            kv_transport_backend="nccl",
+            engine, specs, disagg_router="round_robin", kv_transport_backend="nccl"
         )
 
 

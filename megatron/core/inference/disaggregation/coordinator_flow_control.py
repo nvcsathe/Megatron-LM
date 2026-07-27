@@ -32,14 +32,15 @@ class DisaggMambaFlowControl:
     """Weighted prefill/decode admission based on durable Mamba cache slots.
 
     Engines advertise their durable slot capacity with their disaggregation
-    transfer metadata. Prefill reservations conservatively use prompt block
-    count; decode reservations use the exact number of Mamba block positions
-    in each handoff. Reservations remain held while the corresponding engine
-    owns the request's cache state.
+    transfer metadata. Prefill reservations use the engine's advertised
+    maximum checkpoints per handoff; decode reservations use the exact number
+    of Mamba block positions in each handoff. Reservations remain held while
+    the corresponding engine owns the request's cache state.
     """
 
     def __init__(self) -> None:
         self._capacity: Dict[Any, int] = {}
+        self._prefill_slot_cost: Dict[Any, int] = {}
         self._prefill_usage: Dict[Any, int] = {}
         self._prefill_request_count: Dict[Any, int] = {}
         self._prefill_reservations: Dict[int, Tuple[Any, int]] = {}
@@ -70,6 +71,33 @@ class DisaggMambaFlowControl:
             raise ValueError(f"Mamba durable slot capacity must be positive, got {capacity}")
         return capacity
 
+    @staticmethod
+    def _prefill_slot_cost_from_instance_meta(instance_meta) -> int:
+        """Return the per-request handoff bound advertised by a prefill engine."""
+
+        if not isinstance(instance_meta, list):
+            return 0
+        entries = [entry for entry in instance_meta if isinstance(entry, dict)]
+        hybrid_entries = [
+            entry for entry in entries if entry.get("mamba_slot_capacity") is not None
+        ]
+        if not hybrid_entries:
+            return 0
+        costs = [
+            int(entry["mamba_handoff_max_slots"])
+            for entry in hybrid_entries
+            if entry.get("mamba_handoff_max_slots") is not None
+        ]
+        if len(costs) != len(hybrid_entries):
+            raise ValueError(
+                "Mamba handoff slot demand is missing from part of a prefill "
+                "engine's model-parallel metadata"
+            )
+        cost = max(costs)
+        if cost < 1:
+            raise ValueError(f"Mamba handoff slot demand must be positive, got {cost}")
+        return cost
+
     def register_engine(self, identity, role: str, instance_meta) -> Optional[int]:
         """Register an engine's capacity and return the parsed limit."""
 
@@ -78,9 +106,13 @@ class DisaggMambaFlowControl:
         # the old limits instead of retaining values that are no longer
         # advertised by the new engine instance.
         self._capacity.pop(identity, None)
+        self._prefill_slot_cost.pop(identity, None)
         if capacity is not None:
             self._capacity[identity] = capacity
         if role == "prefill":
+            self._prefill_slot_cost[identity] = self._prefill_slot_cost_from_instance_meta(
+                instance_meta
+            )
             self._prefill_usage.setdefault(identity, 0)
             self._prefill_request_count.setdefault(identity, 0)
         if role == "decode":
@@ -91,6 +123,7 @@ class DisaggMambaFlowControl:
         """Forget an engine after its queued and in-flight requests are dropped."""
 
         self._capacity.pop(identity, None)
+        self._prefill_slot_cost.pop(identity, None)
         self._prefill_usage.pop(identity, None)
         self._prefill_request_count.pop(identity, None)
         self._prefill_queues.pop(identity, None)
@@ -116,13 +149,10 @@ class DisaggMambaFlowControl:
 
         return self._prefill_usage.get(identity, 0)
 
-    @staticmethod
-    def prefill_slot_cost(prompt, block_size_tokens: Optional[int]) -> int:
-        """Conservatively bound a prompt's durable Mamba slot demand."""
+    def prefill_slot_cost(self, identity) -> int:
+        """Return the engine-advertised durable handoff demand per request."""
 
-        if block_size_tokens is None or block_size_tokens < 1:
-            raise ValueError("Mamba prefill admission requires a positive token block size")
-        return (len(prompt) + block_size_tokens - 1) // block_size_tokens
+        return self._prefill_slot_cost.get(identity, 0)
 
     def try_reserve_prefill(
         self, identity, request_id: int, slot_cost: int, max_requests: int

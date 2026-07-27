@@ -3,6 +3,7 @@
 """Decode-local capacity tests for disaggregated state handoff."""
 
 import asyncio
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ from megatron.core.inference.contexts.mamba_slot_allocator import MambaSlotCapac
 from megatron.core.inference.disaggregation.inference_state_handoff import (
     InferenceStateHandoffMixin,
 )
+from megatron.core.inference.disaggregation.pending_handoff_imports import PendingKvImport
 from megatron.core.inference.sampling_params import SamplingParams
 
 
@@ -38,14 +40,22 @@ class _KvAllocator:
     def __init__(self):
         self.next_block = 10
         self.releases = []
+        self.block_ref_counts = torch.zeros(256, dtype=torch.int32)
+        self.kv_hash_to_block_id = {}
 
     def allocate_memory_blocks(self, count):
         blocks = torch.arange(self.next_block, self.next_block + count, dtype=torch.int32)
         self.next_block += count
+        self.block_ref_counts[blocks] = 1
         return blocks
 
     def release_memory_blocks(self, blocks):
+        assert torch.all(self.block_ref_counts[blocks] > 0)
+        self.block_ref_counts[blocks] -= 1
         self.releases.append(blocks.tolist())
+
+    def register_kv_block_hashes(self, block_ids, block_hashes):
+        self.kv_hash_to_block_id.update(zip(block_hashes, block_ids))
 
 
 class _MambaAllocator:
@@ -67,7 +77,20 @@ class _MambaAllocator:
         self.invalidated.append(block_id)
 
 
-class _HandoffHarness(InferenceStateHandoffMixin):
+class _SchedulerHarness:
+    def schedule_waiting_requests(self):
+        if not self.waiting_request_ids:
+            return
+        request_id = self.waiting_request_ids[0]
+        block_ids = torch.tensor(self.blocks_to_bind[request_id], dtype=torch.int32)
+        self.context.kv_block_allocator.block_ref_counts[block_ids] += 1
+        if request_id in self.partial_admissions:
+            self.get_request(request_id).finished_chunk_token_count += 4
+        else:
+            self.waiting_request_ids.popleft()
+
+
+class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
     def __init__(self, loop, available):
         self._loop = loop
         self._initialize_disaggregation_state()
@@ -80,9 +103,21 @@ class _HandoffHarness(InferenceStateHandoffMixin):
         self._kv_transfer_agent = _TransferAgent()
         self._mamba_transfer_agents = {"conv": _TransferAgent(), "ssm": _TransferAgent()}
         self.pg_collection = SimpleNamespace(mp=None)
+        self.waiting_request_ids = deque()
+        self.requests = {}
+        self.blocks_to_bind = {}
+        self.partial_admissions = set()
 
     async def _notify_cond_for_new_request(self):
         return None
+
+    def add_request(self, request_id, prompt, sampling_params, precomputed_block_hashes=None):
+        self.requests[request_id] = SimpleNamespace(finished_chunk_token_count=0)
+        self.waiting_request_ids.append(request_id)
+        return self._loop.create_future()
+
+    def get_request(self, request_id):
+        return self.requests[request_id]
 
 
 def _meta(request_id, positions):
@@ -98,6 +133,19 @@ def _meta(request_id, positions):
 
 def _drain_loop(loop):
     loop.run_until_complete(asyncio.sleep(0))
+
+
+def _pending_import(engine, request_id, block_id, block_hash):
+    return PendingKvImport(
+        request_id=request_id,
+        prompt=[1, 2, 3, 4],
+        sampling_params=SamplingParams(num_tokens_to_generate=2),
+        local_blocks=[block_id],
+        hashes=[block_hash],
+        hashes_to_register=1,
+        handle=None,
+        future=engine._loop.create_future(),
+    )
 
 
 @pytest.fixture
@@ -208,3 +256,37 @@ def test_reset_cancels_capacity_queued_handoffs(handoff_loop):
 
     assert future.cancelled()
     assert engine.pending_kv_import_count == 0
+
+
+def test_import_owner_survives_hash_replacement_until_request_admission(handoff_loop):
+    engine = _HandoffHarness(handoff_loop, available=0)
+    first_block = int(engine.context.kv_block_allocator.allocate_memory_blocks(1)[0])
+    second_block = int(engine.context.kv_block_allocator.allocate_memory_blocks(1)[0])
+
+    engine._finalize_kv_handoff_import(_pending_import(engine, 1, first_block, 101))
+    engine._finalize_kv_handoff_import(_pending_import(engine, 2, second_block, 101))
+
+    assert engine.context.kv_block_allocator.kv_hash_to_block_id[101] == second_block
+    engine.blocks_to_bind[1] = [second_block]
+    engine.schedule_waiting_requests()
+
+    ref_counts = engine.context.kv_block_allocator.block_ref_counts
+    assert ref_counts[first_block] == 0
+    assert ref_counts[second_block] == 2
+    assert 1 not in engine._handoff_import_owners
+    assert 2 in engine._handoff_import_owners
+
+
+def test_chunked_admission_releases_import_owner(handoff_loop):
+    engine = _HandoffHarness(handoff_loop, available=0)
+    block_id = int(engine.context.kv_block_allocator.allocate_memory_blocks(1)[0])
+    engine._finalize_kv_handoff_import(_pending_import(engine, 3, block_id, 103))
+    engine.blocks_to_bind[3] = [block_id]
+    engine.partial_admissions.add(3)
+
+    engine.schedule_waiting_requests()
+
+    assert list(engine.waiting_request_ids) == [3]
+    assert engine.get_request(3).finished_chunk_token_count == 4
+    assert engine.context.kv_block_allocator.block_ref_counts[block_id] == 1
+    assert not engine._handoff_import_owners

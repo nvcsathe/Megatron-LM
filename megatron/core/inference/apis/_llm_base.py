@@ -289,7 +289,9 @@ class _MegatronLLMBase:
         context = DynamicInferenceContext(model.config, inference_config)
         wrapper = GPTInferenceWrapper(model, context)
         controller = TextGenerationController(inference_wrapped_model=wrapper, tokenizer=tokenizer)
-        engine_cls = DisaggDynamicInferenceEngine if inference_shards is not None else DynamicInferenceEngine
+        engine_cls = (
+            DisaggDynamicInferenceEngine if inference_shards is not None else DynamicInferenceEngine
+        )
         engine = engine_cls(controller=controller, context=context)
 
         if inference_shards is not None:
