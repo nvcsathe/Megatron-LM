@@ -165,6 +165,27 @@ def test_prefix_caching_allocate_and_hash_registration():
     assert small.is_memory_available(5) is False
 
 
+def test_lru_eviction_selects_requested_oldest_blocks():
+    allocator = KVBlockAllocator(
+        _make_context(),
+        total_count=8,
+        paused_count=0,
+        enable_prefix_caching=True,
+        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
+    )
+    blocks = allocator.allocate_memory_blocks(5)
+    block_ids = blocks.tolist()
+    hashes = [100 + block_id for block_id in block_ids]
+    allocator.register_kv_block_hashes(block_ids, hashes)
+    allocator.release_memory_blocks(blocks)
+    allocator.block_timestamps[blocks] = torch.tensor([50, 10, 30, 20, 40])
+
+    assert allocator.evict_lru_blocks(2)
+
+    evicted = {block_ids[1], block_ids[3]}
+    assert {block_id for block_id in block_ids if allocator.block_hashes[block_id] == -1} == evicted
+
+
 def test_shared_pinned_block_releases_once_per_owner():
     """Each handoff owner retains and later releases its own block reference."""
     allocator = KVBlockAllocator(

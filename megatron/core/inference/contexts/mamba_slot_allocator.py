@@ -241,8 +241,8 @@ class MambaSlotAllocator:
         # Pick oldest blocks by timestamp (LRU) or first N (REF_ZERO)
         if self.context.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
             timestamps = kv_alloc.block_timestamps[candidate_ids]
-            sorted_indices = torch.argsort(timestamps)[:num_needed]
-            evict_ids = candidate_ids[sorted_indices]
+            _, oldest_indices = torch.topk(timestamps, k=num_needed, largest=False, sorted=False)
+            evict_ids = candidate_ids[oldest_indices]
         else:
             evict_ids = candidate_ids[:num_needed]
 
@@ -272,6 +272,13 @@ class MambaSlotAllocator:
             Slot index or -1.
         """
         return self.block_to_slot[block_id].item()
+
+    def get_slots(self, block_ids: list[int]) -> list[int]:
+        """Return cache slots for a batch of KV block IDs."""
+        if not block_ids:
+            return []
+        indices = torch.tensor(block_ids, dtype=torch.int64, device=self.block_to_slot.device)
+        return self.block_to_slot[indices].tolist()
 
     def has_state(self, block_id: int) -> bool:
         """Check if a block has cached Mamba state."""

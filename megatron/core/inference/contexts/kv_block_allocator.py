@@ -422,10 +422,12 @@ class KVBlockAllocator:
         if cached_block_ids.numel() < num_blocks_needed:
             return False  # Not enough cached blocks to evict
 
-        # Sort by timestamp (ascending = oldest first)
+        # Select the requested oldest blocks without sorting the full cache.
         cached_timestamps = self.block_timestamps[cached_block_ids]
-        sorted_indices = torch.argsort(cached_timestamps)
-        blocks_to_evict = cached_block_ids[sorted_indices[:num_blocks_needed]]
+        _, oldest_indices = torch.topk(
+            cached_timestamps, k=num_blocks_needed, largest=False, sorted=False
+        )
+        blocks_to_evict = cached_block_ids[oldest_indices]
 
         self._deregister_blocks(blocks_to_evict)
 

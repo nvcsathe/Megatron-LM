@@ -2880,17 +2880,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         hashes = req.precomputed_block_hashes[start_block:end_block]
         kv_hash_to_block = self.kv_block_allocator.kv_hash_to_block_id
 
-        # Find longest KV prefix by iterating block hashes from end.
-        # Parent-chained hashes guarantee: if hash at position N exists,
-        # all hashes 0..N also exist. So first match from end = longest prefix.
-        for i in range(len(hashes) - 1, -1, -1):
-            if hashes[i] in kv_hash_to_block:
-                num_matched = i + 1
-                matched_blocks = [kv_hash_to_block[hashes[j]] for j in range(num_matched)]
-                parent_hash = hashes[num_matched - 1]
-                return matched_blocks, parent_hash
-
-        return [], 0
+        matched_blocks = []
+        parent_hash = 0
+        for block_hash in hashes:
+            block_id = kv_hash_to_block.get(block_hash)
+            if block_id is None:
+                break
+            matched_blocks.append(block_id)
+            parent_hash = block_hash
+        return matched_blocks, parent_hash
 
     def add_request(
         self, req: DynamicInferenceRequest, prefill_chunk_length: Optional[int] = None

@@ -1028,6 +1028,49 @@ def test_failed_mamba_batch_allocation_is_atomic(monkeypatch):
     assert torch.equal(allocator.slot_to_block, slot_to_block_before)
 
 
+def test_prefix_match_stops_at_first_evicted_block():
+    context = DynamicInferenceContext.__new__(DynamicInferenceContext)
+    context.enable_prefix_caching = True
+    context.kv_block_allocator = SimpleNamespace(kv_hash_to_block_id={101: 7, 103: 9})
+    request = SimpleNamespace(precomputed_block_hashes=[101, 102, 103])
+
+    matched, parent_hash = context._find_kv_match_count(request, 0, 3)
+
+    assert matched == [7]
+    assert parent_hash == 101
+
+
+def test_mamba_lru_eviction_selects_requested_oldest_slots(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+    kv_allocator = SimpleNamespace(
+        total_count=4,
+        block_ref_counts=torch.zeros(4, dtype=torch.int32),
+        block_timestamps=torch.tensor([40, 10, 30, 20]),
+        block_hashes=torch.tensor([100, 101, 102, 103]),
+    )
+    context = SimpleNamespace(
+        max_requests=1,
+        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
+        kv_block_allocator=kv_allocator,
+    )
+    allocator = MambaSlotAllocator(
+        context=context,
+        max_slots=4,
+        num_mamba_layers=1,
+        conv_states_shape=(1,),
+        ssm_states_shape=(1,),
+        conv_states_dtype=torch.float32,
+        ssm_states_dtype=torch.float32,
+    )
+    allocator.allocate_slots_batch([0, 1, 2, 3])
+    allocator.register_block_hashes_batch([0, 1, 2, 3], [100, 101, 102, 103])
+
+    allocator._evict_lru_slots_batch(2, torch.arange(4))
+
+    assert allocator.block_to_slot.tolist()[1] == -1
+    assert allocator.block_to_slot.tolist()[3] == -1
+
+
 @pytest.mark.internal
 def test_commit_intermediate_states_skips_optional_insert_at_capacity(caplog):
     """A full durable cache must not fail the request that produced the state."""
