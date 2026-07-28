@@ -2039,10 +2039,7 @@ class DynamicInferenceEngine(AbstractEngine):
         return result, context_state, step_time
 
     def _try_send_streaming_partials(self) -> None:
-        """Send pending token deltas without blocking the inference loop."""
-        if not self.socket_for_receiving_requests.poll(timeout=0, flags=zmq.POLLOUT):
-            return
-
+        """Send pending token deltas to the inference coordinator."""
         partials: list = []
         emit_lengths: Dict[int, int] = {}
         for rid, entry in self.requests.items():
@@ -2069,14 +2066,8 @@ class DynamicInferenceEngine(AbstractEngine):
             [Headers.ENGINE_REPLY_PARTIAL.value, partials], use_bin_type=True
         )
         nvtx_range_push("coordinator_streaming")
-        try:
-            self.socket_for_receiving_requests.send(payload, flags=zmq.NOBLOCK)
-        except zmq.Again:
-            # Leave emit lengths unchanged so the unsent tokens are included
-            # in the next delta once the socket becomes writable.
-            return
-        finally:
-            nvtx_range_pop("coordinator_streaming")
+        self.socket_for_receiving_requests.send(payload)
+        nvtx_range_pop("coordinator_streaming")
 
         self._partial_emit_lengths.update(emit_lengths)
 
@@ -2524,6 +2515,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     active_ids = self.context.request_ids[: self.context.total_request_count]
                     matches = torch.where(active_ids == request_id)[0]
                     if matches.numel() > 0:
+                        assert matches.numel() == 1
                         idx = int(matches[0].item())
                         self.context.request_output_lengths[idx] = (
                             self.context.request_kv_length_offsets[idx]

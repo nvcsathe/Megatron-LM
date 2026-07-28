@@ -194,9 +194,9 @@ def handle_engine_reply(coordinator, sender_identity, payload):
         client_identity = coordinator.request_id_to_client_id[fid]
         client_request_identity = coordinator.request_id_to_client_request_id[fid]
         del coordinator.request_id_to_client_id[fid]
-        original_request_id = coordinator.request_id_to_client_request_id.pop(fid)
+        client_request_id = coordinator.request_id_to_client_request_id.pop(fid)
         coordinator.client_request_to_request_id.pop(
-            (client_identity, original_request_id), None
+            (client_identity, client_request_id), None
         )
         assigned_rank = coordinator.request_id_to_rank.pop(fid, None)
         if assigned_rank is not None:
