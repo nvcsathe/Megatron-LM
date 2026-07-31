@@ -65,6 +65,7 @@ except ImportError:
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.sampling import FlashInferSampling, Sampling, TorchSampling
+from megatron.core.inference.structured_output import XGrammarConstraintManager
 from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import rewind_kv_cache
 from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
     mamba_state_selective_copy,
@@ -248,6 +249,9 @@ class TextGenerationController:
         self._async_sched_sample_gpu_ready_event = torch.cuda.Event()
         self._async_sched_sample_cpu_ready_event = torch.cuda.Event()
         self._async_sched_copy_stream = torch.cuda.Stream(device=device)
+        self._structured_output = XGrammarConstraintManager(
+            self.tokenizer, self.vocab_size, max_requests
+        )
 
         # Sampling backend: provides the sampling kernel.
         if self._sampling_backend == "flashinfer":
@@ -267,6 +271,22 @@ class TextGenerationController:
         self._sp_enabled = self.model_config.sequence_parallel and self._tp_size > 1
 
         self._init_mtp_sampling_tensors()
+
+    def initialize_structured_output_request(
+        self, request_id: int, structured_output: Optional[Dict[str, Any]]
+    ) -> None:
+        """Compile and attach a structured-output matcher to a request."""
+        self._structured_output.initialize_request(
+            request_id, structured_output, self.num_speculative_tokens
+        )
+
+    def finish_structured_output_requests(self, request_ids: Tensor) -> None:
+        """Release structured-output state for completed or failed requests."""
+        self._structured_output.finish_requests(request_ids)
+
+    def reset_structured_output(self) -> None:
+        """Release all request-local structured-output state."""
+        self._structured_output.reset()
 
     def _init_mtp_sampling_tensors(self):
         """Pre-allocate MTP sampling tensors.
@@ -1143,6 +1163,28 @@ class TextGenerationController:
         # path must keep the same contract (see the `__init__` allocation comment).
         self._sampled_tokens_cuda[:n].copy_(sampled_tokens)
 
+    def _dynamic_step_apply_structured_output_constraints(self) -> None:
+        """Apply request grammars to the last-token logits before sampling."""
+        structured_output = getattr(self, "_structured_output", None)
+        if structured_output is None or not structured_output.has_requests:
+            return
+
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        active_request_slice = slice(context.paused_request_count, context.total_request_count)
+        request_ids = context.request_ids[active_request_slice].long()
+        logits = self._all_logits_cuda.squeeze(0)
+
+        if context.config.materialize_only_last_token_logits:
+            request_logits = logits[:active_request_count]
+            structured_output.apply_logits_mask(request_logits, request_ids)
+            return
+
+        row_indices = context.gpu_view.active_request_last_token_idxs[:active_request_count]
+        request_logits = logits.index_select(0, row_indices)
+        structured_output.apply_logits_mask(request_logits, request_ids)
+        logits.index_copy_(0, row_indices, request_logits)
+
     def _active_requests_sampling_filter_flags(
         self, active_request_count: Optional[int] = None
     ) -> Tuple[bool, bool]:
@@ -1734,6 +1776,8 @@ class TextGenerationController:
         range_push("active_request_mask")
         # Everything below is 100% CPU.
         active_request_ids = context.request_ids[active_request_slice].long()
+        if hasattr(self, "_structured_output"):
+            self._structured_output.accept_tokens(active_request_ids, sampled_tokens_cpu)
         active_sequence_lengths = context.get_active_sequence_lengths()
 
         # After the forward pass and KV-cache rewind, get_active_sequence_lengths()
@@ -1765,6 +1809,8 @@ class TextGenerationController:
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
         finished_request_ids = context.request_ids[finished_idxs]
+        if hasattr(self, "_structured_output"):
+            self._structured_output.finish_requests(finished_request_ids)
 
         # Save block IDs for finished requests before update_requests releases them.
         # Needed for per-block routing reconstruction in the engine.
@@ -1955,6 +2001,7 @@ class TextGenerationController:
 
         # Sample.
         range_push("sampling")
+        self._dynamic_step_apply_structured_output_constraints()
         sampled_tokens_gpu = self._sampled_tokens_cuda[:active_request_count]
         torch.max(
             self._all_logits_cuda.squeeze(0)[:active_request_count],
@@ -2077,6 +2124,9 @@ class TextGenerationController:
         (active_request_ids, finished_request_ids, active_request_mask, survivor_idxs) = (
             self._build_async_sched_request_state(sampled_tokens_cpu)
         )
+        if hasattr(self, "_structured_output"):
+            self._structured_output.accept_tokens(active_request_ids, sampled_tokens_cpu)
+            self._structured_output.finish_requests(finished_request_ids)
         range_pop()
 
         # Finish the speculative forward before releasing finished-request resources.
@@ -2327,6 +2377,7 @@ class TextGenerationController:
         with torch.inference_mode():
             range_push("sampling")
             return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+            self._dynamic_step_apply_structured_output_constraints()
 
             if self.num_speculative_tokens > 0:
                 # Phase 1: Verify speculative tokens using base logits only.

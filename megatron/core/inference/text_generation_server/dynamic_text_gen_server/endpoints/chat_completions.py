@@ -10,6 +10,7 @@ import warnings
 
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.structured_output import build_tool_constraint
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.incremental_detokenizer import (
     HuggingFaceFastIncrementalDetokenizer,
 )
@@ -460,6 +461,21 @@ try:
         template_tools = _sanitize_tools_for_template(tools)
 
         try:
+            structured_output = build_tool_constraint(
+                tools,
+                tool_choice,
+                reasoning=bool(chat_template_kwargs.get("enable_thinking", True)),
+                parallel_tool_calls=bool(parallel_tool_calls),
+            )
+        except ValueError as error:
+            return Response(f"Invalid tool constraint: {error}", status=400)
+        if structured_output is not None and "qwen3-coder-tool" not in (parsers or []):
+            return Response(
+                "Schema-constrained tool calling requires --parsers qwen3-coder-tool",
+                status=400,
+            )
+
+        try:
             if (
                 hasattr(tokenizer, 'apply_chat_template')
                 and getattr(tokenizer, "chat_template", None) is not None
@@ -611,6 +627,7 @@ try:
                 termination_id=-1 if ignore_eos else None,
                 return_prompt_tokens=return_prompt_tokens,
                 streaming_interval=int(_get_non_none(req, "streaming_interval", 1)),
+                structured_output=structured_output,
             )
         except ValueError as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)

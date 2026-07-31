@@ -2,7 +2,7 @@
 
 import warnings
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -40,6 +40,9 @@ class SamplingParams:
     return_prompt_tokens: bool = False
     streaming: bool = False  # Emit incremental ENGINE_REPLY_PARTIAL frames.
     streaming_interval: int = 1  # Minimum unsent tokens per ENGINE_REPLY_PARTIAL.
+    # Serializable request-level grammar configuration. This remains optional so
+    # ordinary text generation has no structured-output dependency or overhead.
+    structured_output: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         """Validate parameters and maintain backward compatibility.

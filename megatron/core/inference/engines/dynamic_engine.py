@@ -307,6 +307,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """Reset by removing all requests and reset all state."""
 
         self.context.reset()
+        self.controller.reset_structured_output()
 
         # Request state.
         self.request_counter = Counter()
@@ -1044,10 +1045,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
         request_id = request.request_id
         self._validate_async_sched_support_for_request(request)
+        is_new_request = request_id not in self.requests
 
         # Add request to self.requests. If the engine has previously been
         # suspended, then the request may already exist.
-        if request_id not in self.requests:
+        if is_new_request:
             self.requests[request_id] = RequestEntry(
                 record=DynamicInferenceRequestRecord.from_request(request),
                 future=self._loop.create_future(),
@@ -1140,9 +1142,19 @@ class DynamicInferenceEngine(AbstractEngine):
             ]
             request.stop_word_ids = stop_word_ids
 
+        if request.status != Status.FAILED and is_new_request:
+            try:
+                self.controller.initialize_structured_output_request(
+                    request_id, request.sampling_params.structured_output
+                )
+            except (RuntimeError, ValueError) as error:
+                request.status = Status.FAILED
+                request.add_event_error_nontransient(error)
+
         if request.status != Status.FAILED:
             self.waiting_request_ids.append(request_id)
         else:
+            self.controller.finish_structured_output_requests(torch.tensor([request_id]))
             self._handle_failed_request(request_id)
 
         return self.requests[request_id].future
