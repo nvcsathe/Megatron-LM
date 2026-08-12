@@ -188,6 +188,36 @@ def test_apply_bias_returns_input_unchanged_when_bias_is_none():
     assert output is intermediate
 
 
+def test_trtllm_weights_refresh_in_place_after_refit():
+    module = experts_module.InferenceGroupedMLP.__new__(experts_module.InferenceGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.inference_grouped_gemm_backend = (
+        experts_module.InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED
+    )
+    module._concatenated_weights_built = True
+    module.register_buffer('_fc1_weight', torch.ones(2, 4), persistent=False)
+    module.register_buffer('_fc2_weight', torch.ones(2, 4) * 2, persistent=False)
+    module.register_buffer('_trtllm_fc1_weight', None, persistent=False)
+    module.register_buffer('_trtllm_fc2_weight', None, persistent=False)
+    module._build_trtllm_shuffled_weights = lambda: (
+        module._fc1_weight + 10,
+        module._fc2_weight + 20,
+    )
+
+    module._refresh_trtllm_weights()
+    fc1_ptr = module._trtllm_fc1_weight.data_ptr()
+    fc2_ptr = module._trtllm_fc2_weight.data_ptr()
+
+    module._fc1_weight.add_(3)
+    module._fc2_weight.add_(4)
+    module._post_refit()
+
+    assert module._trtllm_fc1_weight.data_ptr() == fc1_ptr
+    assert module._trtllm_fc2_weight.data_ptr() == fc2_ptr
+    torch.testing.assert_close(module._trtllm_fc1_weight, module._fc1_weight + 10)
+    torch.testing.assert_close(module._trtllm_fc2_weight, module._fc2_weight + 20)
+
+
 def test_apply_bias_combines_per_expert_bias_and_probs():
     intermediate = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32)
     bias_parallel = [torch.tensor([10.0, 20.0]), torch.tensor([100.0, 200.0])]

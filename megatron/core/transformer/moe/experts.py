@@ -806,6 +806,14 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
 
+        if (
+            self.inference_grouped_gemm_backend
+            == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED
+        ):
+            self._trtllm_permute_indices = {}
+            self.register_buffer('_trtllm_fc1_weight', None, persistent=False)
+            self.register_buffer('_trtllm_fc2_weight', None, persistent=False)
+
         if HAVE_FLASHINFER:
             self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
 
@@ -998,6 +1006,74 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )
         return output, None
 
+    def _build_trtllm_shuffled_weights(self):
+        """Build the TRT-LLM BlockMajorK weights from the regular expert weights."""
+        from flashinfer.fused_moe.core import (
+            _maybe_get_cached_w3_w1_permute_indices,
+            convert_to_block_layout,
+            get_w2_permute_indices_with_cache,
+        )
+
+        epilogue_tile_m = 128
+        block_k = 128
+        fc1_weights = []
+        fc2_weights = []
+
+        for expert_idx in range(self.num_local_experts):
+            fc1 = self._fc1_weight[expert_idx].view(torch.uint8)
+            fc2 = self._fc2_weight[expert_idx].view(torch.uint8)
+
+            fc1_indices = _maybe_get_cached_w3_w1_permute_indices(
+                self._trtllm_permute_indices,
+                fc1,
+                epilogue_tile_m,
+                is_gated_act_gemm=self.config.gated_linear_unit,
+            )
+            fc2_indices = get_w2_permute_indices_with_cache(
+                self._trtllm_permute_indices, fc2, epilogue_tile_m
+            )
+
+            fc1_weights.append(
+                convert_to_block_layout(fc1[fc1_indices].contiguous(), block_k).view(
+                    torch.bfloat16
+                )
+            )
+            fc2_weights.append(
+                convert_to_block_layout(fc2[fc2_indices].contiguous(), block_k).view(
+                    torch.bfloat16
+                )
+            )
+
+        return torch.stack(fc1_weights), torch.stack(fc2_weights)
+
+    @torch.no_grad()
+    def _refresh_trtllm_weights(self):
+        """Regenerate TRT-LLM weights while preserving CUDA-graph buffer addresses."""
+        new_fc1, new_fc2 = self._build_trtllm_shuffled_weights()
+
+        if self._trtllm_fc1_weight is None:
+            self._trtllm_fc1_weight = new_fc1
+            self._trtllm_fc2_weight = new_fc2
+            return
+
+        if (
+            self._trtllm_fc1_weight.shape != new_fc1.shape
+            or self._trtllm_fc2_weight.shape != new_fc2.shape
+        ):
+            raise RuntimeError("TRT-LLM shuffled weight shape changed during refit")
+
+        self._trtllm_fc1_weight.copy_(new_fc1)
+        self._trtllm_fc2_weight.copy_(new_fc2)
+
+    def _post_refit(self):
+        """Refresh derived TRT-LLM weights after the canonical weights are refit."""
+        if (
+            self.inference_grouped_gemm_backend
+            == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED
+            and self._concatenated_weights_built
+        ):
+            self._refresh_trtllm_weights()
+
     def _trtllm_bf16_routed_forward(self, hidden_states, probs, routing_map):
         """FlashInfer TensorRT-LLM BF16 routed MoE forward."""
         assert (
@@ -1013,8 +1089,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         output = fused_moe.trtllm_bf16_routed_moe(
             topk_ids=packed_topk_ids,
             hidden_states=hidden_states,
-            gemm1_weights=self._fc1_weight,
-            gemm2_weights=self._fc2_weight,
+            gemm1_weights=self._trtllm_fc1_weight,
+            gemm2_weights=self._trtllm_fc2_weight,
             num_experts=not_none(self.config.num_moe_experts),
             top_k=routing_map.shape[1],
             n_group=None,
@@ -1024,8 +1100,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
             local_num_experts=self.num_local_experts,
             routed_scaling_factor=None,
             routing_method_type=0,
-            use_shuffled_weight=False,
-            weight_layout=WeightLayout.MajorK,
+            use_shuffled_weight=True,
+            weight_layout=WeightLayout.BlockMajorK,
             do_finalize=True,
             tune_max_num_tokens=hidden_states.shape[0],
             activation_type=self._flashinfer_activation_type,
@@ -1075,6 +1151,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
             else:
                 self._build_concatenated_weights()
             self._concatenated_weights_built = True
+            if (
+                self.inference_grouped_gemm_backend
+                == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED
+            ):
+                self._refresh_trtllm_weights()
 
         if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
             assert routing_map is not None, "routing_map is required for FlashInfer forward pass."
