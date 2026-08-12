@@ -1034,6 +1034,26 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         if HAVE_FLASHINFER:
             self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
+            if (
+                self.inference_grouped_gemm_backend
+                == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED
+            ):
+                supports_activation_type = (
+                    'activation_type'
+                    in inspect.signature(fused_moe.trtllm_bf16_routed_moe).parameters
+                )
+                if not supports_activation_type and (
+                    self._flashinfer_activation_type != ActivationType.Swiglu
+                ):
+                    raise RuntimeError(
+                        "The installed FlashInfer trtllm_bf16_routed_moe only supports SwiGLU. "
+                        "Upgrade FlashInfer to use another activation."
+                    )
+                self._trtllm_activation_kwargs = (
+                    {'activation_type': self._flashinfer_activation_type}
+                    if supports_activation_type
+                    else {}
+                )
 
         if self.inference_grouped_gemm_backend in (
             InferenceGroupedGemmBackend.TORCH,
@@ -1325,7 +1345,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             weight_layout=WeightLayout.BlockMajorK,
             do_finalize=True,
             tune_max_num_tokens=hidden_states.shape[0],
-            activation_type=self._flashinfer_activation_type,
+            **self._trtllm_activation_kwargs,
         )
         rsv = NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None
         if rsv is not None:
