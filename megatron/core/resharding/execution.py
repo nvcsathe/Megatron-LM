@@ -231,6 +231,15 @@ def execute_reshard_plan(
             dst_param.quantize_(full_bf16)
     pending_quantized.clear()
 
+    # Refresh derived inference weights only after every destination parameter
+    # has been updated. Hooks must update existing buffers in-place because their
+    # addresses may already be captured by CUDA graphs.
+    if dst_module is not None:
+        for submodule in dst_module.modules():
+            post_refit = getattr(submodule, "_post_refit", None)
+            if post_refit is not None:
+                post_refit()
+
     # Ensure all writeback copies are visible to subsequent CUDA ops (e.g. CUDA
     # graph warmup).  The synchronize() above fires *before* the writeback loop,
     # so without this second sync the .copy_() kernels are still async when

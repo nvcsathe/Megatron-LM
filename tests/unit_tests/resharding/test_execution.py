@@ -129,6 +129,37 @@ class TestExecuteReshard:
             dict(src_module.named_parameters())["weight"].data,
         )
 
+    def test_post_refit_hook_observes_updated_weights(self):
+        class RefitAwareModule(torch.nn.Module):
+            def __init__(self, weight):
+                super().__init__()
+                self.weight = torch.nn.Parameter(weight)
+                self.weight_seen_by_hook = None
+
+            def _post_refit(self):
+                self.weight_seen_by_hook = self.weight.detach().clone()
+
+        src_data = torch.randn(4, 8, device="cuda")
+        src_module = _make_module_with_params({"weight": src_data.clone()})
+        dst_module = RefitAwareModule(torch.zeros_like(src_data))
+        s = _full_slice(2)
+        plan = ReshardPlan(
+            send_ops=[
+                _make_transfer_op(
+                    "weight", peer_rank=1, is_send=True, my_slice=s, peer_slice=s, task_id=0
+                )
+            ],
+            recv_ops=[
+                _make_transfer_op(
+                    "weight", peer_rank=0, is_send=False, my_slice=s, peer_slice=s, task_id=0
+                )
+            ],
+        )
+
+        _run(plan, src_module, dst_module, MockCopyService())
+
+        torch.testing.assert_close(dst_module.weight_seen_by_hook, src_data)
+
     def test_slice_copy(self):
         """Copy a row-slice of a parameter."""
         src_data = torch.randn(8, 4, device="cuda")
