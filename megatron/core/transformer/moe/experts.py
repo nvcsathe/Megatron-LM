@@ -1029,6 +1029,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED
         ):
             self._trtllm_permute_indices = {}
+            self._trtllm_intermediate_size = None
             self.register_buffer('_trtllm_fc1_weight', None, persistent=False)
             self.register_buffer('_trtllm_fc2_weight', None, persistent=False)
 
@@ -1247,6 +1248,27 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )
         return output, None
 
+    @staticmethod
+    def _pad_trtllm_expert_weights(fc1, fc2, gated):
+        """Zero-pad one expert's intermediate dimension to a multiple of 128."""
+        intermediate_size = fc2.shape[1]
+        padded_intermediate_size = ((intermediate_size + 127) // 128) * 128
+        padding = padded_intermediate_size - intermediate_size
+
+        if padding == 0:
+            return fc1, fc2, padded_intermediate_size
+
+        if gated:
+            hidden_size = fc1.shape[1]
+            fc1 = fc1.reshape(2, intermediate_size, hidden_size)
+            fc1 = F.pad(fc1, (0, 0, 0, padding))
+            fc1 = fc1.reshape(2 * padded_intermediate_size, hidden_size)
+        else:
+            fc1 = F.pad(fc1, (0, 0, 0, padding))
+        fc2 = F.pad(fc2, (0, padding))
+
+        return fc1, fc2, padded_intermediate_size
+
     def _build_trtllm_shuffled_weights(self):
         """Build the TRT-LLM BlockMajorK weights from the regular expert weights."""
         from flashinfer.fused_moe.core import (
@@ -1261,8 +1283,13 @@ class InferenceGroupedMLP(TEGroupedMLP):
         fc2_weights = []
 
         for expert_idx in range(self.num_local_experts):
-            fc1 = self._fc1_weight[expert_idx].view(torch.uint8)
-            fc2 = self._fc2_weight[expert_idx].view(torch.uint8)
+            fc1, fc2, self._trtllm_intermediate_size = self._pad_trtllm_expert_weights(
+                self._fc1_weight[expert_idx],
+                self._fc2_weight[expert_idx],
+                self.config.gated_linear_unit,
+            )
+            fc1 = fc1.contiguous().view(torch.uint8)
+            fc2 = fc2.contiguous().view(torch.uint8)
 
             fc1_indices = _maybe_get_cached_w3_w1_permute_indices(
                 self._trtllm_permute_indices,
@@ -1336,7 +1363,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             top_k=routing_map.shape[1],
             n_group=None,
             topk_group=None,
-            intermediate_size=self._fc2_weight.shape[2],
+            intermediate_size=not_none(self._trtllm_intermediate_size),
             local_expert_offset=local_expert_start,
             local_num_experts=self.num_local_experts,
             routed_scaling_factor=None,

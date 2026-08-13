@@ -235,6 +235,51 @@ def test_trtllm_weights_refresh_in_place_after_refit():
     torch.testing.assert_close(module._trtllm_fc2_weight, module._fc2_weight + 20)
 
 
+@pytest.mark.parametrize("gated", [False, True])
+def test_pad_trtllm_expert_weights(gated):
+    intermediate_size = 1856
+    padded_intermediate_size = 1920
+    hidden_size = 4
+    fc1_multiplier = 2 if gated else 1
+    fc1 = torch.ones(fc1_multiplier * intermediate_size, hidden_size)
+    if gated:
+        fc1[intermediate_size:].fill_(2)
+    fc2 = torch.full((hidden_size, intermediate_size), 3.0)
+
+    padded_fc1, padded_fc2, actual_intermediate_size = (
+        experts_module.InferenceGroupedMLP._pad_trtllm_expert_weights(fc1, fc2, gated)
+    )
+
+    assert actual_intermediate_size == padded_intermediate_size
+    assert padded_fc1.shape == (fc1_multiplier * padded_intermediate_size, hidden_size)
+    assert padded_fc2.shape == (hidden_size, padded_intermediate_size)
+    torch.testing.assert_close(padded_fc1[:intermediate_size], fc1[:intermediate_size])
+    assert torch.count_nonzero(padded_fc1[intermediate_size:padded_intermediate_size]) == 0
+    if gated:
+        torch.testing.assert_close(
+            padded_fc1[padded_intermediate_size : padded_intermediate_size + intermediate_size],
+            fc1[intermediate_size:],
+        )
+        assert torch.count_nonzero(
+            padded_fc1[padded_intermediate_size + intermediate_size :]
+        ) == 0
+    torch.testing.assert_close(padded_fc2[:, :intermediate_size], fc2)
+    assert torch.count_nonzero(padded_fc2[:, intermediate_size:]) == 0
+
+
+def test_pad_trtllm_expert_weights_aligned_size_is_unchanged():
+    fc1 = torch.ones(128, 4)
+    fc2 = torch.ones(4, 128)
+
+    padded_fc1, padded_fc2, intermediate_size = (
+        experts_module.InferenceGroupedMLP._pad_trtllm_expert_weights(fc1, fc2, False)
+    )
+
+    assert intermediate_size == 128
+    assert padded_fc1 is fc1
+    assert padded_fc2 is fc2
+
+
 def test_apply_bias_combines_per_expert_bias_and_probs():
     intermediate = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32)
     bias_parallel = [torch.tensor([10.0, 20.0]), torch.tensor([100.0, 200.0])]
