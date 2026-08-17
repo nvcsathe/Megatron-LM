@@ -23,6 +23,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
+from megatron.core.inference.moe.trtllm import pack_topk_ids
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -1350,13 +1351,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
         assert probs.dtype == torch.float32, "trtllm_bf16_routed requires fp32 probabilities."
         assert routing_map is not None, "routing_map is required for trtllm_bf16_routed."
 
-        # Use FlashInfer's unpacked precomputed-routing ABI. Packing the expert id and
-        # BF16 probability bits with eager PyTorch materializes several intermediates
-        # and launches multiple pointwise kernels for every MoE layer.
-        topk_ids = routing_map.to(torch.int32)
+        packed_topk_ids = pack_topk_ids(routing_map, probs)
         local_expert_start = self.ep_group.rank() * self.num_local_experts
         output = fused_moe.trtllm_bf16_routed_moe(
-            topk_ids=(topk_ids, probs),
+            topk_ids=packed_topk_ids,
             hidden_states=hidden_states,
             gemm1_weights=self._trtllm_fc1_weight,
             gemm2_weights=self._trtllm_fc2_weight,

@@ -3,6 +3,7 @@
 import argparse
 import sys
 from types import ModuleType, SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -280,8 +281,9 @@ def test_pad_trtllm_expert_weights_aligned_size_is_unchanged():
     assert padded_fc2 is fc2
 
 
-def test_trtllm_bf16_routed_forward_uses_unpacked_routing(monkeypatch):
+def test_trtllm_bf16_routed_forward_uses_fused_packed_routing(monkeypatch):
     recorded_kwargs = {}
+    packed_topk_ids = torch.empty(3, 2, dtype=torch.int32)
 
     def fake_trtllm_bf16_routed_moe(**kwargs):
         recorded_kwargs.update(kwargs)
@@ -293,6 +295,8 @@ def test_trtllm_bf16_routed_forward_uses_unpacked_routing(monkeypatch):
         SimpleNamespace(trtllm_bf16_routed_moe=fake_trtllm_bf16_routed_moe),
         raising=False,
     )
+    pack_topk_ids = MagicMock(return_value=packed_topk_ids)
+    monkeypatch.setattr(experts_module, 'pack_topk_ids', pack_topk_ids)
 
     module = experts_module.InferenceGroupedMLP.__new__(experts_module.InferenceGroupedMLP)
     torch.nn.Module.__init__(module)
@@ -313,10 +317,8 @@ def test_trtllm_bf16_routed_forward_uses_unpacked_routing(monkeypatch):
         hidden_states, probs, routing_map
     )
 
-    topk_ids, topk_weights = recorded_kwargs['topk_ids']
-    assert topk_ids.dtype == torch.int32
-    torch.testing.assert_close(topk_ids, routing_map.to(torch.int32))
-    assert topk_weights is probs
+    pack_topk_ids.assert_called_once_with(routing_map, probs)
+    assert recorded_kwargs['topk_ids'] is packed_topk_ids
     torch.testing.assert_close(output, hidden_states)
     assert output_bias is None
 
