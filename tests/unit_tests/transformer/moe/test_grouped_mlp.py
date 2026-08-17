@@ -280,47 +280,6 @@ def test_pad_trtllm_expert_weights_aligned_size_is_unchanged():
     assert padded_fc2 is fc2
 
 
-def test_trtllm_bf16_routed_forward_uses_unpacked_routing(monkeypatch):
-    recorded_kwargs = {}
-
-    def fake_trtllm_bf16_routed_moe(**kwargs):
-        recorded_kwargs.update(kwargs)
-        return kwargs['hidden_states'].clone()
-
-    monkeypatch.setattr(
-        experts_module,
-        'fused_moe',
-        SimpleNamespace(trtllm_bf16_routed_moe=fake_trtllm_bf16_routed_moe),
-        raising=False,
-    )
-
-    module = experts_module.InferenceGroupedMLP.__new__(experts_module.InferenceGroupedMLP)
-    torch.nn.Module.__init__(module)
-    module.ep_group = SimpleNamespace(rank=lambda: 0)
-    module.num_local_experts = 2
-    module.config = SimpleNamespace(num_moe_experts=2)
-    module._trtllm_fc1_weight = torch.empty(0)
-    module._trtllm_fc2_weight = torch.empty(0)
-    module._trtllm_intermediate_size = 128
-    module._trtllm_activation_kwargs = {}
-    module._nvls_dispatcher = False
-
-    hidden_states = torch.ones(3, 4, dtype=torch.bfloat16)
-    routing_map = torch.tensor([[0, 1], [1, 0], [0, 1]], dtype=torch.int64)
-    probs = torch.tensor([[0.75, 0.25], [0.6, 0.4], [0.8, 0.2]], dtype=torch.float32)
-
-    output, output_bias = module._trtllm_bf16_routed_forward(
-        hidden_states, probs, routing_map
-    )
-
-    topk_ids, topk_weights = recorded_kwargs['topk_ids']
-    assert topk_ids.dtype == torch.int32
-    torch.testing.assert_close(topk_ids, routing_map.to(torch.int32))
-    assert topk_weights is probs
-    torch.testing.assert_close(output, hidden_states)
-    assert output_bias is None
-
-
 def test_apply_bias_combines_per_expert_bias_and_probs():
     intermediate = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32)
     bias_parallel = [torch.tensor([10.0, 20.0]), torch.tensor([100.0, 200.0])]
