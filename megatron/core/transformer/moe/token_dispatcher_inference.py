@@ -468,9 +468,9 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
 
         Fires the fused NVLS allgather+reduce to publish
         [valid_tokens, rank_token_offset, ep_max_tokens] into _step_metadata, then
-        (for FlashInfer) pre-masks the routing buffer with -1 so rows beyond
-        valid_tokens are ignored by the GEMM; the AGV below overwrites
-        [0, valid_tokens) in-place.
+        pre-masks the routing buffer with -1 for backends that support padding
+        sentinels so rows beyond valid_tokens are ignored by the GEMM; the AGV
+        below overwrites [0, valid_tokens) in-place.
         """
         cls = NVLSAllGatherVDispatcher
         fused_metadata_update(
@@ -486,10 +486,8 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             self.config.inference_grouped_gemm_backend
             == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED
         ):
-            # The TRT-LLM routed kernel consumes every row in the fixed-size CUDA graph
-            # buffer and expects valid expert ids. Padding rows are ignored downstream,
-            # so route them to expert 0 with zero weight.
-            cls._symm_agv_routing["tensor"].fill_(0)
+            # Mark unused rows as unrouted so they are excluded from expert GEMMs.
+            cls._symm_agv_routing["tensor"].fill_(-1)
             cls._symm_agv_probs["tensor"].zero_()
 
     def __init__(
