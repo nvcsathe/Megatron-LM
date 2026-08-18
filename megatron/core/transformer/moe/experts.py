@@ -1372,11 +1372,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
             weight_layout=WeightLayout.BlockMajorK,
             do_finalize=True,
             tune_max_num_tokens=hidden_states.shape[0],
+            output=(
+                NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None
+            ),
             **self._trtllm_activation_kwargs,
         )
-        rsv = NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None
-        if rsv is not None:
-            output = rsv.copy_(output)
         return output, None
 
     def forward(
