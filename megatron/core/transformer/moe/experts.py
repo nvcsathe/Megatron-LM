@@ -4,7 +4,7 @@ from __future__ import annotations
 import inspect
 import logging
 from collections.abc import Callable
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from itertools import chain
@@ -76,17 +76,46 @@ else:
 
 try:
     import flashinfer.fused_moe as fused_moe
+    import flashinfer.fused_moe.core as flashinfer_moe_core
     from flashinfer.fused_moe.core import ActivationType, WeightLayout
 
     HAVE_FLASHINFER = True
 except ImportError:
     HAVE_FLASHINFER = False
+    flashinfer_moe_core = None
     WeightLayout = None
 
 from megatron.core.inference.moe import ActivationType as McoreActivationType
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _unsafe_allow_flashinfer_fp32_rsv_output(output: torch.Tensor | None):
+    """Bypass FlashInfer's BF16 output check for an FP32 RSV experiment.
+
+    The TRT-LLM BF16 routed kernel may still issue BF16 stores into this FP32
+    tensor. This helper intentionally changes no tensor metadata and exists only
+    to measure the no-copy path; it does not make the dtype combination correct.
+    """
+    if output is None or output.dtype != torch.float32:
+        yield
+        return
+
+    assert flashinfer_moe_core is not None
+    original_validate = flashinfer_moe_core.check_shape_dtype_device
+
+    def validate_allowing_fp32_output(tensor, shape, dtype, device, name):
+        if tensor is output and name == "output" and dtype == torch.bfloat16:
+            dtype = torch.float32
+        return original_validate(tensor, shape, dtype, device, name)
+
+    flashinfer_moe_core.check_shape_dtype_device = validate_allowing_fp32_output
+    try:
+        yield
+    finally:
+        flashinfer_moe_core.check_shape_dtype_device = original_validate
 
 
 class GroupedLinearFc1Interface(Protocol):
@@ -1356,27 +1385,29 @@ class InferenceGroupedMLP(TEGroupedMLP):
         output_kwargs = {'output': rsv} if self._trtllm_supports_output and rsv is not None else {}
 
         local_expert_start = self.ep_group.rank() * self.num_local_experts
-        output = fused_moe.trtllm_bf16_routed_moe(
-            topk_ids=packed_topk_ids,
-            hidden_states=hidden_states,
-            gemm1_weights=self._trtllm_fc1_weight,
-            gemm2_weights=self._trtllm_fc2_weight,
-            num_experts=not_none(self.config.num_moe_experts),
-            top_k=routing_map.shape[1],
-            n_group=None,
-            topk_group=None,
-            intermediate_size=not_none(self._trtllm_intermediate_size),
-            local_expert_offset=local_expert_start,
-            local_num_experts=self.num_local_experts,
-            routed_scaling_factor=None,
-            routing_method_type=0,
-            use_shuffled_weight=True,
-            weight_layout=WeightLayout.BlockMajorK,
-            do_finalize=True,
-            tune_max_num_tokens=hidden_states.shape[0],
-            **output_kwargs,
-            **self._trtllm_activation_kwargs,
-        )
+        output_override = rsv if self._trtllm_supports_output else None
+        with _unsafe_allow_flashinfer_fp32_rsv_output(output_override):
+            output = fused_moe.trtllm_bf16_routed_moe(
+                topk_ids=packed_topk_ids,
+                hidden_states=hidden_states,
+                gemm1_weights=self._trtllm_fc1_weight,
+                gemm2_weights=self._trtllm_fc2_weight,
+                num_experts=not_none(self.config.num_moe_experts),
+                top_k=routing_map.shape[1],
+                n_group=None,
+                topk_group=None,
+                intermediate_size=not_none(self._trtllm_intermediate_size),
+                local_expert_offset=local_expert_start,
+                local_num_experts=self.num_local_experts,
+                routed_scaling_factor=None,
+                routing_method_type=0,
+                use_shuffled_weight=True,
+                weight_layout=WeightLayout.BlockMajorK,
+                do_finalize=True,
+                tune_max_num_tokens=hidden_states.shape[0],
+                **output_kwargs,
+                **self._trtllm_activation_kwargs,
+            )
         if rsv is not None and not self._trtllm_supports_output:
             output = rsv.copy_(output)
         return output, None

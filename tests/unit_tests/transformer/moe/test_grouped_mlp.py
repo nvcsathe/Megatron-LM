@@ -235,6 +235,31 @@ def test_trtllm_weights_refresh_in_place_after_refit():
     torch.testing.assert_close(module._trtllm_fc2_weight, module._fc2_weight + 20)
 
 
+def test_unsafe_flashinfer_fp32_rsv_output_validation_bypass(monkeypatch):
+    validation_calls = []
+
+    def validate(tensor, shape, dtype, device, name):
+        validation_calls.append((tensor, shape, dtype, device, name))
+
+    fake_flashinfer_core = SimpleNamespace(check_shape_dtype_device=validate)
+    monkeypatch.setattr(experts_module, "flashinfer_moe_core", fake_flashinfer_core)
+    rsv = torch.empty(2, 4, dtype=torch.float32)
+
+    with experts_module._unsafe_allow_flashinfer_fp32_rsv_output(rsv):
+        fake_flashinfer_core.check_shape_dtype_device(
+            rsv, rsv.shape, torch.bfloat16, rsv.device, "output"
+        )
+
+    assert len(validation_calls) == 1
+    tensor, shape, dtype, device, name = validation_calls[0]
+    assert tensor is rsv
+    assert shape == rsv.shape
+    assert dtype == torch.float32
+    assert device == rsv.device
+    assert name == "output"
+    assert fake_flashinfer_core.check_shape_dtype_device is validate
+
+
 @pytest.mark.parametrize("gated", [False, True])
 def test_pad_trtllm_expert_weights(gated):
     intermediate_size = 1856
