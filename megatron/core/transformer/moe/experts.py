@@ -1350,11 +1350,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
         assert probs.dtype == torch.float32, "trtllm_bf16_routed requires fp32 probabilities."
         assert routing_map is not None, "routing_map is required for trtllm_bf16_routed."
 
-        topk_ids = (routing_map.to(torch.int32), probs)
-
+        packed_topk_ids = (routing_map.to(torch.int32) << 16) | (
+            probs.to(torch.bfloat16).contiguous().view(torch.int16).to(torch.int32)
+        )
         local_expert_start = self.ep_group.rank() * self.num_local_experts
         output = fused_moe.trtllm_bf16_routed_moe(
-            topk_ids=topk_ids,
+            topk_ids=packed_topk_ids,
             hidden_states=hidden_states,
             gemm1_weights=self._trtllm_fc1_weight,
             gemm2_weights=self._trtllm_fc2_weight,

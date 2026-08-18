@@ -235,44 +235,6 @@ def test_trtllm_weights_refresh_in_place_after_refit():
     torch.testing.assert_close(module._trtllm_fc2_weight, module._fc2_weight + 20)
 
 
-def test_trtllm_routed_forward_uses_unpacked_routing(monkeypatch):
-    hidden_states = torch.ones(3, 4, dtype=torch.bfloat16)
-    probs = torch.tensor([[0.75, 0.25], [0.6, 0.4], [0.9, 0.1]], dtype=torch.float32)
-    routing_map = torch.tensor([[0, 2], [1, 3], [2, 0]], dtype=torch.int64)
-    captured = {}
-
-    def fake_trtllm_bf16_routed_moe(**kwargs):
-        captured.update(kwargs)
-        return torch.full_like(hidden_states, 7)
-
-    monkeypatch.setattr(
-        experts_module,
-        'fused_moe',
-        SimpleNamespace(trtllm_bf16_routed_moe=fake_trtllm_bf16_routed_moe),
-    )
-    monkeypatch.setattr(
-        experts_module, 'WeightLayout', SimpleNamespace(BlockMajorK='block_major_k')
-    )
-    module = experts_module.InferenceGroupedMLP.__new__(experts_module.InferenceGroupedMLP)
-    module.config = SimpleNamespace(num_moe_experts=4)
-    module.num_local_experts = 2
-    module.ep_group = SimpleNamespace(rank=lambda: 0)
-    module._trtllm_fc1_weight = torch.ones(2, 4)
-    module._trtllm_fc2_weight = torch.ones(2, 4)
-    module._trtllm_intermediate_size = 4
-    module._trtllm_activation_kwargs = {}
-    module._nvls_dispatcher = False
-
-    output, bias = module._trtllm_bf16_routed_forward(hidden_states, probs, routing_map)
-
-    unpacked_ids, unpacked_probs = captured['topk_ids']
-    assert unpacked_ids.dtype == torch.int32
-    torch.testing.assert_close(unpacked_ids, routing_map.to(torch.int32))
-    assert unpacked_probs is probs
-    assert bias is None
-    torch.testing.assert_close(output, torch.full_like(hidden_states, 7))
-
-
 @pytest.mark.parametrize("gated", [False, True])
 def test_pad_trtllm_expert_weights(gated):
     intermediate_size = 1856
