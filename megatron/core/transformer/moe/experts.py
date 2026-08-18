@@ -1039,10 +1039,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 self.inference_grouped_gemm_backend
                 == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED
             ):
-                supports_activation_type = (
-                    'activation_type'
-                    in inspect.signature(fused_moe.trtllm_bf16_routed_moe).parameters
-                )
+                trtllm_signature = inspect.signature(fused_moe.trtllm_bf16_routed_moe)
+                supports_activation_type = 'activation_type' in trtllm_signature.parameters
+                self._trtllm_supports_output = 'output' in trtllm_signature.parameters
                 if not supports_activation_type and (
                     self._flashinfer_activation_type != ActivationType.Swiglu
                 ):
@@ -1353,6 +1352,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
         packed_topk_ids = (routing_map.to(torch.int32) << 16) | (
             probs.to(torch.bfloat16).contiguous().view(torch.int16).to(torch.int32)
         )
+        rsv = NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None
+        output_kwargs = {'output': rsv} if self._trtllm_supports_output and rsv is not None else {}
+
         local_expert_start = self.ep_group.rank() * self.num_local_experts
         output = fused_moe.trtllm_bf16_routed_moe(
             topk_ids=packed_topk_ids,
@@ -1372,11 +1374,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
             weight_layout=WeightLayout.BlockMajorK,
             do_finalize=True,
             tune_max_num_tokens=hidden_states.shape[0],
-            output=(
-                NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None
-            ),
+            **output_kwargs,
             **self._trtllm_activation_kwargs,
         )
+        if rsv is not None and not self._trtllm_supports_output:
+            output = rsv.copy_(output)
         return output, None
 
     def forward(
