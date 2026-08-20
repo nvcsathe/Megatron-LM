@@ -60,6 +60,8 @@ run_worker() {
     local node_rank="${SLURM_NODEID:?SLURM_NODEID is required}"
 
     cd "${MEGATRON_ROOT}"
+    # Leave coordinator-host unset so each node binds its MP ZMQ sockets to
+    # its own hostname. The shared rank-0 coordinator address is broadcast.
     exec python -m torch.distributed.run \
         --nnodes="${EXPECTED_NNODES}" \
         --nproc-per-node="${GPUS_PER_NODE}" \
@@ -107,7 +109,6 @@ run_worker() {
         --inference-dynamic-batching-prefix-caching-mamba-gb "${MAMBA_PREFIX_CACHE_GB}" \
         --inference-shards "${INFERENCE_SHARDS}" \
         --disagg-kv-transport-backend nixl \
-        --coordinator-host "${MASTER_ADDR}" \
         --coordinator-port "${COORDINATOR_PORT}" \
         --host 0.0.0.0 \
         --port "${SERVER_PORT}" \
