@@ -27,6 +27,13 @@ fi
 export PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6/55b_hybrid_moe/checkpoints/pre_training_final_lc}"
 export LOAD_CHECKPOINT="${LOAD_CHECKPOINT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/sasatheesh/data/checkpoints/inescapable-sawfly-step108-mcore}"
 export TOKENIZER_MODEL="${TOKENIZER_MODEL:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json}"
+export CONTAINER_IMAGE="${CONTAINER_IMAGE:-/lustre/fsw/portfolios/nemotron/users/csathe/chaitrasathe+dynamo-megatron+mamba.sqsh}"
+export CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-/home:/home,/lustre:/lustre}"
+
+if [[ ! -f "${CONTAINER_IMAGE}" ]]; then
+    echo "Missing container image: ${CONTAINER_IMAGE}" >&2
+    exit 2
+fi
 
 export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 export PREFILL_NODES=2
@@ -51,15 +58,9 @@ export UCX_MEMTYPE_CACHE="${UCX_MEMTYPE_CACHE:-n}"
 
 run_worker() {
     local node_rank="${SLURM_NODEID:?SLURM_NODEID is required}"
-    local python_cmd
-    if command -v uv >/dev/null 2>&1; then
-        python_cmd=(uv run python)
-    else
-        python_cmd=(python)
-    fi
 
     cd "${MEGATRON_ROOT}"
-    exec "${python_cmd[@]}" -m torch.distributed.run \
+    exec python -m torch.distributed.run \
         --nnodes="${EXPECTED_NNODES}" \
         --nproc-per-node="${GPUS_PER_NODE}" \
         --node-rank="${node_rank}" \
@@ -137,14 +138,10 @@ SRUN_ARGS=(
     --ntasks-per-node=1
     --gpus-per-node="${GPUS_PER_NODE}"
     --kill-on-bad-exit=1
+    --container-image="${CONTAINER_IMAGE}"
+    --container-mounts="${CONTAINER_MOUNTS}"
+    --container-workdir="${MEGATRON_ROOT}"
 )
-if [[ -n "${CONTAINER_IMAGE:-}" ]]; then
-    SRUN_ARGS+=(
-        --container-image="${CONTAINER_IMAGE}"
-        --container-mounts="${CONTAINER_MOUNTS:-/home:/home,/lustre:/lustre}"
-        --container-workdir="${MEGATRON_ROOT}"
-    )
-fi
 
 srun "${SRUN_ARGS[@]}" bash "${WORKER_SCRIPT}" --worker &
 SRUN_PID=$!

@@ -7,6 +7,12 @@ This is a four-node BF16 deployment with one OpenAI-compatible endpoint:
 - NIXL transfers KV and Mamba state from prefill to decode; and
 - the native Megatron coordinator exposes the endpoint from the first node.
 
+The launcher follows the Nano-v3 evaluation path: it passes the Dynamo/NIXL
+`.sqsh` directly to `srun`, mounts `/home` and `/lustre`, sets the shared
+Megatron worktree as the container workdir, and launches the container's plain
+`python`. It does not invoke `uv`, so the image's `/opt/dynamo/venv` remains the
+active Python environment.
+
 Submit from the root of a shared Megatron worktree visible on all four nodes.
 The launcher uses `SLURM_SUBMIT_DIR` as `MEGATRON_ROOT`, avoiding SLURM's
 node-local spool copy of the batch script:
@@ -21,8 +27,13 @@ JOB_ID=$(sbatch --parsable \
 echo "Submitted ${JOB_ID}"
 ```
 
-To run in a Pyxis/Enroot container, pass the image in the submission
-environment:
+By default this uses the same image as the Nano-v3 test:
+
+```text
+/lustre/fsw/portfolios/nemotron/users/csathe/chaitrasathe+dynamo-megatron+mamba.sqsh
+```
+
+Override it when needed by exporting `CONTAINER_IMAGE` before submission:
 
 ```bash
 export CONTAINER_IMAGE=/path/to/megatron-nixl.sqsh
