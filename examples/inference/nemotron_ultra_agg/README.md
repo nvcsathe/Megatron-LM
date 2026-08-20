@@ -73,7 +73,7 @@ checkpoint, retain the 256K context but start with a smaller cache profile:
 ```bash
 export INFERENCE_BUFFER_SIZE_GB=8
 export INFERENCE_MAX_TOKENS=4096
-export INFERENCE_MAX_REQUESTS=4
+export INFERENCE_MAX_REQUESTS=8
 ```
 
 Prefix caching can be enabled after the baseline is stable:

@@ -29,7 +29,7 @@ Override the repository and cache paths with `TOKENIZER_MODEL`, `HF_HOME`, and
 `HF_HUB_CACHE`.
 
 The default server profile is intentionally conservative so each BF16 shard
-can boot on eight 184-GiB GB200 GPUs. It uses an 8-GiB KV buffer, a four-request
+can boot on eight 184-GiB GB200 GPUs. It uses an 8-GiB KV buffer, an eight-request
 limit, a 4,096-token batch limit, a 32,768-token sequence limit, and expandable
 PyTorch CUDA allocator segments. Prefix caching is disabled because its Mamba
 state cache and extraction workspace consume additional GPU memory. After a
