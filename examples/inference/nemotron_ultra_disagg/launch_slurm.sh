@@ -52,16 +52,27 @@ export SERVER_PORT="${SERVER_PORT:-5000}"
 export COORDINATOR_PORT="${COORDINATOR_PORT:-5555}"
 export MASTER_PORT="${MASTER_PORT:-29500}"
 export STARTUP_TIMEOUT_SECONDS="${STARTUP_TIMEOUT_SECONDS:-3600}"
-export INFERENCE_BUFFER_SIZE_GB="${INFERENCE_BUFFER_SIZE_GB:-25}"
-export INFERENCE_MAX_TOKENS="${INFERENCE_MAX_TOKENS:-8192}"
-export INFERENCE_MAX_REQUESTS="${INFERENCE_MAX_REQUESTS:-32}"
-export MAMBA_PREFIX_CACHE_GB="${MAMBA_PREFIX_CACHE_GB:-4}"
+export INFERENCE_BUFFER_SIZE_GB="${INFERENCE_BUFFER_SIZE_GB:-8}"
+export INFERENCE_MAX_TOKENS="${INFERENCE_MAX_TOKENS:-4096}"
+export INFERENCE_MAX_REQUESTS="${INFERENCE_MAX_REQUESTS:-4}"
+export INFERENCE_MAX_SEQ_LENGTH="${INFERENCE_MAX_SEQ_LENGTH:-32768}"
+export ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-0}"
+export MAMBA_PREFIX_CACHE_GB="${MAMBA_PREFIX_CACHE_GB:-1}"
 
 # GB200 does not require a CUDA_DEVICE_MAX_CONNECTIONS override.
 export UCX_MEMTYPE_CACHE="${UCX_MEMTYPE_CACHE:-n}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 run_worker() {
     local node_rank="${SLURM_NODEID:?SLURM_NODEID is required}"
+    local -a prefix_cache_args=()
+    if [[ "${ENABLE_PREFIX_CACHING}" == "1" ]]; then
+        prefix_cache_args=(
+            --inference-dynamic-batching-prefix-caching
+            --inference-dynamic-batching-prefix-caching-eviction-policy lru
+            --inference-dynamic-batching-prefix-caching-mamba-gb "${MAMBA_PREFIX_CACHE_GB}"
+        )
+    fi
 
     cd "${MEGATRON_ROOT}"
     # Leave coordinator-host unset so each node binds its MP ZMQ sockets to
@@ -93,9 +104,9 @@ run_worker() {
         --moe-shared-expert-overlap \
         --use-checkpoint-args \
         --dist-ckpt-strictness log_unexpected \
-        --seq-length 262144 \
-        --max-position-embeddings 262144 \
-        --inference-max-seq-length 262144 \
+        --seq-length "${INFERENCE_MAX_SEQ_LENGTH}" \
+        --max-position-embeddings "${INFERENCE_MAX_SEQ_LENGTH}" \
+        --inference-max-seq-length "${INFERENCE_MAX_SEQ_LENGTH}" \
         --transformer-impl inference_optimized \
         --inference-grouped-gemm-backend vllm \
         --inference-use-synchronous-zmq-collectives \
@@ -110,9 +121,7 @@ run_worker() {
         --inference-dynamic-batching-max-tokens "${INFERENCE_MAX_TOKENS}" \
         --inference-dynamic-batching-max-requests "${INFERENCE_MAX_REQUESTS}" \
         --enable-chunked-prefill \
-        --inference-dynamic-batching-prefix-caching \
-        --inference-dynamic-batching-prefix-caching-eviction-policy lru \
-        --inference-dynamic-batching-prefix-caching-mamba-gb "${MAMBA_PREFIX_CACHE_GB}" \
+        "${prefix_cache_args[@]}" \
         --inference-shards "${INFERENCE_SHARDS}" \
         --disagg-kv-transport-backend nixl \
         --coordinator-port "${COORDINATOR_PORT}" \

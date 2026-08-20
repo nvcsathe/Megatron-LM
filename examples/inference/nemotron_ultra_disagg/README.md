@@ -28,6 +28,15 @@ checkpoint metadata from changing the launcher back to `TikTokenizer`.
 Override the repository and cache paths with `TOKENIZER_MODEL`, `HF_HOME`, and
 `HF_HUB_CACHE`.
 
+The default server profile is intentionally conservative so each BF16 shard
+can boot on eight 184-GiB GB200 GPUs. It uses an 8-GiB KV buffer, a four-request
+limit, a 4,096-token batch limit, a 32,768-token sequence limit, and expandable
+PyTorch CUDA allocator segments. Prefix caching is disabled because its Mamba
+state cache and extraction workspace consume additional GPU memory. After a
+baseline deployment is stable, opt in with `ENABLE_PREFIX_CACHING=1`; its
+default Mamba cache budget is 1 GiB. All limits can be overridden through the
+corresponding launcher environment variables.
+
 Submit from the root of a shared Megatron worktree visible on all four nodes.
 The launcher uses `SLURM_SUBMIT_DIR` as `MEGATRON_ROOT`, avoiding SLURM's
 node-local spool copy of the batch script:
