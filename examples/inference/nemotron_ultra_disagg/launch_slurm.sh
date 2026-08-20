@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Two-node native disaggregated Nemotron Ultra deployment:
-#   node 0: prefill, TP=4 / EP=4 / dense-DP=1
-#   node 1: decode,  TP=4 / EP=4 / dense-DP=1
+# Four-node native disaggregated Nemotron Ultra BF16 deployment:
+#   nodes 0-1: prefill, TP=8 / EP=8 / dense-DP=1
+#   nodes 2-3: decode,  TP=8 / EP=8 / dense-DP=1
 #
 # Submit with:
 #   sbatch --account=<account> --partition=<partition> launch_slurm.sh
 
 #SBATCH --job-name=ultra-disagg
-#SBATCH --nodes=2
+#SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
 #SBATCH --exclusive
@@ -16,19 +16,24 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export MEGATRON_ROOT="${MEGATRON_ROOT:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}"
+export MEGATRON_ROOT="${MEGATRON_ROOT:-${SLURM_SUBMIT_DIR:?SLURM_SUBMIT_DIR is required}}"
+export WORKER_SCRIPT="${MEGATRON_ROOT}/examples/inference/nemotron_ultra_disagg/launch_slurm.sh"
+if [[ ! -f "${WORKER_SCRIPT}" ]]; then
+    echo "Worker script is not visible at ${WORKER_SCRIPT}." >&2
+    echo "Submit from the shared Megatron-LM worktree or export MEGATRON_ROOT explicitly." >&2
+    exit 2
+fi
 
 export PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6/55b_hybrid_moe/checkpoints/pre_training_final_lc}"
 export LOAD_CHECKPOINT="${LOAD_CHECKPOINT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/sasatheesh/data/checkpoints/inescapable-sawfly-step108-mcore}"
 export TOKENIZER_MODEL="${TOKENIZER_MODEL:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json}"
 
 export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
-export PREFILL_NODES=1
-export DECODE_NODES=1
+export PREFILL_NODES=2
+export DECODE_NODES=2
 export EXPECTED_NNODES=$((PREFILL_NODES + DECODE_NODES))
 export SHARD_WORLD_SIZE=$((PREFILL_NODES * GPUS_PER_NODE))
-export TP_SIZE="${TP_SIZE:-${GPUS_PER_NODE}}"
+export TP_SIZE="${TP_SIZE:-8}"
 export DENSE_DP_SIZE=$((SHARD_WORLD_SIZE / TP_SIZE))
 export INFERENCE_SHARDS="tp=${TP_SIZE},pp=1,ep=${SHARD_WORLD_SIZE},expt_tp=1,dp=${DENSE_DP_SIZE},role=prefill+tp=${TP_SIZE},pp=1,ep=${SHARD_WORLD_SIZE},expt_tp=1,dp=${DENSE_DP_SIZE},role=decode"
 
@@ -114,11 +119,11 @@ if [[ "${1:-}" == "--worker" ]]; then
 fi
 
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
-    echo "Run this script with sbatch (it requires two allocated nodes)." >&2
+    echo "Run this script with sbatch (it requires four allocated nodes)." >&2
     exit 2
 fi
 if [[ "${SLURM_NNODES}" -ne "${EXPECTED_NNODES}" ]]; then
-    echo "Expected ${EXPECTED_NNODES} nodes (1 prefill + 1 decode); got ${SLURM_NNODES}." >&2
+    echo "Expected ${EXPECTED_NNODES} nodes (2 prefill + 2 decode); got ${SLURM_NNODES}." >&2
     exit 2
 fi
 
@@ -141,7 +146,7 @@ if [[ -n "${CONTAINER_IMAGE:-}" ]]; then
     )
 fi
 
-srun "${SRUN_ARGS[@]}" bash "${SCRIPT_DIR}/launch_slurm.sh" --worker &
+srun "${SRUN_ARGS[@]}" bash "${WORKER_SCRIPT}" --worker &
 SRUN_PID=$!
 
 cleanup() {

@@ -1,15 +1,19 @@
 # Nemotron Ultra native disaggregated deployment
 
-This is a minimal two-node deployment with one OpenAI-compatible endpoint:
+This is a four-node BF16 deployment with one OpenAI-compatible endpoint:
 
-- node 0: four-GPU GB200 prefill shard, TP=4, EP=4, expert-TP=1, dense-DP=1;
-- node 1: four-GPU GB200 decode shard, TP=4, EP=4, expert-TP=1, dense-DP=1;
+- nodes 0–1: eight-GPU GB200 prefill shard, TP=8, EP=8, expert-TP=1, dense-DP=1;
+- nodes 2–3: eight-GPU GB200 decode shard, TP=8, EP=8, expert-TP=1, dense-DP=1;
 - NIXL transfers KV and Mamba state from prefill to decode; and
 - the native Megatron coordinator exposes the endpoint from the first node.
 
-Submit from a shared Megatron worktree visible on both nodes:
+Submit from the root of a shared Megatron worktree visible on all four nodes.
+The launcher uses `SLURM_SUBMIT_DIR` as `MEGATRON_ROOT`, avoiding SLURM's
+node-local spool copy of the batch script:
 
 ```bash
+cd /lustre/fsw/portfolios/nemotron/users/csathe/Megatron-LM
+export MEGATRON_ROOT="$PWD"
 JOB_ID=$(sbatch --parsable \
   --account=<account> \
   --partition=<partition> \
@@ -22,6 +26,7 @@ environment:
 
 ```bash
 export CONTAINER_IMAGE=/path/to/megatron-nixl.sqsh
+export MEGATRON_ROOT="$PWD"
 JOB_ID=$(sbatch --parsable --export=ALL \
   --account=<account> \
   --partition=<partition> \
