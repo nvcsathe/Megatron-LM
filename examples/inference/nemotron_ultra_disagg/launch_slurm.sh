@@ -144,6 +144,7 @@ srun \
     --container-workdir="${MEGATRON_ROOT}" \
     bash -c '
         set -euo pipefail
+        export PYTHONPATH="${PYTHON_DEPS_DIR}:${PYTHONPATH:-}"
         if ! python -c "import hypercorn, quart" >/dev/null 2>&1; then
             echo "Installing quart==0.20.0 and its Hypercorn dependency."
             mkdir -p "${PYTHON_DEPS_DIR}"
