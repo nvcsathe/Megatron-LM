@@ -29,6 +29,8 @@ export LOAD_CHECKPOINT="${LOAD_CHECKPOINT:-/lustre/fs1/portfolios/llmservice/pro
 export TOKENIZER_MODEL="${TOKENIZER_MODEL:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json}"
 export CONTAINER_IMAGE="${CONTAINER_IMAGE:-/lustre/fsw/portfolios/nemotron/users/csathe/chaitrasathe+dynamo-megatron+mamba.sqsh}"
 export CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-/home:/home,/lustre:/lustre}"
+export PYTHON_DEPS_DIR="${PYTHON_DEPS_DIR:-${MEGATRON_ROOT}/.runtime-deps/nemotron-ultra-py312}"
+export PYTHONPATH="${PYTHON_DEPS_DIR}:${PYTHONPATH:-}"
 
 if [[ ! -f "${CONTAINER_IMAGE}" ]]; then
     echo "Missing container image: ${CONTAINER_IMAGE}" >&2
@@ -132,6 +134,27 @@ fi
 export MASTER_ADDR="${MASTER_ADDR:-$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n 1)}"
 export ENDPOINT_HOST="${ENDPOINT_HOST:-${MASTER_ADDR}}"
 export ENDPOINT_FILE="${ENDPOINT_FILE:-${MEGATRON_ROOT}/ultra-disagg-${SLURM_JOB_ID}.endpoint}"
+
+echo "Checking Quart/Hypercorn in ${PYTHON_DEPS_DIR}."
+srun \
+    --nodes=1 \
+    --ntasks=1 \
+    --container-image="${CONTAINER_IMAGE}" \
+    --container-mounts="${CONTAINER_MOUNTS}" \
+    --container-workdir="${MEGATRON_ROOT}" \
+    bash -c '
+        set -euo pipefail
+        if ! python -c "import hypercorn, quart" >/dev/null 2>&1; then
+            echo "Installing quart==0.20.0 and its Hypercorn dependency."
+            mkdir -p "${PYTHON_DEPS_DIR}"
+            python -m pip install \
+                --disable-pip-version-check \
+                --upgrade \
+                --target "${PYTHON_DEPS_DIR}" \
+                "quart==0.20.0"
+        fi
+        python -c "import hypercorn, quart"
+    '
 
 SRUN_ARGS=(
     --nodes="${EXPECTED_NNODES}"

@@ -13,6 +13,12 @@ Megatron worktree as the container workdir, and launches the container's plain
 `python`. It does not invoke `uv`, so the image's `/opt/dynamo/venv` remains the
 active Python environment.
 
+Before starting the distributed workers, the launcher opens a one-node
+container step and installs `quart==0.20.0` (including Hypercorn) into the
+shared `${MEGATRON_ROOT}/.runtime-deps/nemotron-ultra-py312` overlay when it is
+not already importable. The overlay is added to `PYTHONPATH` for every worker
+and reused by later jobs. Override its location with `PYTHON_DEPS_DIR`.
+
 Submit from the root of a shared Megatron worktree visible on all four nodes.
 The launcher uses `SLURM_SUBMIT_DIR` as `MEGATRON_ROOT`, avoiding SLURM's
 node-local spool copy of the batch script:
