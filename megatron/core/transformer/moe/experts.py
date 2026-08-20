@@ -4,7 +4,7 @@ from __future__ import annotations
 import inspect
 import logging
 from collections.abc import Callable
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from itertools import chain
@@ -23,6 +23,7 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
+from megatron.core.inference.moe.trtllm_finalize import padding_aware_finalize
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -76,46 +77,17 @@ else:
 
 try:
     import flashinfer.fused_moe as fused_moe
-    import flashinfer.fused_moe.core as flashinfer_moe_core
     from flashinfer.fused_moe.core import ActivationType, WeightLayout
 
     HAVE_FLASHINFER = True
 except ImportError:
     HAVE_FLASHINFER = False
-    flashinfer_moe_core = None
     WeightLayout = None
 
 from megatron.core.inference.moe import ActivationType as McoreActivationType
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
 
 logger = logging.getLogger(__name__)
-
-
-@contextmanager
-def _unsafe_allow_flashinfer_fp32_rsv_output(output: torch.Tensor | None):
-    """Bypass FlashInfer's BF16 output check for an FP32 RSV experiment.
-
-    The TRT-LLM BF16 routed kernel may still issue BF16 stores into this FP32
-    tensor. This helper intentionally changes no tensor metadata and exists only
-    to measure the no-copy path; it does not make the dtype combination correct.
-    """
-    if output is None or output.dtype != torch.float32:
-        yield
-        return
-
-    assert flashinfer_moe_core is not None
-    original_validate = flashinfer_moe_core.check_shape_dtype_device
-
-    def validate_allowing_fp32_output(tensor, shape, dtype, device, name):
-        if tensor is output and name == "output" and dtype == torch.bfloat16:
-            dtype = torch.float32
-        return original_validate(tensor, shape, dtype, device, name)
-
-    flashinfer_moe_core.check_shape_dtype_device = validate_allowing_fp32_output
-    try:
-        yield
-    finally:
-        flashinfer_moe_core.check_shape_dtype_device = original_validate
 
 
 class GroupedLinearFc1Interface(Protocol):
@@ -1053,10 +1025,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
 
-        if (
-            self.inference_grouped_gemm_backend
-            == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED
-        ):
+        if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED:
             self._trtllm_permute_indices = {}
             self._trtllm_intermediate_size = None
             self.register_buffer('_trtllm_fc1_weight', None, persistent=False)
@@ -1070,7 +1039,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
             ):
                 trtllm_signature = inspect.signature(fused_moe.trtllm_bf16_routed_moe)
                 supports_activation_type = 'activation_type' in trtllm_signature.parameters
-                self._trtllm_supports_output = 'output' in trtllm_signature.parameters
                 if not supports_activation_type and (
                     self._flashinfer_activation_type != ActivationType.Swiglu
                 ):
@@ -1330,14 +1298,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
             )
 
             fc1_weights.append(
-                convert_to_block_layout(fc1[fc1_indices].contiguous(), block_k).view(
-                    torch.bfloat16
-                )
+                convert_to_block_layout(fc1[fc1_indices].contiguous(), block_k).view(torch.bfloat16)
             )
             fc2_weights.append(
-                convert_to_block_layout(fc2[fc2_indices].contiguous(), block_k).view(
-                    torch.bfloat16
-                )
+                convert_to_block_layout(fc2[fc2_indices].contiguous(), block_k).view(torch.bfloat16)
             )
 
         return torch.stack(fc1_weights), torch.stack(fc2_weights)
@@ -1364,8 +1328,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _post_refit(self):
         """Refresh derived TRT-LLM weights after the canonical weights are refit."""
         if (
-            self.inference_grouped_gemm_backend
-            == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED
+            self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED
             and self._concatenated_weights_built
         ):
             self._refresh_trtllm_weights()
@@ -1382,34 +1345,43 @@ class InferenceGroupedMLP(TEGroupedMLP):
             probs.to(torch.bfloat16).contiguous().view(torch.int16).to(torch.int32)
         )
         rsv = NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None
-        output_kwargs = {'output': rsv} if self._trtllm_supports_output and rsv is not None else {}
-
         local_expert_start = self.ep_group.rank() * self.num_local_experts
-        output_override = rsv if self._trtllm_supports_output else None
-        with _unsafe_allow_flashinfer_fp32_rsv_output(output_override):
-            output = fused_moe.trtllm_bf16_routed_moe(
-                topk_ids=packed_topk_ids,
-                hidden_states=hidden_states,
-                gemm1_weights=self._trtllm_fc1_weight,
-                gemm2_weights=self._trtllm_fc2_weight,
-                num_experts=not_none(self.config.num_moe_experts),
+        output = fused_moe.trtllm_bf16_routed_moe(
+            topk_ids=packed_topk_ids,
+            hidden_states=hidden_states,
+            gemm1_weights=self._trtllm_fc1_weight,
+            gemm2_weights=self._trtllm_fc2_weight,
+            num_experts=not_none(self.config.num_moe_experts),
+            top_k=routing_map.shape[1],
+            n_group=None,
+            topk_group=None,
+            intermediate_size=not_none(self._trtllm_intermediate_size),
+            local_expert_offset=local_expert_start,
+            local_num_experts=self.num_local_experts,
+            routed_scaling_factor=None,
+            routing_method_type=0,
+            use_shuffled_weight=True,
+            weight_layout=WeightLayout.BlockMajorK,
+            do_finalize=not self._nvls_dispatcher,
+            tune_max_num_tokens=hidden_states.shape[0],
+            **self._trtllm_activation_kwargs,
+        )
+        if self._nvls_dispatcher:
+            if rsv is None:
+                raise RuntimeError("TRT-LLM routed MoE NVLS output buffer is not initialized.")
+            if not isinstance(output, (list, tuple)) or len(output) < 3:
+                raise RuntimeError(
+                    "FlashInfer trtllm_bf16_routed_moe(do_finalize=False) must return "
+                    "[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]."
+                )
+            output = padding_aware_finalize(
+                gemm2_output=output[0],
+                expert_weights=output[1],
+                inverse_map=output[2],
+                output=rsv,
+                valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
                 top_k=routing_map.shape[1],
-                n_group=None,
-                topk_group=None,
-                intermediate_size=not_none(self._trtllm_intermediate_size),
-                local_expert_offset=local_expert_start,
-                local_num_experts=self.num_local_experts,
-                routed_scaling_factor=None,
-                routing_method_type=0,
-                use_shuffled_weight=True,
-                weight_layout=WeightLayout.BlockMajorK,
-                do_finalize=True,
-                tune_max_num_tokens=hidden_states.shape[0],
-                **output_kwargs,
-                **self._trtllm_activation_kwargs,
             )
-        if rsv is not None and not self._trtllm_supports_output:
-            output = rsv.copy_(output)
         return output, None
 
     def forward(
@@ -1472,10 +1444,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return self._vllm_forward(
                 permuted_local_hidden_states, permuted_probs, routing_map=routing_map
             )
-        elif (
-            self.inference_grouped_gemm_backend
-            == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED
-        ):
+        elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TRTLLM_BF16_ROUTED:
             return self._trtllm_bf16_routed_forward(
                 permuted_local_hidden_states, permuted_probs, routing_map=routing_map
             )

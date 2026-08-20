@@ -235,29 +235,70 @@ def test_trtllm_weights_refresh_in_place_after_refit():
     torch.testing.assert_close(module._trtllm_fc2_weight, module._fc2_weight + 20)
 
 
-def test_unsafe_flashinfer_fp32_rsv_output_validation_bypass(monkeypatch):
-    validation_calls = []
+def test_trtllm_routed_nvls_uses_padding_aware_finalizer(monkeypatch):
+    module = experts_module.InferenceGroupedMLP.__new__(experts_module.InferenceGroupedMLP)
+    torch.nn.Module.__init__(module)
+    module.config = SimpleNamespace(num_moe_experts=8)
+    module.num_local_experts = 2
+    module.ep_group = SimpleNamespace(rank=lambda: 1)
+    module._nvls_dispatcher = True
+    module._trtllm_intermediate_size = 4
+    module._trtllm_fc1_weight = torch.empty(2, 4)
+    module._trtllm_fc2_weight = torch.empty(2, 4)
+    module._trtllm_activation_kwargs = {}
 
-    def validate(tensor, shape, dtype, device, name):
-        validation_calls.append((tensor, shape, dtype, device, name))
+    hidden_states = torch.zeros(4, 3, dtype=torch.bfloat16)
+    probs = torch.full((4, 2), 0.5, dtype=torch.float32)
+    routing_map = torch.tensor([[0, 2], [1, 3], [-1, -1], [6, 7]], dtype=torch.int64)
+    rsv = torch.empty(4, 3, dtype=torch.float32)
+    valid_tokens = torch.tensor([3], dtype=torch.int32)
+    raw_outputs = (
+        torch.empty(8, 3, dtype=torch.bfloat16),
+        torch.empty(4, 2, dtype=torch.bfloat16),
+        torch.empty(4, 2, dtype=torch.int32),
+    )
+    fused_kwargs = {}
+    finalize_kwargs = {}
 
-    fake_flashinfer_core = SimpleNamespace(check_shape_dtype_device=validate)
-    monkeypatch.setattr(experts_module, "flashinfer_moe_core", fake_flashinfer_core)
-    rsv = torch.empty(2, 4, dtype=torch.float32)
+    def routed_moe(**kwargs):
+        fused_kwargs.update(kwargs)
+        return raw_outputs
 
-    with experts_module._unsafe_allow_flashinfer_fp32_rsv_output(rsv):
-        fake_flashinfer_core.check_shape_dtype_device(
-            rsv, rsv.shape, torch.bfloat16, rsv.device, "output"
-        )
+    def finalize(**kwargs):
+        finalize_kwargs.update(kwargs)
+        return kwargs['output']
 
-    assert len(validation_calls) == 1
-    tensor, shape, dtype, device, name = validation_calls[0]
-    assert tensor is rsv
-    assert shape == rsv.shape
-    assert dtype == torch.float32
-    assert device == rsv.device
-    assert name == "output"
-    assert fake_flashinfer_core.check_shape_dtype_device is validate
+    monkeypatch.setattr(
+        experts_module,
+        "fused_moe",
+        SimpleNamespace(trtllm_bf16_routed_moe=routed_moe),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        experts_module.NVLSAllGatherVDispatcher, "_get_rsv_tensor", classmethod(lambda cls: rsv)
+    )
+    monkeypatch.setattr(
+        experts_module.InferenceAllGatherDispatcherBase,
+        "_valid_tokens",
+        classmethod(lambda cls: valid_tokens),
+    )
+    monkeypatch.setattr(experts_module, "padding_aware_finalize", finalize)
+    monkeypatch.setattr(experts_module, "WeightLayout", SimpleNamespace(BlockMajorK=2))
+
+    output, bias = module._trtllm_bf16_routed_forward(hidden_states, probs, routing_map)
+
+    assert output is rsv
+    assert bias is None
+    assert fused_kwargs['do_finalize'] is False
+    assert 'output' not in fused_kwargs
+    assert finalize_kwargs == {
+        'gemm2_output': raw_outputs[0],
+        'expert_weights': raw_outputs[1],
+        'inverse_map': raw_outputs[2],
+        'output': rsv,
+        'valid_tokens': valid_tokens,
+        'top_k': 2,
+    }
 
 
 @pytest.mark.parametrize("gated", [False, True])
@@ -285,9 +326,7 @@ def test_pad_trtllm_expert_weights(gated):
             padded_fc1[padded_intermediate_size : padded_intermediate_size + intermediate_size],
             fc1[intermediate_size:],
         )
-        assert torch.count_nonzero(
-            padded_fc1[padded_intermediate_size + intermediate_size :]
-        ) == 0
+        assert torch.count_nonzero(padded_fc1[padded_intermediate_size + intermediate_size :]) == 0
     torch.testing.assert_close(padded_fc2[:, :intermediate_size], fc2)
     assert torch.count_nonzero(padded_fc2[:, intermediate_size:]) == 0
 
