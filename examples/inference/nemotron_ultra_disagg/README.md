@@ -19,6 +19,15 @@ shared `${MEGATRON_ROOT}/.runtime-deps/nemotron-ultra-py312` overlay when it is
 not already importable. The overlay is added to `PYTHONPATH` for every worker
 and reused by later jobs. Override its location with `PYTHON_DEPS_DIR`.
 
+The tokenizer is the official fast Hugging Face tokenizer and chat template
+from `nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16`. The bootstrap step caches
+it once under `${MEGATRON_ROOT}/.runtime-deps/huggingface`, verifies that
+`AutoTokenizer` selected a fast tokenizer, and shares the cache with every
+worker. `--no-use-tokenizer-model-from-checkpoint-args` prevents the Megatron
+checkpoint metadata from changing the launcher back to `TikTokenizer`.
+Override the repository and cache paths with `TOKENIZER_MODEL`, `HF_HOME`, and
+`HF_HUB_CACHE`.
+
 Submit from the root of a shared Megatron worktree visible on all four nodes.
 The launcher uses `SLURM_SUBMIT_DIR` as `MEGATRON_ROOT`, avoiding SLURM's
 node-local spool copy of the batch script:

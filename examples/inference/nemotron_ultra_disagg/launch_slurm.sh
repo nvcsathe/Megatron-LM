@@ -26,11 +26,13 @@ fi
 
 export PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6/55b_hybrid_moe/checkpoints/pre_training_final_lc}"
 export LOAD_CHECKPOINT="${LOAD_CHECKPOINT:-/lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/sasatheesh/data/checkpoints/inescapable-sawfly-step108-mcore}"
-export TOKENIZER_MODEL="${TOKENIZER_MODEL:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json}"
+export TOKENIZER_MODEL="${TOKENIZER_MODEL:-nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16}"
 export CONTAINER_IMAGE="${CONTAINER_IMAGE:-/lustre/fsw/portfolios/nemotron/users/csathe/chaitrasathe+dynamo-megatron+mamba.sqsh}"
 export CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-/home:/home,/lustre:/lustre}"
 export PYTHON_DEPS_DIR="${PYTHON_DEPS_DIR:-${MEGATRON_ROOT}/.runtime-deps/nemotron-ultra-py312}"
 export PYTHONPATH="${PYTHON_DEPS_DIR}:${PYTHONPATH:-}"
+export HF_HOME="${HF_HOME:-${MEGATRON_ROOT}/.runtime-deps/huggingface}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-${HF_HOME}/hub}"
 
 if [[ ! -f "${CONTAINER_IMAGE}" ]]; then
     echo "Missing container image: ${CONTAINER_IMAGE}" >&2
@@ -73,7 +75,9 @@ run_worker() {
         -m examples.inference.launch_inference_server \
         --pretrained-checkpoint "${PRETRAINED_CHECKPOINT}" \
         --load "${LOAD_CHECKPOINT}" \
+        --tokenizer-type HuggingFaceTokenizer \
         --tokenizer-model "${TOKENIZER_MODEL}" \
+        --no-use-tokenizer-model-from-checkpoint-args \
         --model-provider mamba \
         --tensor-model-parallel-size "${TP_SIZE}" \
         --pipeline-model-parallel-size 1 \
@@ -145,6 +149,8 @@ srun \
     bash -c '
         set -euo pipefail
         export PYTHONPATH="${PYTHON_DEPS_DIR}:${PYTHONPATH:-}"
+        export HF_HOME="${HF_HOME}"
+        export HF_HUB_CACHE="${HF_HUB_CACHE}"
         if ! python -c "import hypercorn, quart" >/dev/null 2>&1; then
             echo "Installing quart==0.20.0 and its Hypercorn dependency."
             mkdir -p "${PYTHON_DEPS_DIR}"
@@ -155,6 +161,8 @@ srun \
                 "quart==0.20.0"
         fi
         python -c "import hypercorn, quart"
+        echo "Caching official Hugging Face tokenizer ${TOKENIZER_MODEL}."
+        python -c "import os; from transformers import AutoTokenizer; tokenizer = AutoTokenizer.from_pretrained(os.environ.get(\"TOKENIZER_MODEL\"), use_fast=True); assert tokenizer.is_fast, \"Official Ultra tokenizer did not resolve to a fast tokenizer\""
     '
 
 SRUN_ARGS=(
