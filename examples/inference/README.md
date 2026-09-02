@@ -199,6 +199,7 @@ for routing metrics — that file handles lightweight count monitoring
 ### See also
 
 - API reference: [`megatron/core/inference/README.md`](../../megatron/core/inference/README.md)
+- Dynamo disaggregated smoke test: [`nemotron_super_disagg_dynamo/`](nemotron_super_disagg_dynamo/)
 - Low-level engine: [`megatron/core/inference/`](../../megatron/core/inference/)
 - Functional tests: `tests/functional_tests/test_cases/gpt/gpt_offline_inference_*` + `gpt_inference_server_smoke_*`
 - Unit tests: `tests/unit_tests/inference/high_level_api/`
