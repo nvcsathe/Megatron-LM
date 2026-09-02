@@ -48,9 +48,9 @@ if [[ ! -d "${LOAD_CHECKPOINT}" ]]; then
     exit 2
 fi
 
-# Give every batch job its own block of ports. With ten ports per block, the
-# computed defaults range from 20000 through 59997 and remain valid TCP ports.
-export JOB_PORT_BASE="${JOB_PORT_BASE:-$((20000 + (10#${SLURM_JOB_ID} % 4000) * 10))}"
+# Use the established Dynamo test port block by default. Override JOB_PORT_BASE
+# when running concurrent jobs on nodes that share a network namespace.
+export JOB_PORT_BASE="${JOB_PORT_BASE:-30000}"
 export HTTP_PORT="${HTTP_PORT:-${JOB_PORT_BASE}}"
 export ETCD_PORT="${ETCD_PORT:-$((JOB_PORT_BASE + 1))}"
 export ETCD_PEER_PORT="${ETCD_PEER_PORT:-$((JOB_PORT_BASE + 2))}"
@@ -73,13 +73,11 @@ export CONTROL_STATE_DIR="${CONTROL_STATE_DIR:-/tmp/nemotron-super-dynamo-disagg
 # Dynamo uses these addresses for cross-node discovery and messaging.
 export ETCD_ENDPOINTS="http://${CONTROL_HOST:-127.0.0.1}:${ETCD_PORT}"
 export NATS_SERVER="nats://${CONTROL_HOST:-127.0.0.1}:${NATS_PORT}"
-# Match the two-node Nano configuration: use the InfiniBand transport, stage
-# CUDA memory through cuda_copy, and force rendezvous transfers. Assign these
-# explicitly so inherited or container defaults cannot re-enable gdr_copy.
-export UCX_TLS="ib,cuda_copy"
-export UCX_RNDV_THRESH="0"
-export UCX_NET_DEVICES="all"
-export UCX_MEMTYPE_CACHE="n"
+# Match the validated two-node Nano disaggregation harness. Use dedicated
+# override variables so inherited or container UCX settings cannot re-enable
+# gdr_copy accidentally.
+export UCX_TLS="${UCX_TLS_OVERRIDE:-cuda_ipc,cuda_copy,tcp,shm,cma,self}"
+export UCX_MEMTYPE_CACHE="${UCX_MEMTYPE_CACHE_OVERRIDE:-n}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 # CUDA_DEVICE_MAX_CONNECTIONS is intentionally left unset for GB200. Export it
 # as 1 before submission when adapting this non-FSDP TP profile to Hopper.
@@ -340,7 +338,6 @@ run_decode_node() {
 
 if [[ "${1:-}" == "--worker" ]]; then
     echo "SLURM task ${SLURM_PROCID:-unknown}: UCX_TLS=${UCX_TLS}," \
-        "UCX_RNDV_THRESH=${UCX_RNDV_THRESH}, UCX_NET_DEVICES=${UCX_NET_DEVICES}," \
         "UCX_MEMTYPE_CACHE=${UCX_MEMTYPE_CACHE}"
     case "${SLURM_PROCID:?SLURM_PROCID is required}" in
         0) run_control_node ;;

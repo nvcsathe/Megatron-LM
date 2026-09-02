@@ -45,11 +45,12 @@ the response are retained under
 for diagnosis. The job-specific suffix is always derived from the current
 allocation so an inherited path cannot mix artifacts from different jobs.
 
-The batch allocation derives a unique block of frontend, etcd, NATS,
-coordinator, and Dynamo status ports from `SLURM_JOB_ID`. It also keeps the
-mutable etcd and NATS JetStream databases in the control node's container-local
-`/tmp/nemotron-super-dynamo-disagg-${SLURM_JOB_ID}`. Only logs and worker
-registration files are written to the shared worktree.
+The batch allocation defaults to `JOB_PORT_BASE=30000`, using ports 30000–30007
+for the frontend, etcd, NATS, coordinator, and Dynamo status endpoints. Override
+`JOB_PORT_BASE` when running concurrent jobs on nodes that share a network
+namespace. Mutable etcd and NATS JetStream databases remain in the control
+node's container-local `/tmp/nemotron-super-dynamo-disagg-${SLURM_JOB_ID}`.
+Only logs and worker registration files are written to the shared worktree.
 
 Override `LOAD_CHECKPOINT`, `TOKENIZER_MODEL`, `SERVED_MODEL_NAME`,
 `CONTAINER_IMAGE`, `CONTAINER_MOUNTS`, ports, or the startup/request timeouts
@@ -57,8 +58,8 @@ through environment variables before submission. The four-GPU replica
 parallelism is fixed to the validated TP=2, EP=4, expert-TP=1 profile. The
 launcher leaves `CUDA_DEVICE_MAX_CONNECTIONS` unset for GB200; if this profile
 is adapted to pre-Blackwell hardware, export `CUDA_DEVICE_MAX_CONNECTIONS=1`
-before submission. The launcher uses the Nano-tested two-node UCX settings:
-`UCX_TLS=ib,cuda_copy`, `UCX_RNDV_THRESH=0`, `UCX_NET_DEVICES=all`, and
-`UCX_MEMTYPE_CACHE=n`. These are assigned explicitly so inherited or container
-defaults cannot re-enable `gdr_copy`, which cannot register these
-stream-ordered/expandable CUDA allocations.
+before submission. The launcher uses the validated two-node Nano
+disaggregation settings: `UCX_TLS=cuda_ipc,cuda_copy,tcp,shm,cma,self` and
+`UCX_MEMTYPE_CACHE=n`. Use `UCX_TLS_OVERRIDE` or
+`UCX_MEMTYPE_CACHE_OVERRIDE` to intentionally change them; ambient UCX or
+container defaults cannot otherwise re-enable `gdr_copy`.
