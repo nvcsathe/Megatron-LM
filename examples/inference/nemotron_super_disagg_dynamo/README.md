@@ -24,16 +24,15 @@ on both nodes.
 
 ```bash
 cd /path/to/Megatron-LM
-export MEGATRON_ROOT="$PWD"
-export CONTAINER_IMAGE=/path/to/dynamo-megatron.sqsh
-
-sbatch --export=ALL --account=<account> --partition=<partition> \
+sbatch --account=<account> --partition=<partition> \
   examples/inference/nemotron_super_disagg_dynamo/run_slurm_test.sh
 ```
 
-The default checkpoint and tokenizer are:
+The script is self-contained for the Nemotron cluster environment. Its default
+container, checkpoint, and tokenizer are:
 
 ```text
+/lustre/fsw/portfolios/nemotron/users/csathe/chaitrasathe+dynamo-megatron+mamba-dynamo-1.3.1.sqsh
 /lustre/fsw/portfolios/nemotron/projects/nemotron_sw_pre/users/ksanthanam/nemotron-3-super-120b-a12b
 nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16
 ```
@@ -44,10 +43,16 @@ that the response contains generated text, and shuts everything down. Logs and
 the response are retained under
 `logs/nemotron-super-dynamo-disagg-${SLURM_JOB_ID}` for diagnosis.
 
+The batch allocation derives a unique block of frontend, etcd, NATS,
+coordinator, and Dynamo status ports from `SLURM_JOB_ID`. It also keeps the
+mutable etcd and NATS JetStream databases in the control node's container-local
+`/tmp/nemotron-super-dynamo-disagg-${SLURM_JOB_ID}`. Only logs and worker
+registration files are written to the shared worktree.
+
 Override `LOAD_CHECKPOINT`, `TOKENIZER_MODEL`, `SERVED_MODEL_NAME`,
-`CONTAINER_MOUNTS`, ports, or the startup/request timeouts through environment
-variables before submission. The four-GPU replica parallelism is fixed to the
-validated TP=2, EP=4, expert-TP=1 profile. The launcher leaves
-`CUDA_DEVICE_MAX_CONNECTIONS` unset for GB200; if this profile is adapted to
-pre-Blackwell hardware, export `CUDA_DEVICE_MAX_CONNECTIONS=1` before
-submission.
+`CONTAINER_IMAGE`, `CONTAINER_MOUNTS`, ports, or the startup/request timeouts
+through environment variables before submission. The four-GPU replica
+parallelism is fixed to the validated TP=2, EP=4, expert-TP=1 profile. The
+launcher leaves `CUDA_DEVICE_MAX_CONNECTIONS` unset for GB200; if this profile
+is adapted to pre-Blackwell hardware, export `CUDA_DEVICE_MAX_CONNECTIONS=1`
+before submission.

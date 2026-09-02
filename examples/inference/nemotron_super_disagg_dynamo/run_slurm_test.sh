@@ -26,7 +26,7 @@ fi
 export LOAD_CHECKPOINT="${LOAD_CHECKPOINT:-/lustre/fsw/portfolios/nemotron/projects/nemotron_sw_pre/users/ksanthanam/nemotron-3-super-120b-a12b}"
 export TOKENIZER_MODEL="${TOKENIZER_MODEL:-nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16}"
 export SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-${TOKENIZER_MODEL}}"
-export CONTAINER_IMAGE="${CONTAINER_IMAGE:?Set CONTAINER_IMAGE to a Dynamo/Megatron image with NIXL, etcd, and nats-server}"
+export CONTAINER_IMAGE="${CONTAINER_IMAGE:-/lustre/fsw/portfolios/nemotron/users/csathe/chaitrasathe+dynamo-megatron+mamba-dynamo-1.3.1.sqsh}"
 export CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-/home:/home,/lustre:/lustre}"
 
 export EXPECTED_NNODES=2
@@ -39,17 +39,35 @@ if (( GPUS_PER_NODE != 4 || TP_SIZE != 2 || EP_SIZE != 4 || ETP_SIZE != 1 )); th
     echo "Got GPUs=${GPUS_PER_NODE}, TP=${TP_SIZE}, EP=${EP_SIZE}, expert-TP=${ETP_SIZE}." >&2
     exit 2
 fi
+if [[ ! -r "${CONTAINER_IMAGE}" ]]; then
+    echo "Container image is not readable: ${CONTAINER_IMAGE}" >&2
+    exit 2
+fi
+if [[ ! -d "${LOAD_CHECKPOINT}" ]]; then
+    echo "Checkpoint directory is not visible: ${LOAD_CHECKPOINT}" >&2
+    exit 2
+fi
 
-export HTTP_PORT="${HTTP_PORT:-8000}"
-export ETCD_PORT="${ETCD_PORT:-2379}"
-export ETCD_PEER_PORT="${ETCD_PEER_PORT:-2380}"
-export NATS_PORT="${NATS_PORT:-4222}"
-export COORDINATOR_PORT="${COORDINATOR_PORT:-5555}"
+# Give every batch job its own block of ports. With ten ports per block, the
+# computed defaults range from 20000 through 59997 and remain valid TCP ports.
+export JOB_PORT_BASE="${JOB_PORT_BASE:-$((20000 + (10#${SLURM_JOB_ID} % 4000) * 10))}"
+export HTTP_PORT="${HTTP_PORT:-${JOB_PORT_BASE}}"
+export ETCD_PORT="${ETCD_PORT:-$((JOB_PORT_BASE + 1))}"
+export ETCD_PEER_PORT="${ETCD_PEER_PORT:-$((JOB_PORT_BASE + 2))}"
+export NATS_PORT="${NATS_PORT:-$((JOB_PORT_BASE + 3))}"
+export COORDINATOR_PORT="${COORDINATOR_PORT:-$((JOB_PORT_BASE + 4))}"
+export FRONTEND_SYSTEM_PORT="${FRONTEND_SYSTEM_PORT:-$((JOB_PORT_BASE + 5))}"
+export PREFILL_SYSTEM_PORT="${PREFILL_SYSTEM_PORT:-$((JOB_PORT_BASE + 6))}"
+export DECODE_SYSTEM_PORT="${DECODE_SYSTEM_PORT:-$((JOB_PORT_BASE + 7))}"
 export STARTUP_TIMEOUT_SECONDS="${STARTUP_TIMEOUT_SECONDS:-3600}"
 export REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-300}"
 export RUN_DIR="${RUN_DIR:-${MEGATRON_ROOT}/logs/nemotron-super-dynamo-disagg-${SLURM_JOB_ID:-manual}}"
 export PREFILL_WORKER_FILE="${RUN_DIR}/prefill-worker.json"
 export DECODE_WORKER_FILE="${RUN_DIR}/decode-worker.json"
+# etcd and NATS databases are mutable service state and must not live on
+# Lustre. /tmp is node-local inside the Pyxis container, and the job ID makes
+# the path unique even if state from an earlier container survives briefly.
+export CONTROL_STATE_DIR="${CONTROL_STATE_DIR:-/tmp/nemotron-super-dynamo-disagg-${SLURM_JOB_ID}}"
 
 # Dynamo uses these addresses for cross-node discovery and messaging.
 export ETCD_ENDPOINTS="http://${CONTROL_HOST:-127.0.0.1}:${ETCD_PORT}"
@@ -265,24 +283,27 @@ cleanup_control_children() {
 run_control_node() {
     CONTROL_CHILD_PIDS=()
     trap cleanup_control_children EXIT INT TERM
+    mkdir -p "${CONTROL_STATE_DIR}/etcd" "${CONTROL_STATE_DIR}/nats"
 
     etcd \
-        --name nemotron-super-disagg \
-        --data-dir "${RUN_DIR}/etcd" \
+        --name "nemotron-super-disagg-${SLURM_JOB_ID}" \
+        --data-dir "${CONTROL_STATE_DIR}/etcd" \
         --listen-client-urls "http://0.0.0.0:${ETCD_PORT}" \
         --advertise-client-urls "http://${CONTROL_HOST}:${ETCD_PORT}" \
         --listen-peer-urls "http://0.0.0.0:${ETCD_PEER_PORT}" \
         --initial-advertise-peer-urls "http://${CONTROL_HOST}:${ETCD_PEER_PORT}" \
-        --initial-cluster "nemotron-super-disagg=http://${CONTROL_HOST}:${ETCD_PEER_PORT}" \
+        --initial-cluster "nemotron-super-disagg-${SLURM_JOB_ID}=http://${CONTROL_HOST}:${ETCD_PEER_PORT}" \
+        --initial-cluster-token "nemotron-super-disagg-${SLURM_JOB_ID}" \
         >"${RUN_DIR}/etcd.log" 2>&1 &
     CONTROL_CHILD_PIDS+=("$!")
 
-    nats-server -js -a 0.0.0.0 -p "${NATS_PORT}" \
-        --store_dir "${RUN_DIR}/nats" >"${RUN_DIR}/nats.log" 2>&1 &
+    nats-server -js --name "nemotron-super-disagg-${SLURM_JOB_ID}" \
+        -a 0.0.0.0 -p "${NATS_PORT}" \
+        --store_dir "${CONTROL_STATE_DIR}/nats" >"${RUN_DIR}/nats.log" 2>&1 &
     CONTROL_CHILD_PIDS+=("$!")
 
     wait_for_control_plane
-    DYN_SYSTEM_PORT=8080 python -m dynamo.frontend \
+    DYN_SYSTEM_PORT="${FRONTEND_SYSTEM_PORT}" python -m dynamo.frontend \
         --http-port "${HTTP_PORT}" \
         --router-mode kv \
         --router-min-initial-workers 1 \
@@ -292,7 +313,7 @@ run_control_node() {
         >"${RUN_DIR}/frontend.log" 2>&1 &
     CONTROL_CHILD_PIDS+=("$!")
 
-    run_dynamo_worker prefill prefill "${PREFILL_WORKER_FILE}" 8081 \
+    run_dynamo_worker prefill prefill "${PREFILL_WORKER_FILE}" "${PREFILL_SYSTEM_PORT}" \
         >"${RUN_DIR}/prefill.log" 2>&1 &
     CONTROL_CHILD_PIDS+=("$!")
 
@@ -306,7 +327,7 @@ run_control_node() {
 
 run_decode_node() {
     wait_for_control_plane
-    run_dynamo_worker decode backend "${DECODE_WORKER_FILE}" 8082 \
+    run_dynamo_worker decode backend "${DECODE_WORKER_FILE}" "${DECODE_SYSTEM_PORT}" \
         >"${RUN_DIR}/decode.log" 2>&1
 }
 
@@ -334,6 +355,13 @@ export ETCD_ENDPOINTS="http://${CONTROL_HOST}:${ETCD_PORT}"
 export NATS_SERVER="nats://${CONTROL_HOST}:${NATS_PORT}"
 mkdir -p "${RUN_DIR}"
 rm -f "${PREFILL_WORKER_FILE}" "${DECODE_WORKER_FILE}"
+
+echo "Nemotron Super Dynamo job ${SLURM_JOB_ID}"
+echo "  control host: ${CONTROL_HOST}"
+echo "  HTTP/etcd/NATS/coordinator ports: ${HTTP_PORT}/${ETCD_PORT}/${NATS_PORT}/${COORDINATOR_PORT}"
+echo "  Dynamo system ports: ${FRONTEND_SYSTEM_PORT}/${PREFILL_SYSTEM_PORT}/${DECODE_SYSTEM_PORT}"
+echo "  node-local control state: ${CONTROL_STATE_DIR}"
+echo "  shared logs: ${RUN_DIR}"
 
 SRUN_ARGS=(
     --nodes="${EXPECTED_NNODES}"
