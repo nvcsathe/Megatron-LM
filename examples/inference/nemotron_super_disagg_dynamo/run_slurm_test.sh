@@ -61,7 +61,8 @@ export PREFILL_SYSTEM_PORT="${PREFILL_SYSTEM_PORT:-$((JOB_PORT_BASE + 6))}"
 export DECODE_SYSTEM_PORT="${DECODE_SYSTEM_PORT:-$((JOB_PORT_BASE + 7))}"
 export STARTUP_TIMEOUT_SECONDS="${STARTUP_TIMEOUT_SECONDS:-3600}"
 export REQUEST_TIMEOUT_SECONDS="${REQUEST_TIMEOUT_SECONDS:-300}"
-export RUN_DIR="${RUN_DIR:-${MEGATRON_ROOT}/logs/nemotron-super-dynamo-disagg-${SLURM_JOB_ID:-manual}}"
+export RUN_BASE_DIR="${RUN_BASE_DIR:-${MEGATRON_ROOT}/logs}"
+export RUN_DIR="${RUN_BASE_DIR}/nemotron-super-dynamo-disagg-${SLURM_JOB_ID:-manual}"
 export PREFILL_WORKER_FILE="${RUN_DIR}/prefill-worker.json"
 export DECODE_WORKER_FILE="${RUN_DIR}/decode-worker.json"
 # etcd and NATS databases are mutable service state and must not live on
@@ -409,12 +410,20 @@ done
 wait_for_url "http://${CONTROL_HOST}:${HTTP_PORT}/v1/models" "Dynamo frontend"
 
 response_file="${RUN_DIR}/completion-response.json"
-curl --fail --silent --show-error \
-    --max-time "${REQUEST_TIMEOUT_SECONDS}" \
-    "http://${CONTROL_HOST}:${HTTP_PORT}/v1/completions" \
-    -H 'Content-Type: application/json' \
-    -d "{\"model\":\"${SERVED_MODEL_NAME}\",\"prompt\":\"Explain disaggregated inference in one sentence.\",\"max_tokens\":32,\"temperature\":0}" \
-    -o "${response_file}"
+if ! curl --fail-with-body --silent --show-error \
+        --max-time "${REQUEST_TIMEOUT_SECONDS}" \
+        "http://${CONTROL_HOST}:${HTTP_PORT}/v1/completions" \
+        -H 'Content-Type: application/json' \
+        -d "{\"model\":\"${SERVED_MODEL_NAME}\",\"prompt\":\"Explain disaggregated inference in one sentence.\",\"max_tokens\":32,\"temperature\":0}" \
+        -o "${response_file}"; then
+    echo "Completion request failed. Response body (${response_file}):" >&2
+    if [[ -s "${response_file}" ]]; then
+        sed -n '1,200p' "${response_file}" >&2
+    else
+        echo "<empty>" >&2
+    fi
+    exit 1
+fi
 
 python -c 'import json, sys; data = json.load(open(sys.argv[1])); choices = data.get("choices") or []; assert choices and choices[0].get("text"), data; print("PASS:", choices[0]["text"])' "${response_file}"
 echo "Nemotron Super Dynamo disaggregated smoke test passed. Logs: ${RUN_DIR}"

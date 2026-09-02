@@ -41,7 +41,9 @@ The launcher starts the Dynamo control plane and both workers, waits for their
 registrations, sends one deterministic `/v1/completions` request, validates
 that the response contains generated text, and shuts everything down. Logs and
 the response are retained under
-`logs/nemotron-super-dynamo-disagg-${SLURM_JOB_ID}` for diagnosis.
+`${RUN_BASE_DIR:-${MEGATRON_ROOT}/logs}/nemotron-super-dynamo-disagg-${SLURM_JOB_ID}`
+for diagnosis. The job-specific suffix is always derived from the current
+allocation so an inherited path cannot mix artifacts from different jobs.
 
 The batch allocation derives a unique block of frontend, etcd, NATS,
 coordinator, and Dynamo status ports from `SLURM_JOB_ID`. It also keeps the
