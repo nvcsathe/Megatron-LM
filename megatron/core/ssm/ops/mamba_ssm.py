@@ -226,8 +226,10 @@ def _selective_scan_update_kernel(
             z_s_ptrs = z_ptrs + s * stride_z_seq
 
         x = tl.load(x_s_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
-        # Start the B load before the dt/softplus chain so its latency can overlap with that math.
+        # Start the B and C loads before the dt/softplus chain so their latency can overlap with
+        # that math.
         B = tl.load(B_s_ptrs, mask=offs_n < dstate, other=0.0).to(tl.float32)
+        C = tl.load(C_s_ptrs, mask=offs_n < dstate, other=0.0).to(tl.float32)
 
         # Calculate dt and dA
         if not TIE_HDIM:
@@ -245,8 +247,6 @@ def _selective_scan_update_kernel(
                 dt = tl.where(dt <= 20.0, softplus(dt), dt)
             dA = fast_exp(A * dt)
 
-        # Load C after the recurrence inputs are ready; it is only needed for the output projection.
-        C = tl.load(C_s_ptrs, mask=offs_n < dstate, other=0.0).to(tl.float32)
         if HAS_Z:
             z = tl.load(z_s_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
 
