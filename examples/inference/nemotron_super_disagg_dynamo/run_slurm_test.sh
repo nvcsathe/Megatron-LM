@@ -73,11 +73,12 @@ export CONTROL_STATE_DIR="${CONTROL_STATE_DIR:-/tmp/nemotron-super-dynamo-disagg
 # Dynamo uses these addresses for cross-node discovery and messaging.
 export ETCD_ENDPOINTS="http://${CONTROL_HOST:-127.0.0.1}:${ETCD_PORT}"
 export NATS_SERVER="nats://${CONTROL_HOST:-127.0.0.1}:${NATS_PORT}"
-# This topology transfers only across nodes, so select the accelerated and
-# standard reliable-connection transports plus CUDA memory support. Exclude
-# cuda_ipc (same-host only) and gdr_copy (incompatible with these expandable
-# CUDA allocations). Assign unconditionally to override container defaults.
-export UCX_TLS="rc_x,rc,cuda_copy"
+# Default this cross-node smoke test to UCX's portable TCP path plus CUDA memory
+# support. This avoids depending on site-specific RDMA device selection while
+# still exercising NIXL over UCX. Override UCX_TLS (and UCX_NET_DEVICES) before
+# submission to validate a configured RDMA fabric. Exclude cuda_ipc (same-host
+# only) and gdr_copy (incompatible with these expandable CUDA allocations).
+export UCX_TLS="${UCX_TLS:-cuda_copy,tcp}"
 export UCX_MEMTYPE_CACHE="${UCX_MEMTYPE_CACHE:-n}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 # CUDA_DEVICE_MAX_CONNECTIONS is intentionally left unset for GB200. Export it
