@@ -55,4 +55,7 @@ through environment variables before submission. The four-GPU replica
 parallelism is fixed to the validated TP=2, EP=4, expert-TP=1 profile. The
 launcher leaves `CUDA_DEVICE_MAX_CONNECTIONS` unset for GB200; if this profile
 is adapted to pre-Blackwell hardware, export `CUDA_DEVICE_MAX_CONNECTIONS=1`
-before submission.
+before submission. The launcher defaults `UCX_TLS` to `^gdr_copy` because
+HPC-X cannot register stream-ordered/expandable CUDA allocations with the
+`gdr_copy` memory domain. This exclusion preserves UCX's automatic selection
+of the available cross-node fabric transport.
