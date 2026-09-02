@@ -72,10 +72,10 @@ export CONTROL_STATE_DIR="${CONTROL_STATE_DIR:-/tmp/nemotron-super-dynamo-disagg
 # Dynamo uses these addresses for cross-node discovery and messaging.
 export ETCD_ENDPOINTS="http://${CONTROL_HOST:-127.0.0.1}:${ETCD_PORT}"
 export NATS_SERVER="nats://${CONTROL_HOST:-127.0.0.1}:${NATS_PORT}"
-# HPC-X cannot register stream-ordered/expandable CUDA allocations with the
-# gdr_copy memory domain. Keep UCX's automatic fabric selection, but exclude
-# gdr_copy so NIXL can register its large CUDA buffers.
-export UCX_TLS="${UCX_TLS:-^gdr_copy}"
+# Use Dynamo's explicit NIXL/InfiniBand transport set. Assign this
+# unconditionally because the container image may define UCX_TLS and thereby
+# defeat a shell-default exclusion of the gdr_copy memory domain.
+export UCX_TLS="rc_x,rc,cuda_copy,cuda_ipc"
 export UCX_MEMTYPE_CACHE="${UCX_MEMTYPE_CACHE:-n}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 # CUDA_DEVICE_MAX_CONNECTIONS is intentionally left unset for GB200. Export it

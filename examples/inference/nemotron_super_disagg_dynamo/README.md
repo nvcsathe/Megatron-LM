@@ -55,7 +55,8 @@ through environment variables before submission. The four-GPU replica
 parallelism is fixed to the validated TP=2, EP=4, expert-TP=1 profile. The
 launcher leaves `CUDA_DEVICE_MAX_CONNECTIONS` unset for GB200; if this profile
 is adapted to pre-Blackwell hardware, export `CUDA_DEVICE_MAX_CONNECTIONS=1`
-before submission. The launcher defaults `UCX_TLS` to `^gdr_copy` because
+before submission. The launcher sets `UCX_TLS` to
+`rc_x,rc,cuda_copy,cuda_ipc`, Dynamo's explicit NIXL/InfiniBand transport set.
+The assignment intentionally overrides any container-image default because
 HPC-X cannot register stream-ordered/expandable CUDA allocations with the
-`gdr_copy` memory domain. This exclusion preserves UCX's automatic selection
-of the available cross-node fabric transport.
+`gdr_copy` memory domain.
