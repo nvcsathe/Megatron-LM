@@ -58,8 +58,10 @@ through environment variables before submission. The four-GPU replica
 parallelism is fixed to the validated TP=2, EP=4, expert-TP=1 profile. The
 launcher leaves `CUDA_DEVICE_MAX_CONNECTIONS` unset for GB200; if this profile
 is adapted to pre-Blackwell hardware, export `CUDA_DEVICE_MAX_CONNECTIONS=1`
-before submission. The launcher uses the validated two-node Nano
-disaggregation settings: `UCX_TLS=cuda_ipc,cuda_copy,tcp,shm,cma,self` and
-`UCX_MEMTYPE_CACHE=n`. Use `UCX_TLS_OVERRIDE` or
-`UCX_MEMTYPE_CACHE_OVERRIDE` to intentionally change them; ambient UCX or
-container defaults cannot otherwise re-enable `gdr_copy`.
+before submission. The launcher uses the Nano disaggregation transport set
+adapted to this fixed cross-node topology:
+`UCX_TLS=cuda_copy,tcp,shm,cma,self` and `UCX_MEMTYPE_CACHE=n`. It excludes
+`cuda_ipc`, which crashes when selected for a prefill-to-decode transfer across
+these nodes, and `gdr_copy`, which cannot register the CUDA cache allocation.
+Use `UCX_TLS_OVERRIDE` or `UCX_MEMTYPE_CACHE_OVERRIDE` to intentionally change
+these settings.

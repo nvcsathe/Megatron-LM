@@ -73,10 +73,11 @@ export CONTROL_STATE_DIR="${CONTROL_STATE_DIR:-/tmp/nemotron-super-dynamo-disagg
 # Dynamo uses these addresses for cross-node discovery and messaging.
 export ETCD_ENDPOINTS="http://${CONTROL_HOST:-127.0.0.1}:${ETCD_PORT}"
 export NATS_SERVER="nats://${CONTROL_HOST:-127.0.0.1}:${NATS_PORT}"
-# Match the validated two-node Nano disaggregation harness. Use dedicated
-# override variables so inherited or container UCX settings cannot re-enable
-# gdr_copy accidentally.
-export UCX_TLS="${UCX_TLS_OVERRIDE:-cuda_ipc,cuda_copy,tcp,shm,cma,self}"
+# Use the Nano disaggregation transport set without cuda_ipc: prefill and
+# decode are fixed to different nodes, and selecting CUDA IPC for this path
+# crashes in uct_cuda_ipc_ep_get_zcopy. Dedicated override variables prevent
+# inherited or container UCX settings from re-enabling cuda_ipc or gdr_copy.
+export UCX_TLS="${UCX_TLS_OVERRIDE:-cuda_copy,tcp,shm,cma,self}"
 export UCX_MEMTYPE_CACHE="${UCX_MEMTYPE_CACHE_OVERRIDE:-n}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 # CUDA_DEVICE_MAX_CONNECTIONS is intentionally left unset for GB200. Export it
