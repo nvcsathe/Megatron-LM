@@ -45,11 +45,62 @@ the response are retained under
 for diagnosis. The job-specific suffix is always derived from the current
 allocation so an inherited path cannot mix artifacts from different jobs.
 
-The batch allocation defaults to `JOB_PORT_BASE=30000`, using ports 30000–30007
-for the frontend, etcd, NATS, coordinator, and Dynamo status endpoints. Override
-`JOB_PORT_BASE` when running concurrent jobs on nodes that share a network
-namespace. Mutable etcd and NATS JetStream databases remain in the control
-node's container-local `/tmp/nemotron-super-dynamo-disagg-${SLURM_JOB_ID}`.
+## Run the 24-GPU 4P1D performance server
+
+`run_slurm_perf_server.sh` deploys the AIConfigurator 4P1D topology on six
+four-GPU GB200 nodes and leaves it running for a separate benchmark job:
+
+- nodes 0-3 each run one four-GPU prefill worker with
+  `tp1pp1dp4etp1ep4` and a maximum batch size of 1;
+- nodes 4-5 together run one eight-GPU decode worker with
+  `tp1pp1dp8etp1ep8` and a maximum batch size of 376; and
+- the complete deployment uses 24 GPUs. The decode worker is one distributed
+  Megatron rank group, not two independent workers.
+
+Submit it from the shared worktree:
+
+```bash
+JOB_ID=$(sbatch --parsable --account=<account> --partition=<partition> \
+  examples/inference/nemotron_super_disagg_dynamo/run_slurm_perf_server.sh)
+```
+
+When all five Dynamo workers are registered, the job log prints the endpoint
+and the launcher writes a sourceable endpoint file:
+
+```bash
+ENDPOINT_FILE="${RUN_BASE_DIR:-${MEGATRON_ROOT:-$PWD}/logs}/nemotron-super-dynamo-4p1d-${JOB_ID}/endpoint.env"
+source "$ENDPOINT_FILE"
+curl "$DYNAMO_ENDPOINT/models"
+```
+
+The endpoint is routable from compute nodes on the same cluster network. Point
+the separate benchmark job at `DYNAMO_ENDPOINT` and use `DYNAMO_MODEL` as the
+OpenAI model name. This launcher does not generate traffic itself. Stop the
+deployment with `scancel "$JOB_ID"`.
+
+The default inference limits reproduce the planner row: prefill batch 1 and
+decode batch 376. `INFERENCE_MAX_SEQ_LENGTH`, `INFERENCE_MAX_TOKENS`,
+`INFERENCE_BUFFER_SIZE_GB`, `PREFILL_MAX_REQUESTS`, and
+`DECODE_MAX_REQUESTS` are environment overrides. Ensure the sequence lengths,
+precision, and speculative-decoding assumptions in the external benchmark
+match the planner invocation before comparing its predicted latency or
+throughput.
+
+The performance server retains the smoke test's conservative cross-node
+transport defaults (`UCX_TLS=cuda_copy,tcp,shm,cma,self`). Set
+`UCX_TLS_OVERRIDE` and `UCX_MEMTYPE_CACHE_OVERRIDE` to the cluster's validated
+RDMA/NIXL settings when measuring production transport performance.
+
+The decode Dynamo parent launches its two-node engine through an overlapping
+child `srun`. The cluster must permit overlapping Slurm job steps, and `srun`
+must be available in the decode parent's container environment.
+
+The smoke test defaults to `JOB_PORT_BASE=30000`, using ports
+30000–30007 for the frontend, etcd, NATS, coordinator, and Dynamo status
+endpoints. The 4P1D launcher defaults to `JOB_PORT_BASE=31000` and reserves
+through `JOB_PORT_BASE+32`. Override `JOB_PORT_BASE` when running concurrent
+jobs on nodes that share a network namespace. Mutable etcd and NATS JetStream
+databases remain in the control node's container-local `/tmp` job directory.
 Only logs and worker registration files are written to the shared worktree.
 
 Override `LOAD_CHECKPOINT`, `TOKENIZER_MODEL`, `SERVED_MODEL_NAME`,
