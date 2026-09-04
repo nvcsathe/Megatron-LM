@@ -8,9 +8,7 @@ import json
 import logging
 import os
 import queue
-import shlex
 import signal
-import sys
 import threading
 from collections.abc import AsyncGenerator
 from pathlib import Path
@@ -42,6 +40,7 @@ from megatron.core.inference.inference_client import InferenceClient, InferenceR
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.inference.integrations.dynamo.args import Config, parse_args
+from megatron.inference.integrations.dynamo.launcher import build_engine_command
 from megatron.inference.integrations.dynamo.telemetry import EngineEventReceiver
 
 logger = logging.getLogger(__name__)
@@ -124,6 +123,8 @@ class MegatronLLMEngine(LLMEngine):
         cls, argv: list[str] | None = None
     ) -> tuple["MegatronLLMEngine", WorkerConfig]:
         config = parse_args(argv)
+        if config.launcher == "external" and config.node_rank != 0:
+            raise ValueError("The Dynamo parent must run with --node-rank 0")
         # Dynamo builds model cards independently from WorkerConfig.model_name
         # and EngineConfig.model. Resolve both to one metadata-only snapshot so
         # a Megatron-owned engine never downloads a second copy of its weights.
@@ -234,48 +235,7 @@ class MegatronLLMEngine(LLMEngine):
         )
 
     def _engine_command(self, parent_event_address: str) -> list[str]:
-        command = [sys.executable, "-m", "torch.distributed.run"]
-        if self.config.launcher == "local":
-            command.extend(["--standalone", f"--nproc-per-node={self.config.nproc_per_node}"])
-        else:
-            command.extend(
-                [
-                    f"--nnodes={self.config.nnodes}",
-                    f"--nproc-per-node={self.config.nproc_per_node}",
-                    "--node-rank=__SLURM_NODE_RANK__",
-                    f"--master-addr={self.config.master_addr}",
-                    f"--master-port={self.config.master_port}",
-                ]
-            )
-        command.extend(
-            [
-                "--module",
-                "megatron.inference.integrations.dynamo.engine_service",
-                "--dynamo-parent-event-address",
-                parent_event_address,
-                "--role",
-                self.config.role,
-            ]
-        )
-        if self.config.coordinator_host is not None:
-            command.extend(["--coordinator-host", self.config.coordinator_host])
-        if self.config.coordinator_port is not None:
-            command.extend(["--coordinator-port", str(self.config.coordinator_port)])
-        command.extend(self.config.megatron_argv)
-        if self.config.launcher == "slurm":
-            shell_command = shlex.join(command).replace("__SLURM_NODE_RANK__", '"${SLURM_NODEID}"')
-            srun_command = [
-                "srun",
-                f"--nodes={self.config.nnodes}",
-                f"--ntasks={self.config.nnodes}",
-                "--ntasks-per-node=1",
-                f"--gpus-per-node={self.config.nproc_per_node}",
-                "--kill-on-bad-exit=1",
-            ]
-            if self.config.slurm_nodelist is not None:
-                srun_command.append(f"--nodelist={self.config.slurm_nodelist}")
-            return srun_command + ["bash", "-c", f"exec {shell_command}"]
-        return command
+        return build_engine_command(self.config, parent_event_address)
 
     async def _forward_logs(self, stream: asyncio.StreamReader, level: int) -> None:
         while line := await stream.readline():

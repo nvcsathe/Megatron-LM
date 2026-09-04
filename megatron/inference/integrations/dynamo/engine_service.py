@@ -24,7 +24,7 @@ from megatron.training.initialize import initialize_megatron
 
 def _extra_args(parser):
     parser = add_inference_args(add_modelopt_args(parser))
-    parser.add_argument("--dynamo-parent-event-address", required=True)
+    parser.add_argument("--dynamo-parent-event-address", default=None)
     return add_engine_service_args(parser)
 
 
@@ -52,8 +52,12 @@ async def _serve() -> None:
     if disaggregated:
         engine.setup_kv_transfer(role=args.role)
 
-    reporter = EngineEventReporter(engine, args.dynamo_parent_event_address)
-    reporter.start()
+    reporter = None
+    if dist.get_rank() == 0:
+        if args.dynamo_parent_event_address is None:
+            raise ValueError("Global rank zero requires --dynamo-parent-event-address")
+        reporter = EngineEventReporter(engine, args.dynamo_parent_event_address)
+        reporter.start()
 
     try:
         address = await engine.start_listening_to_data_parallel_coordinator(
@@ -63,10 +67,12 @@ async def _serve() -> None:
             endpoint = InferenceEngineEndpoint.from_engine(
                 address, engine, logical_data_parallel_size=replica_count
             )
+            assert reporter is not None
             reporter.observe("ready", endpoint.to_dict())
         await engine.engine_loop_task
     finally:
-        reporter.stop()
+        if reporter is not None:
+            reporter.stop()
 
 
 def main() -> None:

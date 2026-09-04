@@ -76,14 +76,6 @@ export DECODE_MASTER_PORT="${DECODE_MASTER_PORT:-$((JOB_PORT_BASE + 32))}"
 export UCX_TLS="${UCX_TLS_OVERRIDE:-cuda_copy,tcp,shm,cma,self}"
 export UCX_MEMTYPE_CACHE="${UCX_MEMTYPE_CACHE_OVERRIDE:-n}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
-# The decode Dynamo parent launches its two-node engine through a nested srun.
-# Slurm and Pyxis consume these environment variables as the equivalent of
-# --overlap and the corresponding --container-* options, so the nested step
-# needs no changes to the Megatron Dynamo integration.
-export SLURM_OVERLAP=1
-export PYXIS_CONTAINER_IMAGE="${CONTAINER_IMAGE}"
-export PYXIS_CONTAINER_MOUNTS="${CONTAINER_MOUNTS}"
-export PYXIS_CONTAINER_WORKDIR="${MEGATRON_ROOT}"
 # CUDA_DEVICE_MAX_CONNECTIONS is intentionally unset for GB200.
 
 prefill_worker_file() {
@@ -360,35 +352,43 @@ run_prefill_worker() {
         -- "${model_args[@]}"
 }
 
-run_decode_worker() {
+run_decode_node() {
+    local node_rank="${SLURM_PROCID:?SLURM_PROCID is required for a decode node}"
     local worker_file
     worker_file="$(decode_worker_file)"
     local -a model_args=()
+    local -a worker_args=()
     mapfile -t model_args < <(megatron_args decode)
+    worker_args=(
+        --role decode
+        --component backend
+        --model "${TOKENIZER_MODEL}"
+        --served-model-name "${SERVED_MODEL_NAME}"
+        --endpoint-types completions
+        --launcher external
+        --nnodes "${DECODE_NNODES}"
+        --node-rank "${node_rank}"
+        --nproc-per-node "${GPUS_PER_NODE}"
+        --master-addr "${DECODE_LEADER_HOST}"
+        --master-port "${DECODE_MASTER_PORT}"
+        --coordinator-host "${DECODE_LEADER_HOST}"
+        --coordinator-port "${DECODE_COORDINATOR_PORT}"
+        --worker-id-file "${worker_file}"
+        --megatron-root "${MEGATRON_ROOT}"
+        --discovery-backend etcd
+        --request-plane nats
+        --event-plane nats
+    )
 
     wait_for_control_plane
     cd "${MEGATRON_ROOT}"
-    DYN_SYSTEM_PORT="${DECODE_SYSTEM_PORT}" exec python -m megatron.inference.integrations.dynamo \
-        --role decode \
-        --component backend \
-        --model "${TOKENIZER_MODEL}" \
-        --served-model-name "${SERVED_MODEL_NAME}" \
-        --endpoint-types completions \
-        --launcher slurm \
-        --nnodes "${DECODE_NNODES}" \
-        --nproc-per-node "${GPUS_PER_NODE}" \
-        --master-addr "${DECODE_LEADER_HOST}" \
-        --master-port "${DECODE_MASTER_PORT}" \
-        --slurm-nodelist "${DECODE_NODELIST}" \
-        --parent-event-host "${DECODE_LEADER_HOST}" \
-        --coordinator-host "${DECODE_LEADER_HOST}" \
-        --coordinator-port "${DECODE_COORDINATOR_PORT}" \
-        --worker-id-file "${worker_file}" \
-        --megatron-root "${MEGATRON_ROOT}" \
-        --discovery-backend etcd \
-        --request-plane nats \
-        --event-plane nats \
-        -- "${model_args[@]}"
+    if [[ "${node_rank}" -eq 0 ]]; then
+        DYN_SYSTEM_PORT="${DECODE_SYSTEM_PORT}" exec \
+            python -m megatron.inference.integrations.dynamo \
+            "${worker_args[@]}" -- "${model_args[@]}"
+    fi
+    exec python -m megatron.inference.integrations.dynamo.headless \
+        "${worker_args[@]}" -- "${model_args[@]}"
 }
 
 case "${1:-}" in
@@ -400,8 +400,8 @@ case "${1:-}" in
         run_prefill_worker "${2:-}"
         exit
         ;;
-    --decode-worker)
-        run_decode_worker
+    --decode-node)
+        run_decode_node
         exit
         ;;
     "")
@@ -501,11 +501,13 @@ for ((index = 0; index < PREFILL_WORKERS; index++)); do
         "${CONTAINER_ARGS[@]}" bash "${WORKER_SCRIPT}" --prefill-worker "${index}"
 done
 
-# The lightweight Dynamo parent shares decode node 0 with the engine job step.
-# SLURM_OVERLAP and the PYXIS_CONTAINER_* variables apply to its child srun.
+# SLURM owns the complete two-node decode step. Task 0 runs the Dynamo parent
+# and rank-zero agent; task 1 runs only a headless rank agent.
 launch_service decode-0 \
-    srun --overlap --nodes=1 --ntasks=1 --nodelist="${DECODE_LEADER_HOST}" \
-    "${CONTAINER_ARGS[@]}" bash "${WORKER_SCRIPT}" --decode-worker
+    srun --overlap --nodes="${DECODE_NNODES}" --ntasks="${DECODE_NNODES}" \
+    --ntasks-per-node=1 --nodelist="${DECODE_NODELIST}" \
+    --gpus-per-node="${GPUS_PER_NODE}" --kill-on-bad-exit=1 \
+    "${CONTAINER_ARGS[@]}" bash "${WORKER_SCRIPT}" --decode-node
 
 service_failed() {
     local index pid rc

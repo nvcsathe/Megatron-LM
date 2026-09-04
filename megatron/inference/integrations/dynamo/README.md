@@ -68,38 +68,42 @@ python -m dynamo.frontend \
   --event-plane nats
 ```
 
-The parent event socket binds to `127.0.0.1` by default. A multi-node launcher
-must pass `--parent-event-host` with a routable address on the Dynamo parent
-host; only global rank zero connects to this endpoint.
+The parent event socket binds to `127.0.0.1` by default. Only the local global
+rank-zero process connects to this endpoint, so loopback also works for a
+multi-node replica.
 
 ### Multi-node SLURM replica
 
-The default `local` launcher starts one complete replica on one node. To run a
-single complete TP/PP/EP replica across SLURM nodes, launch the Dynamo parent
-once from the batch script (not once per node) and let it create one `srun`
-task per node. The worktree and model paths must be visible on every node.
+The default `local` launcher starts one complete replica on one node. For a
+multi-node replica, SLURM must create one task per node in a single job step.
+Task zero runs the Dynamo parent and its local rank agent; every other task runs
+the headless entrypoint, which starts only its local agent and never registers
+a Dynamo worker. The parent does not invoke `srun`.
 
 ```bash
 export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
 export MASTER_PORT=29500
-export PARENT_EVENT_HOST=$(hostname -I | awk '{print $1}')
 
-python -m megatron.inference.integrations.dynamo \
-  --launcher slurm \
-  --nnodes "$SLURM_NNODES" \
-  --nproc-per-node 8 \
-  --master-addr "$MASTER_ADDR" \
-  --master-port "$MASTER_PORT" \
-  --parent-event-host "$PARENT_EVENT_HOST" \
-  --slurm-nodelist "$SLURM_JOB_NODELIST" \
-  --role aggregated \
-  --model Qwen/Qwen3-8B \
-  -- <Megatron arguments>
+# Run this script through: srun --nodes=$SLURM_NNODES --ntasks=$SLURM_NNODES \
+#   --ntasks-per-node=1 bash launch-replica-node.sh
+common_args=(
+  --launcher external --nnodes "$SLURM_NNODES" --node-rank "$SLURM_PROCID"
+  --nproc-per-node 8 --master-addr "$MASTER_ADDR" --master-port "$MASTER_PORT"
+  --role aggregated --model Qwen/Qwen3-8B
+)
+engine_args=(--load /path/to/checkpoint) # Add the remaining Megatron arguments.
+if [[ "$SLURM_PROCID" -eq 0 ]]; then
+  exec python -m megatron.inference.integrations.dynamo \
+    "${common_args[@]}" -- "${engine_args[@]}"
+else
+  exec python -m megatron.inference.integrations.dynamo.headless \
+    "${common_args[@]}" -- "${engine_args[@]}"
+fi
 ```
 
-This starts one `torch.distributed.run` agent per node, with `SLURM_NODEID` as
-the node rank. Reserve the selected nodes exclusively for this Dynamo worker;
-individual Megatron ranks are not separate Dynamo workers.
+`--launcher external` is scheduler-neutral: the allocation layer supplies the
+node rank and owns placement and hard cancellation. Reserve the selected nodes
+for this complete replica; individual Megatron ranks are not Dynamo workers.
 
 ## Tests
 
@@ -130,6 +134,6 @@ pytest -q tests/unit_tests/inference/test_kv_transfer_backends.py
 - Cancellation targets the exact Megatron request; shutdown unregisters the
   endpoint, drains active requests, and then stops all ranks.
 
-The default launcher supports one node per engine. The SLURM launcher can run
-one engine across multiple nodes; scale horizontally by adding complete Dynamo
-component replicas on separate node sets.
+The default launcher supports one node per engine. The external launcher can
+join node-local agents into one multi-node engine; scale horizontally by adding
+complete Dynamo component replicas on separate node sets.

@@ -91,9 +91,9 @@ transport defaults (`UCX_TLS=cuda_copy,tcp,shm,cma,self`). Set
 `UCX_TLS_OVERRIDE` and `UCX_MEMTYPE_CACHE_OVERRIDE` to the cluster's validated
 RDMA/NIXL settings when measuring production transport performance.
 
-The decode Dynamo parent launches its two-node engine through an overlapping
-child `srun`. The cluster must permit overlapping Slurm job steps, and `srun`
-must be available in the decode parent's container environment.
+The allocation launcher creates one two-node decode `srun`: task zero hosts the
+Dynamo parent and rank-zero agent, while task one runs a headless rank agent.
+The parent never creates a nested Slurm job step.
 
 The smoke test defaults to `JOB_PORT_BASE=30000`, using ports
 30000–30007 for the frontend, etcd, NATS, coordinator, and Dynamo status

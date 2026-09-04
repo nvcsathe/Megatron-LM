@@ -30,9 +30,9 @@ class Config:
     megatron_argv: list[str]
     launcher: str = "local"
     nnodes: int = 1
+    node_rank: int = 0
     master_addr: str | None = None
     master_port: int | None = None
-    slurm_nodelist: str | None = None
     engine_start_timeout: float = 1800.0
     engine_shutdown_timeout: float = 30.0
     parent_event_host: str = "127.0.0.1"
@@ -81,19 +81,18 @@ def parse_args(argv: list[str] | None = None) -> Config:
     add_engine_service_args(parser)
     parser.add_argument(
         "--launcher",
-        choices=["local", "slurm"],
+        choices=["local", "external"],
         default="local",
-        help="Launch the owned Megatron rank group locally or through a SLURM job step.",
+        help=(
+            "Launch a complete single-node rank group locally, or one local rank agent "
+            "inside an externally created multi-node allocation."
+        ),
     )
     parser.add_argument("--nnodes", type=int, default=1)
+    parser.add_argument("--node-rank", type=int, default=0)
     parser.add_argument("--nproc-per-node", type=int, required=True)
     parser.add_argument("--master-addr", default=None)
     parser.add_argument("--master-port", type=int, default=None)
-    parser.add_argument(
-        "--slurm-nodelist",
-        default=None,
-        help="Optional SLURM node list reserved for this complete Megatron replica.",
-    )
     parser.add_argument(
         "--worker-id-file",
         default=None,
@@ -116,19 +115,14 @@ def parse_args(argv: list[str] | None = None) -> Config:
         parser.error("--nnodes must be at least 1")
     if args.launcher == "local" and args.nnodes != 1:
         parser.error("--launcher local only supports --nnodes 1")
-    if args.launcher == "slurm" and (not args.master_addr or args.master_port is None):
-        parser.error("--launcher slurm requires --master-addr and --master-port")
+    if args.launcher == "local" and args.node_rank != 0:
+        parser.error("--launcher local requires --node-rank 0")
+    if args.launcher == "external" and (not args.master_addr or args.master_port is None):
+        parser.error("--launcher external requires --master-addr and --master-port")
+    if not 0 <= args.node_rank < args.nnodes:
+        parser.error("--node-rank must be between 0 and --nnodes - 1")
     if args.master_port is not None and not 1 <= args.master_port <= 65535:
         parser.error("--master-port must be between 1 and 65535")
-    if (
-        args.launcher == "slurm"
-        and args.nnodes > 1
-        and args.parent_event_host in {"127.0.0.1", "::1", "localhost"}
-    ):
-        parser.error(
-            "multi-node --launcher slurm requires --parent-event-host to be a routable "
-            "address on the Dynamo parent host"
-        )
     if args.engine_start_timeout <= 0:
         parser.error("--engine-start-timeout must be positive")
     if args.engine_shutdown_timeout <= 0:
@@ -153,10 +147,10 @@ def parse_args(argv: list[str] | None = None) -> Config:
         role=args.role,
         launcher=args.launcher,
         nnodes=args.nnodes,
+        node_rank=args.node_rank,
         nproc_per_node=args.nproc_per_node,
         master_addr=args.master_addr,
         master_port=args.master_port,
-        slurm_nodelist=args.slurm_nodelist,
         coordinator_host=args.coordinator_host,
         coordinator_port=args.coordinator_port,
         worker_id_file=args.worker_id_file,

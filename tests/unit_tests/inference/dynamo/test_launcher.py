@@ -10,6 +10,8 @@ import pytest
 pytest.importorskip("dynamo")
 
 from megatron.inference.integrations.dynamo.args import parse_args
+from megatron.inference.integrations.dynamo.headless import main as headless_main
+from megatron.inference.integrations.dynamo.launcher import build_engine_command
 from megatron.inference.integrations.dynamo.llm_engine import MegatronLLMEngine
 from megatron.inference.integrations.dynamo.main import main
 
@@ -30,26 +32,24 @@ def _argv():
     ]
 
 
-def _slurm_argv():
+def _external_argv(node_rank=0):
     return [
         "--role",
         "aggregated",
         "--model",
         "model-meta",
         "--launcher",
-        "slurm",
+        "external",
         "--nnodes",
         "2",
+        "--node-rank",
+        str(node_rank),
         "--nproc-per-node",
         "4",
         "--master-addr",
         "node-0",
         "--master-port",
         "29500",
-        "--slurm-nodelist",
-        "node-[0-1]",
-        "--parent-event-host",
-        "10.0.0.10",
         "--",
         "--load",
         "/checkpoints/model path",
@@ -77,15 +77,13 @@ def test_parse_args_splits_dynamo_and_megatron_arguments():
             "--model",
             "model-meta",
             "--launcher",
-            "slurm",
+            "external",
             "--nnodes",
             "2",
             "--nproc-per-node",
             "4",
             "--master-addr",
             "node-0",
-            "--master-port",
-            "29500",
             "--",
             "--load",
             "/checkpoint",
@@ -133,28 +131,52 @@ def test_owned_engine_command_targets_megatron_only_service():
     assert command[-4:] == ["--load", "/checkpoints/model", "--tensor-model-parallel-size", "2"]
 
 
-def test_slurm_engine_command_launches_one_torchrun_agent_per_node():
-    engine = MegatronLLMEngine(parse_args(_slurm_argv()))
-    command = engine._engine_command("tcp://10.0.0.10:5556")
+def test_external_engine_command_launches_only_the_local_leader_agent():
+    engine = MegatronLLMEngine(parse_args(_external_argv()))
+    command = engine._engine_command("tcp://127.0.0.1:5556")
 
-    assert command[:5] == [
-        "srun",
-        "--nodes=2",
-        "--ntasks=2",
-        "--ntasks-per-node=1",
-        "--gpus-per-node=4",
-    ]
-    assert "--kill-on-bad-exit=1" in command
-    assert "--nodelist=node-[0-1]" in command
-    assert command[-3:-1] == ["bash", "-c"]
-    payload = command[-1]
-    assert "--nnodes=2" in payload
-    assert "--nproc-per-node=4" in payload
-    assert '--node-rank="${SLURM_NODEID}"' in payload
-    assert "--master-addr=node-0" in payload
-    assert "--master-port=29500" in payload
-    assert "megatron.inference.integrations.dynamo.engine_service" in payload
-    assert "'/checkpoints/model path'" in payload
+    assert command[1:3] == ["-m", "torch.distributed.run"]
+    assert command[0] != "srun"
+    assert "--nnodes=2" in command
+    assert "--nproc-per-node=4" in command
+    assert "--node-rank=0" in command
+    assert "--master-addr=node-0" in command
+    assert "--master-port=29500" in command
+    assert "megatron.inference.integrations.dynamo.engine_service" in command
+    assert command[command.index("--dynamo-parent-event-address") + 1] == (
+        "tcp://127.0.0.1:5556"
+    )
+    assert command[-2:] == ["--load", "/checkpoints/model path"]
+
+
+def test_headless_engine_command_launches_only_its_local_rank_agent():
+    config = parse_args(_external_argv(node_rank=1))
+    command = build_engine_command(config)
+
+    assert command[0] != "srun"
+    assert "--node-rank=1" in command
+    assert "--dynamo-parent-event-address" not in command
+    assert "megatron.inference.integrations.dynamo.engine_service" in command
+
+
+def test_headless_entrypoint_executes_the_local_rank_agent():
+    with patch("megatron.inference.integrations.dynamo.headless.os.execv") as execv:
+        headless_main(_external_argv(node_rank=1))
+
+    command = execv.call_args.args[1]
+    assert "--node-rank=1" in command
+    assert "--dynamo-parent-event-address" not in command
+
+
+def test_headless_entrypoint_rejects_rank_zero():
+    with pytest.raises(ValueError, match="node-rank greater than zero"):
+        headless_main(_external_argv(node_rank=0))
+
+
+@pytest.mark.asyncio
+async def test_external_dynamo_parent_must_own_node_rank_zero():
+    with pytest.raises(ValueError, match="Dynamo parent.*node-rank 0"):
+        await MegatronLLMEngine.from_args(_external_argv(node_rank=1))
 
 
 @pytest.mark.asyncio
